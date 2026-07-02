@@ -1,18 +1,17 @@
-// multimodal-server — slice 1: session-oriented HTTP LLM API (text-only).
+// multimodal-server — slice 2: session-oriented HTTP LLM API with streaming.
 //
 // Endpoints (see docs/ipc-protocol.md):
 //   POST   /sessions              -> create a session, returns {session_id}
 //   POST   /sessions/{id}/inject  -> body {text}; tokenize + decode into KV cache (no gen)
-//   POST   /sessions/{id}/generate-> body {max_tokens,...}; generate from cache, return text
+//   POST   /sessions/{id}/generate-> body {max_tokens, stream, ...}
+//       stream=false (default): returns slice-1 JSON {text, tokens, ...}
+//       stream=true : text/event-stream; one event per token + a final usage event
 //   DELETE /sessions/{id}         -> free the session
 //   GET    /health                -> liveness
 //
 // All MultiModalAgent engine code lives under engine/multimodal/ — we do NOT
 // modify the upstream llama.cpp fork. One model is loaded and shared; each
 // session is its own llama_context (owning its KV cache).
-//
-// Slice 1 scope: text-only, non-streaming. Streaming / multimodal / fork /
-// batching are deferred (see TODO.md). Perf is measured but not gated yet.
 
 #include <atomic>
 #include <chrono>
@@ -22,8 +21,10 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include "httplib.h"
 #include "nlohmann/json.hpp"
@@ -54,8 +55,20 @@ struct AppState {
     std::atomic<int64_t> next_id{1};
 };
 
+struct GenParams {
+    int   max_tokens = 256;
+    float temp       = 0.8f;
+    float top_p      = 1.0f;
+    int   seed       = -1;
+};
+
+struct GenResult {
+    std::string text;
+    std::vector<int64_t> ids;
+    double gen_s = 0.0;
+};
+
 std::string make_session_id(int64_t n) {
-    // simple, unique, opaque-enough for local use
     std::ostringstream os;
     os << "s_" << n;
     return os.str();
@@ -73,7 +86,6 @@ std::string extract_session_id(const std::string & path, const std::string & act
     return id;
 }
 
-// Parse "s_NNN" -> NNN. Returns -1 on bad format.
 int64_t parse_session_id_num(const std::string & id) {
     const std::string pfx = "s_";
     if (id.rfind(pfx, 0) != 0) return -1;
@@ -90,7 +102,6 @@ double now_s() {
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
-// Shared sampler chain builder (greedy + temperature). Per-call in slice 1.
 llama_sampler * make_sampler(float temp, float top_p, int seed) {
     auto * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
     if (top_p < 1.0f) llama_sampler_chain_add(chain, llama_sampler_init_top_p(top_p, 1));
@@ -98,6 +109,66 @@ llama_sampler * make_sampler(float temp, float top_p, int seed) {
     const uint32_t s = (seed < 0) ? LLAMA_DEFAULT_SEED : (uint32_t)seed;
     llama_sampler_chain_add(chain, llama_sampler_init_dist(s));
     return chain;
+}
+
+// Find a session by id under the lock. Returns nullptr if absent. Does NOT hold
+// the lock on return (each session's context is single-threaded; the caller
+// drives generation without the global lock).
+llama_context * lookup_session(AppState & app, int64_t n) {
+    std::lock_guard<std::mutex> lk(app.mu);
+    auto it = (n > 0) ? app.sessions.find(n) : app.sessions.end();
+    return (it == app.sessions.end()) ? nullptr : it->second;
+}
+
+// Seed an empty session with BOS so there are logits to sample from.
+bool seed_if_empty(const AppState & app, llama_context * ctx) {
+    if (llama_memory_seq_pos_max(llama_get_memory(ctx), 0) >= 0) return true;
+    llama_token bos = llama_vocab_bos(app.vocab);
+    llama_batch b = llama_batch_get_one(&bos, 1);
+    return llama_decode(ctx, b) == 0;
+}
+
+// Shared generation loop. Calls `on_token(piece, id)` per produced token (after
+// the token's text is known and it has been fed back into the cache). The
+// callback may return false to stop generation early (e.g. client disconnect).
+// Errors are surfaced by returning a non-empty `error` string.
+//
+// Both the streaming and non-streaming handlers use this so generation logic
+// lives in exactly one place.
+GenResult run_generation(
+    const AppState & app, llama_context * ctx, const GenParams & p,
+    std::function<bool(const std::string & piece, int64_t id)> on_token
+) {
+    GenResult r;
+    if (!seed_if_empty(app, ctx)) return r;
+
+    llama_sampler * smpl = make_sampler(p.temp, p.top_p, p.seed);
+    const int n_ctx = llama_n_ctx(ctx);
+    const double t0 = now_s();
+    bool keep_going = true;
+    for (int step = 0; step < p.max_tokens && keep_going; ++step) {
+        const int used = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
+        if (used + 1 > n_ctx) break;
+        llama_token id = llama_sampler_sample(smpl, ctx, -1);
+        if (llama_vocab_is_eog(app.vocab, id)) break;
+        char buf[64];
+        const int n = llama_token_to_piece(app.vocab, id, buf, sizeof(buf), 0, true);
+        std::string piece = (n > 0) ? std::string(buf, n) : std::string{};
+        r.ids.push_back((int64_t)id);
+        r.text += piece;
+        if (on_token) keep_going = on_token(piece, (int64_t)id);
+        llama_batch batch = llama_batch_get_one(&id, 1);
+        if (llama_decode(ctx, batch) != 0) break;
+    }
+    r.gen_s = now_s() - t0;
+    llama_sampler_free(smpl);
+    return r;
+}
+
+std::string sse_event(const json & j) {
+    std::ostringstream os;
+    os << "data: " << j.dump() << "\n\n";
+    return os.str();
 }
 
 } // namespace
@@ -147,6 +218,21 @@ int main(int argc, char ** argv) {
     app.n_batch = cfg.n_batch;
     std::cerr << "model loaded.\n";
 
+    // Warm up CUDA / kernel JIT by running a tiny generation. Without this the
+    // first real request pays ~10s+ of CUDA initialization (graph capture, kernel
+    // JIT) as its TTFT.
+    {
+        std::cerr << "warming up...\n";
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = 512; cp.n_batch = 512; cp.no_perf = true;
+        if (llama_context * wctx = llama_init_from_model(app.model, cp)) {
+            GenParams gp{5, 0.0f, 1.0f, 0};
+            run_generation(app, wctx, gp, nullptr);
+            llama_free(wctx);
+            std::cerr << "warmup done.\n";
+        }
+    }
+
     httplib::Server svr;
 
     svr.Get("/health", [](const httplib::Request &, httplib::Response &res) {
@@ -177,17 +263,11 @@ int main(int argc, char ** argv) {
     // ---- POST /sessions/{id}/inject : text -> KV cache (no generation) ----
     svr.Post(R"(/sessions/[^/]+/inject)", [&](const httplib::Request &req, httplib::Response &res) {
         std::string sid = extract_session_id(req.path, "inject");
-        int64_t n = parse_session_id_num(sid);
-        llama_context * ctx = nullptr;
-        {
-            std::lock_guard<std::mutex> lk(app.mu);
-            auto it = (n > 0) ? app.sessions.find(n) : app.sessions.end();
-            if (it == app.sessions.end()) {
-                res.status = 404;
-                res.set_content(error_body("unknown session", 404).dump(), "application/json");
-                return;
-            }
-            ctx = it->second;
+        llama_context * ctx = lookup_session(app, parse_session_id_num(sid));
+        if (!ctx) {
+            res.status = 404;
+            res.set_content(error_body("unknown session", 404).dump(), "application/json");
+            return;
         }
         std::string text;
         try { text = json::parse(req.body).value("text", ""); }
@@ -216,7 +296,6 @@ int main(int argc, char ** argv) {
             res.set_content(error_body("tokenize failed", 500).dump(), "application/json");
             return;
         }
-        // capacity check
         const int n_ctx = llama_n_ctx(ctx);
         const int used = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
         if (used + (int)toks.size() > n_ctx) {
@@ -242,81 +321,74 @@ int main(int argc, char ** argv) {
         res.set_content(body.dump(), "application/json");
     });
 
-    // ---- POST /sessions/{id}/generate : non-streaming generation ----
+    // ---- POST /sessions/{id}/generate : streaming (SSE) or JSON ----
     svr.Post(R"(/sessions/[^/]+/generate)", [&](const httplib::Request &req, httplib::Response &res) {
         std::string sid = extract_session_id(req.path, "generate");
-        int64_t n = parse_session_id_num(sid);
-        llama_context * ctx = nullptr;
-        {
-            std::lock_guard<std::mutex> lk(app.mu);
-            auto it = (n > 0) ? app.sessions.find(n) : app.sessions.end();
-            if (it == app.sessions.end()) {
-                res.status = 404;
-                res.set_content(error_body("unknown session", 404).dump(), "application/json");
-                return;
-            }
-            ctx = it->second;
+        llama_context * ctx = lookup_session(app, parse_session_id_num(sid));
+        if (!ctx) {
+            res.status = 404;
+            res.set_content(error_body("unknown session", 404).dump(), "application/json");
+            return;
         }
-        int   max_tokens = 256;
-        float temp = 0.8f;
-        float top_p = 1.0f;
-        int   seed = -1;
+        GenParams gp;
+        bool stream = false;
         try {
             auto j = json::parse(req.body);
-            max_tokens = j.value("max_tokens", 256);
-            temp = j.value("temperature", 0.8f);
-            top_p = j.value("top_p", 1.0f);
-            seed = j.value("seed", -1);
+            gp.max_tokens = j.value("max_tokens", 256);
+            gp.temp       = j.value("temperature", 0.8f);
+            gp.top_p      = j.value("top_p", 1.0f);
+            gp.seed       = j.value("seed", -1);
+            stream        = j.value("stream", false);
         } catch (...) {}
 
-        llama_sampler * smpl = make_sampler(temp, top_p, seed);
-        // If nothing has been decoded yet, seed with BOS so there are logits to
-        // sample from (avoids an assert in llama_sampler_sample on n_outputs=0).
-        if (llama_memory_seq_pos_max(llama_get_memory(ctx), 0) < 0) {
-            llama_token bos = llama_vocab_bos(app.vocab);
-            llama_batch b = llama_batch_get_one(&bos, 1);
-            if (llama_decode(ctx, b) != 0) {
-                llama_sampler_free(smpl);
-                res.status = 500;
-                res.set_content(error_body("failed to seed session", 500).dump(), "application/json");
-                return;
-            }
+        if (!stream) {
+            // slice-1 behavior: whole response as JSON.
+            GenResult r = run_generation(app, ctx, gp, nullptr);
+            const double tok_s = (r.gen_s > 0) ? (r.ids.size() / r.gen_s) : 0.0;
+            json body = {
+                {"session_id", sid},
+                {"text", r.text},
+                {"tokens", r.ids},
+                {"n_tokens", r.ids.size()},
+                {"gen_ms", (int)(r.gen_s * 1000)},
+                {"tokens_per_s", tok_s},
+            };
+            res.set_content(body.dump(), "application/json");
+            return;
         }
-        std::string out;
-        std::vector<int64_t> out_ids;
-        out.reserve(max_tokens * 4);
-        const int n_ctx = llama_n_ctx(ctx);
-        const double t0 = now_s();
-        for (int step = 0; step < max_tokens; ++step) {
-            const int used = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
-            if (used + 1 > n_ctx) break;
-            llama_token id = llama_sampler_sample(smpl, ctx, -1);
-            if (llama_vocab_is_eog(app.vocab, id)) break;
-            out_ids.push_back((int64_t)id);
-            char buf[64];
-            const int n = llama_token_to_piece(app.vocab, id, buf, sizeof(buf), 0, true);
-            if (n > 0) out.append(buf, n);
-            llama_batch batch = llama_batch_get_one(&id, 1);
-            if (llama_decode(ctx, batch) != 0) break;
-        }
-        const double dt = now_s() - t0;
-        llama_sampler_free(smpl);
 
-        const double tok_s = (dt > 0) ? (out_ids.size() / dt) : 0.0;
-        json body = {
-            {"session_id", sid},
-            {"text", out},
-            {"tokens", out_ids},
-            {"n_tokens", out_ids.size()},
-            {"gen_ms", (int)(dt * 1000)},
-            {"tokens_per_s", tok_s},
-        };
-        res.set_content(body.dump(), "application/json");
+        // Streaming: text/event-stream. Generate tokens directly inside the
+        // chunked provider callback — httplib calls it on its worker thread, and
+        // each token piece is written to the DataSink the instant it is produced.
+        // No separate thread, no lifetime issues. The provider blocks httplib's
+        // worker until generation finishes, which is fine (one request at a time).
+        res.set_header("Cache-Control", "no-cache");
+        res.set_header("Connection", "keep-alive");
+        res.set_chunked_content_provider(
+            "text/event-stream",
+            [&app, ctx, gp, sid](size_t, httplib::DataSink & ds) -> bool {
+                GenResult r = run_generation(app, ctx, gp, [&ds](const std::string & piece, int64_t id) {
+                    std::string ev = sse_event(json{
+                        {"type", "token"}, {"token", piece}, {"id", id}
+                    });
+                    return ds.write(ev.data(), ev.size());
+                });
+                const double tok_s = (r.gen_s > 0) ? (r.ids.size() / r.gen_s) : 0.0;
+                std::string done = sse_event(json{
+                    {"type", "done"},
+                    {"n_tokens", r.ids.size()},
+                    {"gen_ms", (int)(r.gen_s * 1000)},
+                    {"tokens_per_s", tok_s},
+                });
+                ds.write(done.data(), done.size());
+                ds.done();
+                return true;
+            }
+        );
     });
 
     // ---- DELETE /sessions/{id} : free the session ----
     svr.Delete(R"(/sessions/[^/]+)", [&](const httplib::Request &req, httplib::Response &res) {
-        // path is "/sessions/{id}"
         const std::string prefix = "/sessions/";
         if (req.path.rfind(prefix, 0) != 0 || req.path.find('/', prefix.size()) != std::string::npos) {
             res.status = 404;
@@ -347,7 +419,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // cleanup on shutdown
     {
         std::lock_guard<std::mutex> lk(app.mu);
         for (auto & [_, ctx] : app.sessions) llama_free(ctx);
