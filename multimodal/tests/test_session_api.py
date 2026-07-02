@@ -70,34 +70,53 @@ def test_inject_unknown_session_404(base):
     assert "error" in r.json()
 
 
+# ------------------------------- chat template ------------------------------
+
+
+def test_inject_messages_applies_chat_template(base, make_session):
+    """Injecting {messages} should apply the model's chat template and produce
+    coherent output (not raw control-token soup)."""
+    sid = make_session()
+    r = requests.post(
+        f"{base}/sessions/{sid}/inject",
+        json={"messages": [{"role": "user", "content": "What is 2+2? Reply with the number."}]},
+        timeout=60,
+    )
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["chat_template_applied"] is True
+    assert j["tokens_injected"] > 0
+    # Generate and check the model produces a coherent response containing "4"
+    g = requests.post(
+        f"{base}/sessions/{sid}/generate",
+        json={"max_tokens": 80, "temperature": 0.0},
+        timeout=120,
+    )
+    assert g.status_code == 200
+    text = g.json()["text"].lower()
+    assert "4" in text, f"expected '4' in response: {text!r}"
+
+
 # ------------------------------- generate -----------------------------------
 
 
 def test_generate_returns_text(base, make_session):
     sid = make_session()
-    # Gemma-4 is instruction-tuned: inject a chat-formatted prompt so it actually
-    # responds (raw completion text yields garbage).
-    prompt = (
-        "<start_of_turn>user\n"
-        "What is the capital of France? Reply with one word.\n"
-        "<end_of_turn>\n"
-        "<start_of_turn>model\n"
-    )
+    # Use the model's chat template (messages) so it responds coherently.
     requests.post(
         f"{base}/sessions/{sid}/inject",
-        json={"text": prompt},
+        json={"messages": [{"role": "user", "content": "What is 2+2? Reply with the number."}]},
         timeout=120,
     )
     r = requests.post(
         f"{base}/sessions/{sid}/generate",
-        json={"max_tokens": 16, "temperature": 0.0},
+        json={"max_tokens": 60, "temperature": 0.0},
         timeout=120,
     )
     assert r.status_code == 200, r.text
     j = r.json()
     assert j["n_tokens"] > 0
     assert isinstance(j["text"], str) and len(j["text"]) > 0
-    # The model should mention Paris in its reply (greedy, chat-formatted).
     print(f"  [generate] {j['n_tokens']} tokens in {j['gen_ms']} ms "
           f"({j['tokens_per_s']:.1f} tok/s): {j['text']!r}")
 

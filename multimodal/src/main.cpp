@@ -29,10 +29,12 @@
 #include "httplib.h"
 #include "nlohmann/json.hpp"
 
+#include "common.h"
+#include "chat.h"
 #include "ggml.h"
 #include "llama.h"
 
-using json = nlohmann::json;
+// 'json' (nlohmann::ordered_json) is provided by common/chat.h.
 
 namespace {
 
@@ -48,6 +50,7 @@ struct ServerConfig {
 struct AppState {
     llama_model * model = nullptr;
     const llama_vocab * vocab = nullptr;
+    common_chat_templates_ptr chat_templates;  // built from the model; applies its chat template
     int n_ctx_per_session = 4096;
     int n_batch = 2048;
     std::mutex mu;
@@ -214,6 +217,12 @@ int main(int argc, char ** argv) {
     app.model = llama_model_load_from_file(cfg.model_path.c_str(), mp);
     if (!app.model) { std::cerr << "error: failed to load model\n"; return 1; }
     app.vocab = llama_model_get_vocab(app.model);
+    app.chat_templates = common_chat_templates_init(app.model, /* override */ "");
+    if (app.chat_templates) {
+        std::cerr << "chat template loaded.\n";
+    } else {
+        std::cerr << "warning: no chat template in model; 'messages' inject will fail.\n";
+    }
     app.n_ctx_per_session = cfg.ctx_size;
     app.n_batch = cfg.n_batch;
     std::cerr << "model loaded.\n";
@@ -270,7 +279,31 @@ int main(int argc, char ** argv) {
             return;
         }
         std::string text;
-        try { text = json::parse(req.body).value("text", ""); }
+        bool used_template = false;
+        try {
+            auto j = json::parse(req.body);
+            if (j.contains("messages")) {
+                // Apply the model's chat template to a list of {role, content} msgs.
+                if (!app.chat_templates) {
+                    res.status = 500;
+                    res.set_content(error_body("model has no chat template", 500).dump(), "application/json");
+                    return;
+                }
+                common_chat_templates_inputs inputs;
+                inputs.add_generation_prompt = j.value("add_generation_prompt", true);
+                for (const auto & m : j["messages"]) {
+                    common_chat_msg msg;
+                    msg.role    = m.value("role", "user");
+                    msg.content = m.value("content", "");
+                    inputs.messages.push_back(std::move(msg));
+                }
+                common_chat_params cp = common_chat_templates_apply(app.chat_templates.get(), inputs);
+                text = cp.prompt;
+                used_template = true;
+            } else {
+                text = j.value("text", "");
+            }
+        }
         catch (...) {
             res.status = 400;
             res.set_content(error_body("invalid JSON body", 400).dump(), "application/json");
@@ -278,7 +311,7 @@ int main(int argc, char ** argv) {
         }
         if (text.empty()) {
             res.status = 400;
-            res.set_content(error_body("'text' is required", 400).dump(), "application/json");
+            res.set_content(error_body("'text' or 'messages' is required", 400).dump(), "application/json");
             return;
         }
         const bool is_first = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == -1;
@@ -317,6 +350,7 @@ int main(int argc, char ** argv) {
             {"tokens_injected", toks.size()},
             {"cache_size", new_size},
             {"inject_ms", (int)(dt * 1000)},
+            {"chat_template_applied", used_template},
         };
         res.set_content(body.dump(), "application/json");
     });

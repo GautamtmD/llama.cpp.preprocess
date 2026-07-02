@@ -81,13 +81,12 @@ def main():
     sid = r.json()["session_id"]
     print(f"[demo] session: {sid}", file=sys.stderr)
 
-    chat_prompt = (
-        f"<start_of_turn>user\n{args.prompt}\n<end_of_turn>\n"
-        f"<start_of_turn>model\n"
-    )
+    chat_prompt = json.dumps({"messages": [{"role": "user", "content": args.prompt}]})
     requests.post(
         f"{args.llm_url}/sessions/{sid}/inject",
-        json={"text": chat_prompt}, timeout=60,
+        data=chat_prompt,
+        headers={"Content-Type": "application/json"},
+        timeout=60,
     )
 
     # ---- 3. Load TTS engine BEFORE starting the stream (so we don't miss ----

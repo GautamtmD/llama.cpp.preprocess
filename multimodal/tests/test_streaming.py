@@ -24,11 +24,12 @@ def _parse_sse(response) -> Iterator[dict]:
 
 
 def _inject_chat(base, sid, user_text):
-    prompt = (
-        "<start_of_turn>user\n" + user_text +
-        "\n<end_of_turn>\n<start_of_turn>model\n"
+    """Inject using the model's chat template (messages format)."""
+    requests.post(
+        f"{base}/sessions/{sid}/inject",
+        json={"messages": [{"role": "user", "content": user_text}]},
+        timeout=60,
     )
-    requests.post(f"{base}/sessions/{sid}/inject", json={"text": prompt}, timeout=60)
 
 
 def test_stream_yields_token_events(base, make_session):
