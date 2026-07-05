@@ -52,3 +52,18 @@ target_link_libraries(multimodal-server PRIVATE
 )
 
 target_compile_features(multimodal-server PRIVATE cxx_std_17)
+
+# Unit tests for the pure helpers (util.h). Header-only against the vendored
+# nlohmann json — no model/GPU/projector, no link to llama/mtmd. Built and run
+# by scripts/build_engine.sh as a build-time contract gate.
+add_executable(multimodal-util-tests
+    tests/test_util.cpp
+)
+target_include_directories(multimodal-util-tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../vendor
+)
+target_compile_features(multimodal-util-tests PRIVATE cxx_std_17)
+set_target_properties(multimodal-util-tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)

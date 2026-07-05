@@ -30,6 +30,8 @@
 #include "httplib.h"
 #include "nlohmann/json.hpp"
 
+#include "util.h"
+
 #include "common.h"
 #include "chat.h"
 #include "ggml.h"
@@ -75,35 +77,6 @@ struct GenResult {
     std::vector<int64_t> ids;
     double gen_s = 0.0;
 };
-
-std::string make_session_id(int64_t n) {
-    std::ostringstream os;
-    os << "s_" << n;
-    return os.str();
-}
-
-// Parse the {id} out of a "/sessions/{id}/..." path. Returns empty on miss.
-std::string extract_session_id(const std::string & path, const std::string & action) {
-    const std::string prefix = "/sessions/";
-    if (path.rfind(prefix, 0) != 0) return "";
-    const size_t rest = path.find('/', prefix.size());
-    if (rest == std::string::npos) return "";
-    const std::string id = path.substr(prefix.size(), rest - prefix.size());
-    const std::string act = path.substr(rest);
-    if (act != "/" + action) return "";
-    return id;
-}
-
-int64_t parse_session_id_num(const std::string & id) {
-    const std::string pfx = "s_";
-    if (id.rfind(pfx, 0) != 0) return -1;
-    try { return std::stoll(id.substr(pfx.size())); }
-    catch (...) { return -1; }
-}
-
-json error_body(const std::string & msg, int code) {
-    return json{{"error", msg}, {"code", code}};
-}
 
 double now_s() {
     using namespace std::chrono;
@@ -173,42 +146,9 @@ GenResult run_generation(
     return r;
 }
 
-std::string sse_event(const json & j) {
-    std::ostringstream os;
-    os << "data: " << j.dump() << "\n\n";
-    return os.str();
-}
-
 } // namespace
 
 // ---- multimodal helpers (outside anon namespace so they can be forward-declared) ----
-
-// RFC4648 base64 decode (no URL-safe, ignores whitespace).
-static std::string base64_decode(const std::string & s) {
-    static int8_t tbl[256];
-    static bool init = false;
-    if (!init) {
-        for (int i = 0; i < 256; ++i) tbl[i] = -1;
-        const char * chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        for (int i = 0; i < 64; ++i) tbl[(unsigned char)chars[i]] = (int8_t)i;
-        init = true;
-    }
-    std::string out;
-    out.reserve(s.size() * 3 / 4);
-    int val = 0, bits = 0;
-    for (char c : s) {
-        if (c == '=' || c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
-        int8_t d = tbl[(unsigned char)c];
-        if (d < 0) continue;  // skip invalid
-        val = (val << 6) | d;
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            out += char((val >> bits) & 0xFF);
-        }
-    }
-    return out;
-}
 
 // Decode image bytes (PNG/JPEG/BMP/...) into an mtmd_bitmap via the mtmd
 // helper. We use the public helper (not stb directly) because the stb_image
