@@ -1,0 +1,124 @@
+{
+  "word_seven": {
+    "voice": "default",
+    "prompt": "seven",
+    "expected_words": [
+      "seven"
+    ]
+  },
+  "word_banana": {
+    "voice": "Buffy_flirty",
+    "prompt": "banana",
+    "expected_words": [
+      "banana"
+    ]
+  },
+  "word_purple": {
+    "voice": "Buffy_Sarcastic",
+    "prompt": "purple",
+    "expected_words": [
+      "purple"
+    ]
+  },
+  "word_morning": {
+    "voice": "default",
+    "prompt": "morning",
+    "expected_words": [
+      "morning"
+    ]
+  },
+  "sent_fox": {
+    "voice": "default",
+    "prompt": "the quick brown fox",
+    "expected_words": [
+      "the",
+      "quick",
+      "brown",
+      "fox"
+    ]
+  },
+  "sent_hello": {
+    "voice": "Buffy_flirty",
+    "prompt": "hello how are you",
+    "expected_words": [
+      "hello",
+      "how",
+      "are",
+      "you"
+    ]
+  },
+  "sent_weather": {
+    "voice": "Buffy_Sarcastic",
+    "prompt": "i like warm weather",
+    "expected_words": [
+      "i",
+      "like",
+      "warm",
+      "weather"
+    ]
+  },
+  "sent_dog": {
+    "voice": "default",
+    "prompt": "the dog runs fast",
+    "expected_words": [
+      "the",
+      "dog",
+      "runs",
+      "fast"
+    ]
+  },
+  "sent_door": {
+    "voice": "Buffy_flirty",
+    "prompt": "please close the door",
+    "expected_words": [
+      "please",
+      "close",
+      "the",
+      "door"
+    ]
+  },
+  "sent_game": {
+    "voice": "Buffy_Sarcastic",
+    "prompt": "we can win this game",
+    "expected_words": [
+      "we",
+      "can",
+      "win",
+      "this",
+      "game"
+    ]
+  },
+  "long_walk": {
+    "voice": "default",
+    "prompt": "the weather is nice today. i think we should go for a walk. we can stop for coffee on the way. it will be a fun afternoon.",
+    "expected_words": [
+      "the",
+      "weather",
+      "is",
+      "nice",
+      "today",
+      "i",
+      "think",
+      "we",
+      "should",
+      "go",
+      "for",
+      "a",
+      "walk",
+      "we",
+      "can",
+      "stop",
+      "for",
+      "coffee",
+      "on",
+      "the",
+      "way",
+      "it",
+      "will",
+      "be",
+      "a",
+      "fun",
+      "afternoon"
+    ]
+  }
+}

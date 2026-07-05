@@ -216,7 +216,12 @@ static std::string base64_decode(const std::string & s) {
 // are not exported from mtmd.dll. The helper also auto-detects audio files,
 // which sets up slice 3b (audio inject) for free.
 // Returns nullptr on failure. Caller owns the result (free with mtmd_bitmap_free).
-static mtmd_bitmap * bitmap_from_image_bytes(mtmd_context * mtmd_ctx,
+// Decode image OR audio bytes into an mtmd_bitmap via the mtmd helper. The
+// helper auto-detects the media type by magic bytes: images via stb_image
+// (jpg/png/bmp/...), audio via miniaudio (wav/mp3/flac) resampled to the
+// projector's sample rate (mtmd_get_audio_sample_rate). Returns nullptr on
+// failure. Caller owns the result (free with mtmd_bitmap_free).
+static mtmd_bitmap * bitmap_from_media_bytes(mtmd_context * mtmd_ctx,
                                              const std::string & bytes) {
     mtmd_helper_bitmap_wrapper wrap = mtmd_helper_bitmap_init_from_buf(
         mtmd_ctx,
@@ -446,15 +451,41 @@ int main(int argc, char ** argv) {
                                 b64 = b64.substr(comma + 1);
                             }
                             std::string bytes = base64_decode(b64);
-                            mtmd_bitmap * bmp = bitmap_from_image_bytes(app.mtmd_ctx, bytes);
+                            mtmd_bitmap * bmp = bitmap_from_media_bytes(app.mtmd_ctx, bytes);
                             if (!bmp) {
                                 throw std::runtime_error("failed to decode image");
                             }
                             bitmaps.push_back(bmp);
                             out += media_marker;
                             used_multimodal = true;
+                        } else if (ptype == "audio" || ptype == "input_audio") {
+                            if (!app.mtmd_ctx) {
+                                throw std::runtime_error("audio part requires --mmproj to be loaded");
+                            }
+                            if (!mtmd_support_audio(app.mtmd_ctx)) {
+                                throw std::runtime_error("audio part requires a projector with audio support");
+                            }
+                            // accept {"data": "<b64>"} or {"input_audio": {"data": "<data-url or b64>"}}
+                            std::string b64;
+                            if (part.contains("data")) {
+                                b64 = part["data"].get<std::string>();
+                            } else if (part.contains("input_audio")) {
+                                b64 = part["input_audio"].value("data", "");
+                            }
+                            // strip optional data-URL prefix (data:audio/wav;base64,...)
+                            size_t comma = b64.find(',');
+                            if (b64.rfind("data:", 0) == 0 && comma != std::string::npos) {
+                                b64 = b64.substr(comma + 1);
+                            }
+                            std::string bytes = base64_decode(b64);
+                            mtmd_bitmap * bmp = bitmap_from_media_bytes(app.mtmd_ctx, bytes);
+                            if (!bmp) {
+                                throw std::runtime_error("failed to decode audio");
+                            }
+                            bitmaps.push_back(bmp);
+                            out += media_marker;
+                            used_multimodal = true;
                         }
-                        // audio handled in slice 3b
                     }
                     return out;
                 };

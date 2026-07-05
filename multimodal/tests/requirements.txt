@@ -4,3 +4,5 @@
 pytest
 requests
 Pillow
+numpy          # audio rate-resampling in test_multimodal_audio
+soundfile      # read/write WAV for the audio rate test
