@@ -13,6 +13,7 @@
 // modify the upstream llama.cpp fork. One model is loaded and shared; each
 // session is its own llama_context (owning its KV cache).
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -33,6 +34,8 @@
 #include "chat.h"
 #include "ggml.h"
 #include "llama.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
 
 // 'json' (nlohmann::ordered_json) is provided by common/chat.h.
 
@@ -40,6 +43,7 @@ namespace {
 
 struct ServerConfig {
     std::string model_path;
+    std::string mmproj_path;   // multimodal projector gguf (empty = text-only)
     int  port          = 8080;
     int  n_gpu_layers  = 99;
     int  ctx_size      = 4096;
@@ -51,6 +55,7 @@ struct AppState {
     llama_model * model = nullptr;
     const llama_vocab * vocab = nullptr;
     common_chat_templates_ptr chat_templates;  // built from the model; applies its chat template
+    mtmd_context * mtmd_ctx = nullptr;         // multimodal projector (may be null)
     int n_ctx_per_session = 4096;
     int n_batch = 2048;
     std::mutex mu;
@@ -176,6 +181,96 @@ std::string sse_event(const json & j) {
 
 } // namespace
 
+// ---- multimodal helpers (outside anon namespace so they can be forward-declared) ----
+
+// RFC4648 base64 decode (no URL-safe, ignores whitespace).
+static std::string base64_decode(const std::string & s) {
+    static int8_t tbl[256];
+    static bool init = false;
+    if (!init) {
+        for (int i = 0; i < 256; ++i) tbl[i] = -1;
+        const char * chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; ++i) tbl[(unsigned char)chars[i]] = (int8_t)i;
+        init = true;
+    }
+    std::string out;
+    out.reserve(s.size() * 3 / 4);
+    int val = 0, bits = 0;
+    for (char c : s) {
+        if (c == '=' || c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+        int8_t d = tbl[(unsigned char)c];
+        if (d < 0) continue;  // skip invalid
+        val = (val << 6) | d;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out += char((val >> bits) & 0xFF);
+        }
+    }
+    return out;
+}
+
+// Decode image bytes (PNG/JPEG/BMP/...) into an mtmd_bitmap via the mtmd
+// helper. We use the public helper (not stb directly) because the stb_image
+// implementation is compiled statically into the mtmd library and its symbols
+// are not exported from mtmd.dll. The helper also auto-detects audio files,
+// which sets up slice 3b (audio inject) for free.
+// Returns nullptr on failure. Caller owns the result (free with mtmd_bitmap_free).
+static mtmd_bitmap * bitmap_from_image_bytes(mtmd_context * mtmd_ctx,
+                                             const std::string & bytes) {
+    mtmd_helper_bitmap_wrapper wrap = mtmd_helper_bitmap_init_from_buf(
+        mtmd_ctx,
+        reinterpret_cast<const unsigned char *>(bytes.data()),
+        bytes.size(),
+        /*placeholder*/ false);
+    // video_ctx is non-null only for video input, which we don't support here.
+    // (Image/audio decode produces a bitmap with a null video_ctx.)
+    return wrap.bitmap;  // may be nullptr on failure
+}
+
+// Run the mtmd tokenize + per-chunk eval path: turns the marker-containing text
+// + bitmaps into chunks and decodes each into the session's KV cache.
+// Returns false on error. Does NOT free the bitmaps (caller owns).
+static bool mtmd_inject(mtmd_context * mtmd_ctx, const llama_vocab * /*vocab*/,
+                        llama_context * ctx, const std::string & text,
+                        const std::vector<mtmd_bitmap *> & bitmaps) {
+    mtmd_input_text input_text;
+    input_text.text          = text.c_str();
+    input_text.add_special   = true;
+    input_text.parse_special = true;
+
+    mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+    std::vector<const mtmd_bitmap *> bptrs;
+    bptrs.reserve(bitmaps.size());
+    for (auto * b : bitmaps) bptrs.push_back(b);
+
+    int32_t rc = mtmd_tokenize(mtmd_ctx, chunks, &input_text,
+                               bptrs.data(), bptrs.size());
+    if (rc != 0) {
+        mtmd_input_chunks_free(chunks);
+        return false;
+    }
+
+    const size_t n_chunks = mtmd_input_chunks_size(chunks);
+    llama_pos n_past = 0;
+    // start from the current cache position (so multi-turn inject composes)
+    llama_pos cur_max = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+    if (cur_max >= 0) n_past = cur_max + 1;
+
+    bool ok = true;
+    for (size_t i = 0; i < n_chunks; ++i) {
+        const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, i);
+        llama_pos new_n_past = n_past;
+        int32_t r = mtmd_helper_eval_chunk_single(
+            mtmd_ctx, ctx, chunk, n_past, /*seq_id*/ 0, /*n_batch*/ 512,
+            /*logits_last*/ (i == n_chunks - 1), &new_n_past);
+        if (r != 0) { ok = false; break; }
+        n_past = new_n_past;
+    }
+    mtmd_input_chunks_free(chunks);
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     ServerConfig cfg;
     for (int i = 1; i < argc; ++i) {
@@ -185,6 +280,7 @@ int main(int argc, char ** argv) {
         };
         if      (a == "--port")          cfg.port = std::atoi(next().c_str());
         else if (a == "--model" || a == "-m") cfg.model_path = next();
+        else if (a == "--mmproj")        cfg.mmproj_path = next();
         else if (a == "--n-gpu-layers" || a == "-ngl") cfg.n_gpu_layers = std::atoi(next().c_str());
         else if (a == "--ctx-size" || a == "-c") cfg.ctx_size = std::atoi(next().c_str());
         else if (a == "--n-batch")      cfg.n_batch = std::atoi(next().c_str());
@@ -192,6 +288,7 @@ int main(int argc, char ** argv) {
             std::cout <<
                 "multimodal-server [options]\n"
                 "  -m, --model PATH          model gguf (required)\n"
+                "      --mmproj PATH         multimodal projector gguf (enables image/audio)\n"
                 "      --port N              HTTP port (default 8080)\n"
                 "  -ngl,--n-gpu-layers N     GPU layers (default 99)\n"
                 "  -c, --ctx-size N          context per session (default 4096)\n"
@@ -227,6 +324,22 @@ int main(int argc, char ** argv) {
     app.n_batch = cfg.n_batch;
     std::cerr << "model loaded.\n";
 
+    // Load the multimodal projector (if given). Encoder-free models like Gemma 4
+    // 12B have a tiny projector (no heavy ViT), so this is cheap.
+    if (!cfg.mmproj_path.empty()) {
+        std::cerr << "loading mmproj: " << cfg.mmproj_path << " ...\n";
+        mtmd_context_params mp = mtmd_context_params_default();
+        mp.use_gpu = (cfg.n_gpu_layers > 0);
+        mp.warmup  = true;
+        app.mtmd_ctx = mtmd_init_from_file(cfg.mmproj_path.c_str(), app.model, mp);
+        if (!app.mtmd_ctx) {
+            std::cerr << "error: failed to load mmproj\n";
+            return 1;
+        }
+        std::cerr << "mmproj loaded (vision=" << mtmd_support_vision(app.mtmd_ctx)
+                  << " audio=" << mtmd_support_audio(app.mtmd_ctx) << ").\n";
+    }
+
     // Warm up CUDA / kernel JIT by running a tiny generation. Without this the
     // first real request pays ~10s+ of CUDA initialization (graph capture, kernel
     // JIT) as its TTFT.
@@ -246,6 +359,17 @@ int main(int argc, char ** argv) {
 
     svr.Get("/health", [](const httplib::Request &, httplib::Response &res) {
         res.set_content(R"({"status":"ok"})", "application/json");
+    });
+
+    // ---- GET /info : capabilities (what the model + projector support) ----
+    svr.Get("/info", [&](const httplib::Request &, httplib::Response &res) {
+        json body = {
+            {"model_loaded", app.model != nullptr},
+            {"supports_vision", app.mtmd_ctx ? mtmd_support_vision(app.mtmd_ctx) : false},
+            {"supports_audio", app.mtmd_ctx ? mtmd_support_audio(app.mtmd_ctx) : false},
+            {"audio_sample_rate", app.mtmd_ctx ? mtmd_get_audio_sample_rate(app.mtmd_ctx) : 0},
+        };
+        res.set_content(body.dump(), "application/json");
     });
 
     // ---- POST /sessions : create a session ----
@@ -280,33 +404,104 @@ int main(int argc, char ** argv) {
         }
         std::string text;
         bool used_template = false;
+        bool used_multimodal = false;
         try {
             auto j = json::parse(req.body);
             if (j.contains("messages")) {
                 // Apply the model's chat template to a list of {role, content} msgs.
+                // content may be a string OR an array of parts (text/image/audio).
                 if (!app.chat_templates) {
                     res.status = 500;
                     res.set_content(error_body("model has no chat template", 500).dump(), "application/json");
                     return;
                 }
+                // First pass: collect any media parts across all messages, replacing
+                // each with the mtmd media marker in the text content.
+                std::vector<mtmd_bitmap *> bitmaps;  // owned; freed below
+                std::string media_marker = mtmd_default_marker();
+                auto replace_media_in_content = [&](const json & content) -> std::string {
+                    if (content.is_string()) {
+                        return content.get<std::string>();
+                    }
+                    // array of parts
+                    std::string out;
+                    for (const auto & part : content) {
+                        std::string ptype = part.value("type", "");
+                        if (ptype == "text") {
+                            out += part.value("text", "");
+                        } else if (ptype == "image" || ptype == "image_url") {
+                            if (!app.mtmd_ctx) {
+                                throw std::runtime_error("image part requires --mmproj to be loaded");
+                            }
+                            // accept {"data": "<base64>"} or {"image_url": {"url": "data:image/png;base64,<..>"}}
+                            std::string b64;
+                            if (part.contains("data")) {
+                                b64 = part["data"].get<std::string>();
+                            } else if (part.contains("image_url")) {
+                                b64 = part["image_url"].value("url", "");
+                            }
+                            // strip optional data-URL prefix
+                            size_t comma = b64.find(',');
+                            if (b64.rfind("data:", 0) == 0 && comma != std::string::npos) {
+                                b64 = b64.substr(comma + 1);
+                            }
+                            std::string bytes = base64_decode(b64);
+                            mtmd_bitmap * bmp = bitmap_from_image_bytes(app.mtmd_ctx, bytes);
+                            if (!bmp) {
+                                throw std::runtime_error("failed to decode image");
+                            }
+                            bitmaps.push_back(bmp);
+                            out += media_marker;
+                            used_multimodal = true;
+                        }
+                        // audio handled in slice 3b
+                    }
+                    return out;
+                };
+
                 common_chat_templates_inputs inputs;
                 inputs.add_generation_prompt = j.value("add_generation_prompt", true);
                 for (const auto & m : j["messages"]) {
                     common_chat_msg msg;
                     msg.role    = m.value("role", "user");
-                    msg.content = m.value("content", "");
+                    msg.content = replace_media_in_content(m["content"]);
                     inputs.messages.push_back(std::move(msg));
                 }
                 common_chat_params cp = common_chat_templates_apply(app.chat_templates.get(), inputs);
                 text = cp.prompt;
                 used_template = true;
+
+                // If we have media, run the mtmd tokenize+eval path instead of the
+                // plain text tokenize+decode below.
+                if (used_multimodal) {
+                    double t0 = now_s();
+                    bool ok = mtmd_inject(app.mtmd_ctx, app.vocab, ctx, text, bitmaps);
+                    const double dt = now_s() - t0;
+                    for (auto * b : bitmaps) mtmd_bitmap_free(b);
+                    if (!ok) {
+                        res.status = 500;
+                        res.set_content(error_body("mtmd tokenize/decode failed", 500).dump(), "application/json");
+                        return;
+                    }
+                    const int new_size = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
+                    json body = {
+                        {"session_id", sid},
+                        {"cache_size", new_size},
+                        {"inject_ms", (int)(dt * 1000)},
+                        {"chat_template_applied", used_template},
+                        {"used_multimodal", true},
+                        {"n_media", bitmaps.size()},
+                    };
+                    res.set_content(body.dump(), "application/json");
+                    return;
+                }
             } else {
                 text = j.value("text", "");
             }
         }
-        catch (...) {
+        catch (const std::exception & e) {
             res.status = 400;
-            res.set_content(error_body("invalid JSON body", 400).dump(), "application/json");
+            res.set_content(error_body(std::string("bad request: ") + e.what(), 400).dump(), "application/json");
             return;
         }
         if (text.empty()) {

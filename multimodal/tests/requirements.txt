@@ -1,0 +1,6 @@
+# Python deps for the multimodal-server behavior tests.
+# Install into the repo venv (.venv) before running pytest:
+#   .venv/Scripts/python.exe -m pip install -r engine/multimodal/tests/requirements.txt
+pytest
+requests
+Pillow

@@ -16,6 +16,8 @@ set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
 # We DO need the `common` lib (llama-common) for tokenization helpers etc.
 set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
+# We need libmtmd (multimodal projector: image/audio injection).
+set(LLAMA_BUILD_TOOLS ON CACHE BOOL "" FORCE)
 add_subdirectory(
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_BINARY_DIR}/llama-build
@@ -39,12 +41,14 @@ target_include_directories(multimodal-server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../vendor
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
     ${CMAKE_CURRENT_SOURCE_DIR}/../common
+    ${CMAKE_CURRENT_SOURCE_DIR}/../tools/mtmd
 )
 
 target_link_libraries(multimodal-server PRIVATE
     llama
     llama-common
     cpp-httplib
+    mtmd
 )
 
 target_compile_features(multimodal-server PRIVATE cxx_std_17)
