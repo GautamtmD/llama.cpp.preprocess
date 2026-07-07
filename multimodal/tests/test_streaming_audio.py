@@ -277,3 +277,82 @@ def test_streaming_payload_validation(base, make_session):
     assert "multiple of 640" in r_samples.json()["error"]
 
 
+def test_tts_to_inject_integration(base, make_session):
+    import sys
+    from pathlib import Path
+
+    # Resolve project root and append GPA engine source to sys.path
+    project_root = Path(HERE).parents[2]
+    gpa_src = project_root / "audio_engines" / "gpa_1_5" / "src"
+    if str(gpa_src) not in sys.path:
+        sys.path.insert(0, str(gpa_src))
+
+    from tts_streaming_engine.engine import GPAStreamingTTSEngine, resolve_assets_dir
+    import numpy as np
+
+    # Initialize the TTS engine
+    assets = resolve_assets_dir(project_root)
+    eng = GPAStreamingTTSEngine(assets_dir=assets, mode="performance", project_root=project_root)
+    eng.warmup()
+
+    # Synthesize phrase
+    text_to_speak = "please close the door"
+    chunks = [c.samples for c in eng.synthesize_stream(text_to_speak)]
+    assert len(chunks) > 0, "No audio chunks synthesized by TTS"
+
+    # Concatenate and pad to 640-sample boundaries
+    samples = np.concatenate(chunks)
+    remainder = len(samples) % 640
+    if remainder != 0:
+        padding = 640 - remainder
+        samples = np.pad(samples, (0, padding), mode="constant")
+
+    # Stream chunks to the server
+    sid = make_session()
+    prefix_text = (
+        f"<|turn>system\n<|think|>\n{TRANSCRIPTION_SYSTEM_PROMPT}<turn|>\n"
+        f"<|turn>user\n<|audio>"
+    )
+    r_pref = requests.post(f"{base}/sessions/{sid}/inject", json={"text": prefix_text}, timeout=60)
+    assert r_pref.status_code == 200
+
+    chunk_size = 6400
+    for i in range(0, len(samples), chunk_size):
+        chunk = samples[i : i + chunk_size]
+        chunk_bytes = struct.pack(f"<{len(chunk)}f", *chunk)
+        chunk_b64 = base64.b64encode(chunk_bytes).decode("ascii")
+        r_chunk = requests.post(f"{base}/sessions/{sid}/inject", json={"audio": chunk_b64}, timeout=60)
+        assert r_chunk.status_code == 200
+
+    # Suffix
+    suffix_text = "<audio|><turn|>\n<|turn>model\n"
+    r_suff = requests.post(f"{base}/sessions/{sid}/inject", json={"text": suffix_text}, timeout=60)
+    assert r_suff.status_code == 200
+
+    # Generate transcript
+    g = requests.post(
+        f"{base}/sessions/{sid}/generate",
+        json={"max_tokens": 100, "temperature": 0.0},
+        timeout=120,
+    )
+    assert g.status_code == 200
+    transcript = g.json()["text"]
+    print(f"  [TTS Integration] Generated: {transcript!r}")
+
+    # Validate transcription content contains key words
+    import re
+    def normalize_words(t: str) -> list[str]:
+        t = t.lower()
+        t = re.sub(r"[^a-z0-9\s]", " ", t)
+        return [w for w in t.split() if w]
+
+    def is_subsequence(needle: list[str], haystack: list[str]) -> bool:
+        it = iter(haystack)
+        return all(w in it for w in needle)
+
+    expected = ["please", "close", "the", "door"]
+    words = normalize_words(transcript)
+    assert is_subsequence(expected, words), f"ASR failed on TTS-generated audio. Output: {transcript}"
+
+
+
