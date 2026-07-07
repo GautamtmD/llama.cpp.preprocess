@@ -474,41 +474,37 @@ int main(int argc, char ** argv) {
                 }
                 std::string bytes = base64_decode(b64);
 
-                mtmd_bitmap * bmp = nullptr;
-                auto is_audio_buffer = [](const std::string & buf) -> bool {
-                    if (buf.size() < 12) {
-                        return false;
-                    }
-                    bool is_wav = memcmp(buf.data(), "RIFF", 4) == 0 && memcmp(buf.data() + 8, "WAVE", 4) == 0;
-                    bool is_mp3 = buf.size() >= 3 && (
-                        memcmp(buf.data(), "ID3", 3) == 0 ||
-                        ((unsigned char)buf[0] == 0xFF && ((unsigned char)buf[1] & 0xE0) == 0xE0)
-                    );
-                    bool is_flac = memcmp(buf.data(), "fLaC", 4) == 0;
-                    return is_wav || is_mp3 || is_flac;
-                };
-
-                if (is_audio_buffer(bytes)) {
-                    if (!app.mtmd_ctx) {
-                        res.status = 400;
-                        res.set_content(error_body("audio requires --mmproj to be loaded", 400).dump(), "application/json");
-                        return;
-                    }
-                    bmp = bitmap_from_media_bytes(app.mtmd_ctx, bytes);
-                } else {
-                    if (!app.mtmd_ctx) {
-                        res.status = 400;
-                        res.set_content(error_body("audio requires --mmproj to be loaded", 400).dump(), "application/json");
-                        return;
-                    }
-                    size_t n_samples = bytes.size() / sizeof(float);
-                    const float * samples = reinterpret_cast<const float *>(bytes.data());
-                    bmp = mtmd_bitmap_init_from_audio(n_samples, samples);
+                if (bytes.empty()) {
+                    res.status = 400;
+                    res.set_content(error_body("audio buffer cannot be empty", 400).dump(), "application/json");
+                    return;
                 }
+
+                if (bytes.size() % sizeof(float) != 0) {
+                    res.status = 400;
+                    res.set_content(error_body("audio buffer size must be a multiple of 4 bytes (sizeof(float))", 400).dump(), "application/json");
+                    return;
+                }
+
+                size_t n_samples = bytes.size() / sizeof(float);
+                if (n_samples % 640 != 0) {
+                    res.status = 400;
+                    res.set_content(error_body("audio sample count must be a multiple of 640 (Gemma 4 audio frame size)", 400).dump(), "application/json");
+                    return;
+                }
+
+                if (!app.mtmd_ctx) {
+                    res.status = 400;
+                    res.set_content(error_body("audio requires --mmproj to be loaded", 400).dump(), "application/json");
+                    return;
+                }
+
+                const float * samples = reinterpret_cast<const float *>(bytes.data());
+                mtmd_bitmap * bmp = mtmd_bitmap_init_from_audio(n_samples, samples);
 
                 if (!bmp) {
                     res.status = 400;
-                    res.set_content(error_body("failed to decode audio", 400).dump(), "application/json");
+                    res.set_content(error_body("failed to decode audio bitmap", 400).dump(), "application/json");
                     return;
                 }
 
@@ -530,11 +526,13 @@ int main(int argc, char ** argv) {
                 }
 
                 const size_t n_chunks = mtmd_input_chunks_size(chunks);
-                bool ok = false;
+                bool ok = true;
+                bool has_audio = false;
                 llama_pos new_n_past = 0;
                 for (size_t i = 0; i < n_chunks; ++i) {
                     const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, i);
                     if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+                        has_audio = true;
                         llama_pos n_past = 0;
                         llama_pos cur_max = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
                         if (cur_max >= 0) n_past = cur_max + 1;
@@ -542,9 +540,14 @@ int main(int argc, char ** argv) {
                         int32_t r = mtmd_helper_eval_chunk_single(
                             app.mtmd_ctx, ctx, chunk, n_past, /*seq_id*/ 0, /*n_batch*/ 512,
                             /*logits_last*/ true, &new_n_past);
-                        if (r == 0) ok = true;
-                        break;
+                        if (r != 0) {
+                            ok = false;
+                            break;
+                        }
                     }
+                }
+                if (!has_audio) {
+                    ok = false;
                 }
 
                 mtmd_bitmap_free(bmp);

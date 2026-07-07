@@ -253,3 +253,27 @@ def test_streaming_latency_benchmark(base, make_session):
     assert warm_latency < 1.000, f"Warm latency {warm_latency * 1000:.1f} ms exceeds the 1000 ms budget!"
     assert warm_latency < cold_latency, "Streaming inject (warm) should be faster than one-shot (cold)!"
 
+
+def test_streaming_payload_validation(base, make_session):
+    sid = make_session()
+
+    # 1. Test empty audio payload
+    r_empty = requests.post(f"{base}/sessions/{sid}/inject", json={"audio": ""}, timeout=10)
+    assert r_empty.status_code == 400
+    assert "cannot be empty" in r_empty.json()["error"]
+
+    # 2. Test payload size not multiple of sizeof(float)
+    bad_bytes_b64 = base64.b64encode(b"123").decode("ascii")
+    r_size = requests.post(f"{base}/sessions/{sid}/inject", json={"audio": bad_bytes_b64}, timeout=10)
+    assert r_size.status_code == 400
+    assert "multiple of 4 bytes" in r_size.json()["error"]
+
+    # 3. Test payload sample count not multiple of 640
+    bad_samples = [0.0] * 10
+    bad_samples_bytes = struct.pack("<10f", *bad_samples)
+    bad_samples_b64 = base64.b64encode(bad_samples_bytes).decode("ascii")
+    r_samples = requests.post(f"{base}/sessions/{sid}/inject", json={"audio": bad_samples_b64}, timeout=10)
+    assert r_samples.status_code == 400
+    assert "multiple of 640" in r_samples.json()["error"]
+
+
