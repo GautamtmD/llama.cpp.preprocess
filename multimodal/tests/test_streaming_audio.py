@@ -54,7 +54,8 @@ TRANSCRIPTION_SYSTEM_PROMPT = (
 )
 
 
-def test_streaming_vs_oneshot_equivalence(base, make_session):
+@pytest.mark.parametrize("chunk_size", [640, 1280, 6400])
+def test_streaming_vs_oneshot_equivalence(base, make_session, chunk_size):
     name = "sent_door"  # "please close the door"
     samples, sr = read_wav_as_float32(name)
     assert sr == 16000, f"Expected 16kHz fixture, got {sr}Hz"
@@ -79,7 +80,7 @@ def test_streaming_vs_oneshot_equivalence(base, make_session):
     # Generate one-shot transcript
     g_one = requests.post(
         f"{base}/sessions/{sid_one}/generate",
-        json={"max_tokens": 100, "temperature": 0.0},
+        json={"max_tokens": 250, "temperature": 0.0},
         timeout=120,
     )
     assert g_one.status_code == 200
@@ -104,7 +105,6 @@ def test_streaming_vs_oneshot_equivalence(base, make_session):
     assert r_pref.status_code == 200, r_pref.text
 
     # Step 2b: Inject audio chunks incrementally (e.g. 400ms / 6400 samples)
-    chunk_size = 6400
     for i in range(0, len(samples), chunk_size):
         chunk = samples[i : i + chunk_size]
         # pack as float32
@@ -132,7 +132,7 @@ def test_streaming_vs_oneshot_equivalence(base, make_session):
     # Generate streaming transcript
     g_stream = requests.post(
         f"{base}/sessions/{sid_stream}/generate",
-        json={"max_tokens": 100, "temperature": 0.0},
+        json={"max_tokens": 250, "temperature": 0.0},
         timeout=120,
     )
     assert g_stream.status_code == 200
@@ -250,6 +250,9 @@ def test_streaming_latency_benchmark(base, make_session):
     warm_latency = (t_warm_first_token - t_warm_eos) if t_warm_first_token else 999.0
     print(f"  [warm] EOS -> first token latency: {warm_latency * 1000:.1f} ms")
 
+    # Note: 1.0s is a regression guard based on the hardware constraints of the local
+    # RTX 5060 Ti GPU (which decodes at ~120 ms/token for the 12B model prefill),
+    # not the target US-1 budget of < 300 ms.
     assert warm_latency < 1.000, f"Warm latency {warm_latency * 1000:.1f} ms exceeds the 1000 ms budget!"
     assert warm_latency < cold_latency, "Streaming inject (warm) should be faster than one-shot (cold)!"
 
@@ -332,7 +335,7 @@ def test_tts_to_inject_integration(base, make_session):
     # Generate transcript
     g = requests.post(
         f"{base}/sessions/{sid}/generate",
-        json={"max_tokens": 100, "temperature": 0.0},
+        json={"max_tokens": 250, "temperature": 0.0},
         timeout=120,
     )
     assert g.status_code == 200
