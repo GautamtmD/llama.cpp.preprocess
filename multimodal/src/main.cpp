@@ -466,6 +466,106 @@ int main(int argc, char ** argv) {
                     res.set_content(body.dump(), "application/json");
                     return;
                 }
+            } else if (j.contains("audio")) {
+                std::string b64 = j["audio"].get<std::string>();
+                size_t comma = b64.find(',');
+                if (b64.rfind("data:", 0) == 0 && comma != std::string::npos) {
+                    b64 = b64.substr(comma + 1);
+                }
+                std::string bytes = base64_decode(b64);
+
+                mtmd_bitmap * bmp = nullptr;
+                auto is_audio_buffer = [](const std::string & buf) -> bool {
+                    if (buf.size() < 12) {
+                        return false;
+                    }
+                    bool is_wav = memcmp(buf.data(), "RIFF", 4) == 0 && memcmp(buf.data() + 8, "WAVE", 4) == 0;
+                    bool is_mp3 = buf.size() >= 3 && (
+                        memcmp(buf.data(), "ID3", 3) == 0 ||
+                        ((unsigned char)buf[0] == 0xFF && ((unsigned char)buf[1] & 0xE0) == 0xE0)
+                    );
+                    bool is_flac = memcmp(buf.data(), "fLaC", 4) == 0;
+                    return is_wav || is_mp3 || is_flac;
+                };
+
+                if (is_audio_buffer(bytes)) {
+                    if (!app.mtmd_ctx) {
+                        res.status = 400;
+                        res.set_content(error_body("audio requires --mmproj to be loaded", 400).dump(), "application/json");
+                        return;
+                    }
+                    bmp = bitmap_from_media_bytes(app.mtmd_ctx, bytes);
+                } else {
+                    if (!app.mtmd_ctx) {
+                        res.status = 400;
+                        res.set_content(error_body("audio requires --mmproj to be loaded", 400).dump(), "application/json");
+                        return;
+                    }
+                    size_t n_samples = bytes.size() / sizeof(float);
+                    const float * samples = reinterpret_cast<const float *>(bytes.data());
+                    bmp = mtmd_bitmap_init_from_audio(n_samples, samples);
+                }
+
+                if (!bmp) {
+                    res.status = 400;
+                    res.set_content(error_body("failed to decode audio", 400).dump(), "application/json");
+                    return;
+                }
+
+                std::string dummy_prompt = mtmd_default_marker();
+                mtmd_input_text input_text;
+                input_text.text          = dummy_prompt.c_str();
+                input_text.add_special   = false;
+                input_text.parse_special = true;
+
+                mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+                const mtmd_bitmap * bptrs[1] = {bmp};
+                int32_t rc = mtmd_tokenize(app.mtmd_ctx, chunks, &input_text, bptrs, 1);
+                if (rc != 0) {
+                    mtmd_bitmap_free(bmp);
+                    mtmd_input_chunks_free(chunks);
+                    res.status = 500;
+                    res.set_content(error_body("mtmd_tokenize failed", 500).dump(), "application/json");
+                    return;
+                }
+
+                const size_t n_chunks = mtmd_input_chunks_size(chunks);
+                bool ok = false;
+                llama_pos new_n_past = 0;
+                for (size_t i = 0; i < n_chunks; ++i) {
+                    const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, i);
+                    if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+                        llama_pos n_past = 0;
+                        llama_pos cur_max = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+                        if (cur_max >= 0) n_past = cur_max + 1;
+
+                        int32_t r = mtmd_helper_eval_chunk_single(
+                            app.mtmd_ctx, ctx, chunk, n_past, /*seq_id*/ 0, /*n_batch*/ 512,
+                            /*logits_last*/ true, &new_n_past);
+                        if (r == 0) ok = true;
+                        break;
+                    }
+                }
+
+                mtmd_bitmap_free(bmp);
+                mtmd_input_chunks_free(chunks);
+
+                if (!ok) {
+                    res.status = 500;
+                    res.set_content(error_body("failed to decode streaming audio chunk", 500).dump(), "application/json");
+                    return;
+                }
+
+                const int new_size = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
+                json body = {
+                    {"session_id", sid},
+                    {"cache_size", new_size},
+                    {"chat_template_applied", false},
+                    {"used_multimodal", true},
+                    {"n_media", 1}
+                };
+                res.set_content(body.dump(), "application/json");
+                return;
             } else {
                 text = j.value("text", "");
             }
