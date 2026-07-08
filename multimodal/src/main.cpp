@@ -86,6 +86,12 @@ struct AppState {
     std::string                          system_prompt;
     std::mutex mu;
     std::map<int64_t, llama_context *> sessions;  // owns the contexts
+    // Last token in each session's cache (seq 0). Used to refresh logits after a
+    // fork restores KV via llama_state_seq_set_data (the restore carries KV but
+    // NOT the output/logits buffer, so the forked session must re-decode its last
+    // token before it can generate). LLAMA_TOKEN_NULL when unknown (e.g. a session
+    // whose last inject ended in a media/audio embedding chunk — see fork handler).
+    std::map<int64_t, llama_token> last_tokens;
     std::atomic<int64_t> next_id{1};
 };
 
@@ -123,6 +129,38 @@ llama_context * lookup_session(AppState & app, int64_t n) {
     std::lock_guard<std::mutex> lk(app.mu);
     auto it = (n > 0) ? app.sessions.find(n) : app.sessions.end();
     return (it == app.sessions.end()) ? nullptr : it->second;
+}
+
+// Create a new session context with the server's standard params. Returns
+// nullptr on failure. (Shared by POST /sessions and POST /sessions/{id}/fork.)
+llama_context * create_session_ctx(const AppState & app) {
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx   = app.n_ctx_per_session;
+    cp.n_batch = std::min<int>(app.n_batch, app.n_ctx_per_session);
+    cp.no_perf = true;
+    return llama_init_from_model(app.model, cp);
+}
+
+// Register a pre-built context as a new session under the lock; returns its id.
+int64_t register_session(AppState & app, llama_context * ctx) {
+    const int64_t n = app.next_id.fetch_add(1);
+    std::lock_guard<std::mutex> lk(app.mu);
+    app.sessions[n] = ctx;
+    app.last_tokens[n] = LLAMA_TOKEN_NULL;
+    return n;
+}
+
+// Remember the last token decoded into a session (for fork logits refresh).
+void set_last_token(AppState & app, int64_t n, llama_token t) {
+    std::lock_guard<std::mutex> lk(app.mu);
+    app.last_tokens[n] = t;
+}
+
+// The last token decoded into a session, or LLAMA_TOKEN_NULL if unknown.
+llama_token get_last_token(AppState & app, int64_t n) {
+    std::lock_guard<std::mutex> lk(app.mu);
+    auto it = app.last_tokens.find(n);
+    return (it == app.last_tokens.end()) ? LLAMA_TOKEN_NULL : it->second;
 }
 
 // Seed an empty session with BOS so there are logits to sample from.
@@ -388,29 +426,94 @@ int main(int argc, char ** argv) {
 
     // ---- POST /sessions : create a session ----
     svr.Post("/sessions", [&](const httplib::Request &, httplib::Response &res) {
-        llama_context_params cp = llama_context_default_params();
-        cp.n_ctx = app.n_ctx_per_session;
-        cp.n_batch = std::min<int>(app.n_batch, app.n_ctx_per_session);
-        cp.no_perf = true;
-        llama_context * ctx = llama_init_from_model(app.model, cp);
+        llama_context * ctx = create_session_ctx(app);
         if (!ctx) {
             res.status = 500;
             res.set_content(error_body("failed to create context", 500).dump(), "application/json");
             return;
         }
-        const int64_t n = app.next_id.fetch_add(1);
-        {
-            std::lock_guard<std::mutex> lk(app.mu);
-            app.sessions[n] = ctx;
-        }
+        const int64_t n = register_session(app, ctx);
         json body = {{"session_id", make_session_id(n)}};
+        res.set_content(body.dump(), "application/json");
+    });
+
+    // ---- POST /sessions/{id}/fork : copy this session's KV into a NEW session ----
+    //
+    // Approach A' (see docs/decisions/0004-fork-copy-semantics.md): snapshot the
+    // source sequence's KV via llama_state_seq_get_data and restore it into a
+    // fresh context (llama_state_seq_set_data). The forked session owns an
+    // independent K/V copy, so source and fork generate independently. Forkable
+    // at any point — it snapshots whatever the source cache currently holds
+    // (after a text inject, an audio inject, or a generate). The source session
+    // is untouched. (Slice 5 will swap this for llama_memory_seq_cp once
+    // sessions become sequences in a pooled context — see the ADR.)
+    svr.Post(R"(/sessions/[^/]+/fork)", [&](const httplib::Request &req, httplib::Response &res) {
+        std::string sid = extract_session_id(req.path, "fork");
+        llama_context * src = lookup_session(app, parse_session_id_num(sid));
+        if (!src) {
+            res.status = 404;
+            res.set_content(error_body("unknown session", 404).dump(), "application/json");
+            return;
+        }
+
+        const double t0 = now_s();
+        // Snapshot source seq 0's KV into a host buffer, then restore into a new ctx.
+        const size_t seq_size = llama_state_seq_get_size(src, /*seq_id*/ 0);
+        std::vector<uint8_t> buf(seq_size);
+        llama_state_seq_get_data(src, buf.data(), buf.size(), /*seq_id*/ 0);
+        llama_context * dst = create_session_ctx(app);
+        if (!dst) {
+            res.status = 500;
+            res.set_content(error_body("failed to create forked context", 500).dump(), "application/json");
+            return;
+        }
+        llama_state_seq_set_data(dst, buf.data(), buf.size(), /*dest_seq_id*/ 0);
+        // The restore carries KV but NOT the output/logits buffer, so the forked
+        // session can't sample until logits are recomputed. Re-decode the source's
+        // last token at its existing position (same token -> identical K/V, plus a
+        // fresh logits row). When the last token is unknown (a session whose last
+        // inject ended in an image/audio embedding chunk), there is no discrete
+        // token to re-decode; the client should inject one text token before
+        // generating from such a fork (the chat protocol always closes a turn with
+        // text markers, so this is the normal flow).
+        const llama_token src_last = get_last_token(app, parse_session_id_num(sid));
+        if (src_last != LLAMA_TOKEN_NULL) {
+            llama_memory_t dmem = llama_get_memory(dst);
+            const llama_pos pmax = llama_memory_seq_pos_max(dmem, 0);
+            // Re-decoding at an already-cached position won't produce a logits row,
+            // so free the last cell then re-evaluate the source's last token there:
+            // it recomputes identical K/V and yields a fresh logits row, making the
+            // forked session immediately generation-ready.
+            llama_memory_seq_rm(dmem, 0, pmax, pmax + 1);
+            llama_batch b = llama_batch_init(/*n_tokens*/ 1, /*embd*/ 0, /*n_seq_max*/ 1);
+            b.n_tokens    = 1;
+            b.token[0]    = src_last;
+            b.pos[0]      = pmax;
+            b.n_seq_id[0] = 1;
+            b.seq_id[0][0]= 0;
+            b.logits[0]   = 1;  // request logits for this token
+            llama_decode(dst, b);
+            llama_batch_free(b);
+        }
+        const double dt = now_s() - t0;
+
+        const int64_t new_n = register_session(app, dst);
+        set_last_token(app, new_n, src_last);  // the fork inherits the source's last token
+        const int dst_size  = llama_memory_seq_pos_max(llama_get_memory(dst), 0) + 1;
+        json body = {
+            {"session_id", make_session_id(new_n)},
+            {"forked_from", sid},
+            {"cache_size", dst_size},
+            {"fork_ms", (int)(dt * 1000)},
+        };
         res.set_content(body.dump(), "application/json");
     });
 
     // ---- POST /sessions/{id}/inject : text -> KV cache (no generation) ----
     svr.Post(R"(/sessions/[^/]+/inject)", [&](const httplib::Request &req, httplib::Response &res) {
         std::string sid = extract_session_id(req.path, "inject");
-        llama_context * ctx = lookup_session(app, parse_session_id_num(sid));
+        const int64_t sid_num = parse_session_id_num(sid);
+        llama_context * ctx = lookup_session(app, sid_num);
         if (!ctx) {
             res.status = 404;
             res.set_content(error_body("unknown session", 404).dump(), "application/json");
@@ -701,6 +804,7 @@ int main(int argc, char ** argv) {
             return;
         }
         const double dt = now_s() - t0;
+        if (!toks.empty()) set_last_token(app, sid_num, toks.back());  // for fork logits refresh
         const int new_size = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
         json body = {
             {"session_id", sid},
@@ -716,7 +820,8 @@ int main(int argc, char ** argv) {
     // ---- POST /sessions/{id}/generate : streaming (SSE) or JSON ----
     svr.Post(R"(/sessions/[^/]+/generate)", [&](const httplib::Request &req, httplib::Response &res) {
         std::string sid = extract_session_id(req.path, "generate");
-        llama_context * ctx = lookup_session(app, parse_session_id_num(sid));
+        const int64_t sid_num = parse_session_id_num(sid);
+        llama_context * ctx = lookup_session(app, sid_num);
         if (!ctx) {
             res.status = 404;
             res.set_content(error_body("unknown session", 404).dump(), "application/json");
@@ -736,6 +841,7 @@ int main(int argc, char ** argv) {
         if (!stream) {
             // slice-1 behavior: whole response as JSON.
             GenResult r = run_generation(app, ctx, gp, nullptr);
+            if (!r.ids.empty()) set_last_token(app, sid_num, (llama_token)r.ids.back());
             const double tok_s = (r.gen_s > 0) ? (r.ids.size() / r.gen_s) : 0.0;
             json body = {
                 {"session_id", sid},
@@ -758,13 +864,14 @@ int main(int argc, char ** argv) {
         res.set_header("Connection", "keep-alive");
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&app, ctx, gp, sid](size_t, httplib::DataSink & ds) -> bool {
+            [&app, ctx, gp, sid, sid_num](size_t, httplib::DataSink & ds) -> bool {
                 GenResult r = run_generation(app, ctx, gp, [&ds](const std::string & piece, int64_t id) {
                     std::string ev = sse_event(json{
                         {"type", "token"}, {"token", piece}, {"id", id}
                     });
                     return ds.write(ev.data(), ev.size());
                 });
+                if (!r.ids.empty()) set_last_token(app, sid_num, (llama_token)r.ids.back());
                 const double tok_s = (r.gen_s > 0) ? (r.ids.size() / r.gen_s) : 0.0;
                 std::string done = sse_event(json{
                     {"type", "done"},
@@ -799,6 +906,7 @@ int main(int argc, char ** argv) {
             }
             llama_free(it->second);
             app.sessions.erase(it);
+            app.last_tokens.erase(n);
         }
         res.set_content(json{{"session_id", sid}, {"deleted", true}}.dump(), "application/json");
     });
