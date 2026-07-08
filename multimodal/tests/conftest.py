@@ -14,6 +14,10 @@ Then:
 
 Set MULTIMODAL_SERVER_URL to point elsewhere (default http://127.0.0.1:8080).
 If the server isn't reachable, all tests skip (rather than fail) at collection.
+
+Self-booting test modules (e.g. test_chat_template.py, which boots its own
+server instances with custom CLI flags) set ``MULTIMODAL_SELF_BOOT=1`` to opt
+out of the live-server requirement checked here.
 """
 
 from __future__ import annotations
@@ -26,6 +30,10 @@ import requests
 
 BASE = os.environ.get("MULTIMODAL_SERVER_URL", "http://127.0.0.1:8080").rstrip("/")
 
+# Self-booting modules manage their own server lifecycles (custom CLI flags) and
+# must not be gated on a pre-started server at BASE.
+SELF_BOOT = os.environ.get("MULTIMODAL_SELF_BOOT", "") == "1"
+
 
 def _server_up() -> bool:
     try:
@@ -34,7 +42,7 @@ def _server_up() -> bool:
         return False
 
 
-if not _server_up():
+if not SELF_BOOT and not _server_up():
     pytest.skip(
         f"multimodal-server not reachable at {BASE} (set MULTIMODAL_SERVER_URL; "
         "see this file's docstring for how to start it)",

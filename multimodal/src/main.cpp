@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -41,6 +42,15 @@
 
 // 'json' (nlohmann::ordered_json) is provided by common/chat.h.
 
+// Read an entire file into a string (for --chat-template-file). Throws on error.
+static std::string read_file_contents(const std::string & path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open file: " + path);
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
 namespace {
 
 struct ServerConfig {
@@ -50,6 +60,14 @@ struct ServerConfig {
     int  n_gpu_layers  = 99;
     int  ctx_size      = 4096;
     int  n_batch       = 2048;
+
+    // Chat-template handling (mirrors llama-server / common/arg.cpp). We reuse
+    // common/'s templating; these just feed it the same inputs llama-server does.
+    std::string chat_template;                                // --chat-template / --chat-template-file (override; empty = model's default)
+    bool        use_jinja            = true;                  // --jinja / --no-jinja (default true, like llama-server)
+    bool        enable_chat_template = true;                  // --no-chat-template disables the 'messages' inject path
+    std::map<std::string, std::string> chat_template_kwargs;  // --chat-template-kwargs (key -> JSON value serialized as a string)
+    std::string system_prompt;                                // --system-prompt (prepended as a system message to every conversation)
 };
 
 // One model loaded once; many sessions (each its own context / KV cache).
@@ -60,6 +78,12 @@ struct AppState {
     mtmd_context * mtmd_ctx = nullptr;         // multimodal projector (may be null)
     int n_ctx_per_session = 4096;
     int n_batch = 2048;
+    // Chat-template options (copied from ServerConfig at startup) — passed to
+    // common_chat_templates_apply so our rendering matches llama-server.
+    bool                                 use_jinja            = true;
+    bool                                 enable_chat_template = true;
+    std::map<std::string, std::string>   chat_template_kwargs;
+    std::string                          system_prompt;
     std::mutex mu;
     std::map<int64_t, llama_context *> sessions;  // owns the contexts
     std::atomic<int64_t> next_id{1};
@@ -229,6 +253,26 @@ int main(int argc, char ** argv) {
         else if (a == "--n-gpu-layers" || a == "-ngl") cfg.n_gpu_layers = std::atoi(next().c_str());
         else if (a == "--ctx-size" || a == "-c") cfg.ctx_size = std::atoi(next().c_str());
         else if (a == "--n-batch")      cfg.n_batch = std::atoi(next().c_str());
+        else if (a == "--chat-template")      cfg.chat_template = next();
+        else if (a == "--chat-template-file") cfg.chat_template = read_file_contents(next());
+        else if (a == "--jinja")              cfg.use_jinja = true;
+        else if (a == "--no-jinja")           cfg.use_jinja = false;
+        else if (a == "--no-chat-template")   cfg.enable_chat_template = false;
+        else if (a == "--system-prompt")      cfg.system_prompt = next();
+        else if (a == "--chat-template-kwargs") {
+            // Parse a JSON object string, e.g. '{"k":"v"}'. Each value is stored
+            // as its JSON serialization (mirrors common/arg.cpp); re-parsed by
+            // common_chat_templates_apply when rendering.
+            std::string v = next();
+            json parsed = json::parse(v);
+            if (!parsed.is_object()) {
+                std::cerr << "error: --chat-template-kwargs must be a JSON object\n";
+                return 2;
+            }
+            for (auto it = parsed.begin(); it != parsed.end(); ++it) {
+                cfg.chat_template_kwargs[it.key()] = it.value().dump();
+            }
+        }
         else if (a == "--help" || a == "-h") {
             std::cout <<
                 "multimodal-server [options]\n"
@@ -237,13 +281,33 @@ int main(int argc, char ** argv) {
                 "      --port N              HTTP port (default 8080)\n"
                 "  -ngl,--n-gpu-layers N     GPU layers (default 99)\n"
                 "  -c, --ctx-size N          context per session (default 4096)\n"
-                "      --n-batch N           batch size (default 2048)\n";
+                "      --n-batch N           batch size (default 2048)\n"
+                "      --chat-template TPL   Jinja chat template override (else model default)\n"
+                "      --chat-template-file F  read Jinja chat template override from a file\n"
+                "      --jinja / --no-jinja  use the Jinja template engine (default: enabled)\n"
+                "      --no-chat-template    disable templating: 'messages' inject is rejected\n"
+                "      --system-prompt TEXT  system prompt prepended to every conversation\n"
+                "      --chat-template-kwargs JSON  extra Jinja vars, e.g. '{\"k\":\"v\"}'\n";
             return 0;
         }
     }
     if (cfg.model_path.empty()) {
         std::cerr << "error: --model is required (see --help)\n";
         return 2;
+    }
+
+    // Validate a user-supplied chat template up front (fail fast), mirroring
+    // common/arg.cpp. Without --jinja only commonly-used templates are accepted.
+    if (!cfg.chat_template.empty() &&
+        !common_chat_verify_template(cfg.chat_template, cfg.use_jinja)) {
+        std::cerr << "error: the supplied chat template is not supported: "
+                  << cfg.chat_template << "\n";
+        if (cfg.use_jinja) {
+            std::cerr << "(template failed Jinja validation)\n";
+        } else {
+            std::cerr << "note: started without --jinja, only commonly used templates are accepted\n";
+        }
+        return 1;
     }
 
     llama_log_set([](enum ggml_log_level level, const char * text, void *) {
@@ -259,9 +323,14 @@ int main(int argc, char ** argv) {
     app.model = llama_model_load_from_file(cfg.model_path.c_str(), mp);
     if (!app.model) { std::cerr << "error: failed to load model\n"; return 1; }
     app.vocab = llama_model_get_vocab(app.model);
-    app.chat_templates = common_chat_templates_init(app.model, /* override */ "");
+    app.chat_templates = common_chat_templates_init(app.model, /* override */ cfg.chat_template);
+    app.use_jinja            = cfg.use_jinja;
+    app.enable_chat_template = cfg.enable_chat_template;
+    app.chat_template_kwargs = cfg.chat_template_kwargs;
+    app.system_prompt        = cfg.system_prompt;
     if (app.chat_templates) {
-        std::cerr << "chat template loaded.\n";
+        std::cerr << "chat template loaded (use_jinja=" << (app.use_jinja ? "true" : "false")
+                  << ", enabled=" << (app.enable_chat_template ? "true" : "false") << ").\n";
     } else {
         std::cerr << "warning: no chat template in model; 'messages' inject will fail.\n";
     }
@@ -350,11 +419,20 @@ int main(int argc, char ** argv) {
         std::string text;
         bool used_template = false;
         bool used_multimodal = false;
+        bool return_prompt = false;  // opt-in: echo the rendered prompt (chat-template parity tests)
         try {
             auto j = json::parse(req.body);
             if (j.contains("messages")) {
+                if (!app.enable_chat_template) {
+                    res.status = 400;
+                    res.set_content(error_body(
+                        "chat template disabled (started with --no-chat-template); "
+                        "use 'text' instead of 'messages'", 400).dump(), "application/json");
+                    return;
+                }
                 // Apply the model's chat template to a list of {role, content} msgs.
                 // content may be a string OR an array of parts (text/image/audio).
+                return_prompt = j.value("return_prompt", false);
                 if (!app.chat_templates) {
                     res.status = 500;
                     res.set_content(error_body("model has no chat template", 500).dump(), "application/json");
@@ -432,6 +510,15 @@ int main(int argc, char ** argv) {
 
                 common_chat_templates_inputs inputs;
                 inputs.add_generation_prompt = j.value("add_generation_prompt", true);
+                inputs.use_jinja             = app.use_jinja;
+                inputs.chat_template_kwargs  = app.chat_template_kwargs;
+                // Prepend a global --system-prompt if configured.
+                if (!app.system_prompt.empty()) {
+                    common_chat_msg sys;
+                    sys.role    = "system";
+                    sys.content = app.system_prompt;
+                    inputs.messages.push_back(std::move(sys));
+                }
                 for (const auto & m : j["messages"]) {
                     common_chat_msg msg;
                     msg.role    = m.value("role", "user");
@@ -463,6 +550,7 @@ int main(int argc, char ** argv) {
                         {"used_multimodal", true},
                         {"n_media", bitmaps.size()},
                     };
+                    if (return_prompt) body["prompt"] = text;
                     res.set_content(body.dump(), "application/json");
                     return;
                 }
@@ -621,6 +709,7 @@ int main(int argc, char ** argv) {
             {"inject_ms", (int)(dt * 1000)},
             {"chat_template_applied", used_template},
         };
+        if (return_prompt) body["prompt"] = text;
         res.set_content(body.dump(), "application/json");
     });
 
