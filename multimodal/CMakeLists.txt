@@ -53,6 +53,23 @@ target_link_libraries(multimodal-server PRIVATE
 
 target_compile_features(multimodal-server PRIVATE cxx_std_17)
 
+# M2.0 measurement gate: standalone benchmark for KV-cache fork copy cost
+# (approaches A / A' / B). Opt-in target — not built by the util-test gate.
+# Build with: cmake --build ... --target multimodal-fork-bench
+if(NOT TARGET multimodal-fork-bench)
+add_executable(multimodal-fork-bench
+    src/fork_bench.cpp
+)
+target_include_directories(multimodal-fork-bench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+target_link_libraries(multimodal-fork-bench PRIVATE llama)
+target_compile_features(multimodal-fork-bench PRIVATE cxx_std_17)
+set_target_properties(multimodal-fork-bench PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/$<CONFIG>
+)
+endif()
+
 # Unit tests for the pure helpers (util.h). Header-only against the vendored
 # nlohmann json — no model/GPU/projector, no link to llama/mtmd. Built and run
 # by scripts/build_engine.sh as a build-time contract gate.
