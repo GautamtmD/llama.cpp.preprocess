@@ -158,6 +158,23 @@ def test_generate_on_empty_session_still_works(base, make_session):
     assert r.json()["n_tokens"] >= 1
 
 
+def test_generate_temp0_is_deterministic(base, make_session):
+    """temperature=0 is greedy: two fresh sessions with the same prompt produce
+    IDENTICAL output (argmax each step, no RNG). This is what makes fork/source
+    parity assertions reliable."""
+    prompt = [{"role": "user", "content": "List three colors, comma-separated."}]
+    a = make_session()
+    requests.post(f"{base}/sessions/{a}/inject", json={"messages": prompt}, timeout=60)
+    ga = requests.post(f"{base}/sessions/{a}/generate",
+                       json={"max_tokens": 40, "temperature": 0.0}, timeout=120).json()
+    b = make_session()
+    requests.post(f"{base}/sessions/{b}/inject", json={"messages": prompt}, timeout=60)
+    gb = requests.post(f"{base}/sessions/{b}/generate",
+                       json={"max_tokens": 40, "temperature": 0.0}, timeout=120).json()
+    assert ga["text"] == gb["text"], (ga["text"], gb["text"])
+    assert ga["n_tokens"] > 0
+
+
 # ------------------------------- delete -------------------------------------
 
 

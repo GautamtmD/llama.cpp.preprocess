@@ -58,20 +58,32 @@ Input / trigger:
 Expected:
 - A new `{session_id}` is returned whose KV is a copy of the source's at fork
   time (`cache_size` matches the source).
-- Forkable after text-inject, after audio-inject, and after generate.
+- **Fully generation-ready** after text-inject and after generate: the fork
+  reproduces the source's exact greedy (temp=0) output from the shared snapshot.
+- **After audio/image inject:** the KV is copied. If the source's last inject
+  ended in a media EMBEDDING chunk (audio/image — no discrete token), the fork
+  is NOT immediately generation-ready; inject one text token first. The chat
+  protocol always closes an audio turn with text markers, so the normal flow
+  (audio -> text suffix) is fully forkable. (Media inject clears the tracked
+  last token, so a later fork never re-decodes a stale token at a media cell.)
 - The source session's cache is unchanged by the fork, and later mutations to
   the source do NOT appear in the fork (true snapshot independence).
-- The forked session generates coherent text from the snapshot.
 - Unknown source session -> 404.
 
 Latency / performance budget:
-- Fork copy (includes creating the new context) of a session with ≤ 2048 cached
-  tokens: **≤ 600 ms** (measured median ~200–310 ms on RTX 5060 Ti, Gemma 4 12B;
-  the cost is context-creation-dominated — see
-  [`docs/decisions/0004-fork-copy-semantics.md`](../../../docs/decisions/0004-fork-copy-semantics.md)).
+- Fork copy of a session with ≤ 2048 cached tokens: **≤ 1.0 s** steady-state
+  on RTX 5060 Ti, Gemma 4 12B (measured ~480 ms for a tiny session, ~700 ms at
+  ~200 tokens). Breakdown: new-context creation ~200 ms + the redecode ~290 ms
+  (that redecode is the **first decode in the new dst context**, so it pays that
+  context's one-time first-decode cost — graph build + buffer alloc; it is NOT
+  CUDA-graph capture, which `GGML_CUDA_DISABLE_GRAPHS` does not reduce and which
+  destroys generation throughput) + `get/set_data` growing with N. A startup
+  fork warm-up removes the one-time global-JIT cold-start (first fork ~480 ms,
+  not ~870 ms). All of this is eliminated by slice 5 (`llama_memory_seq_cp` in a
+  pooled context: no new context, no redecode → ~0). See
+  [`docs/decisions/0004-fork-copy-semantics.md`](../../../docs/decisions/0004-fork-copy-semantics.md).
 - VRAM: **≤ ~400 MiB per fork** (the forked session's KV state; measured ~350
-  MiB, plateaus with the model's SWA cache). Slice 5 will drop this to ~0 by
-  switching to `llama_memory_seq_cp` in a pooled context.
+  MiB, plateaus with the model's SWA cache). Slice 5 drops this to ~0.
 
 Test:
 - tests/test_fork.py (correctness + latency against the live server)

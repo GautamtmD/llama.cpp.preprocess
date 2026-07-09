@@ -114,9 +114,16 @@ double now_s() {
 }
 
 llama_sampler * make_sampler(float temp, float top_p, int seed) {
+    // temp <= 0 -> GREEDY (deterministic argmax). This is the standard meaning of
+    // "temperature 0" and makes generation reproducible: two sessions with the
+    // same prompt produce identical tokens, which is what lets tests assert exact
+    // fork/source parity. top_p/seed are only consulted when temp > 0.
+    if (temp <= 0.0f) {
+        return llama_sampler_init_greedy();
+    }
     auto * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
     if (top_p < 1.0f) llama_sampler_chain_add(chain, llama_sampler_init_top_p(top_p, 1));
-    if (temp > 0)     llama_sampler_chain_add(chain, llama_sampler_init_temp(temp));
+    llama_sampler_chain_add(chain, llama_sampler_init_temp(temp));
     const uint32_t s = (seed < 0) ? LLAMA_DEFAULT_SEED : (uint32_t)seed;
     llama_sampler_chain_add(chain, llama_sampler_init_dist(s));
     return chain;
@@ -161,6 +168,45 @@ llama_token get_last_token(AppState & app, int64_t n) {
     std::lock_guard<std::mutex> lk(app.mu);
     auto it = app.last_tokens.find(n);
     return (it == app.last_tokens.end()) ? LLAMA_TOKEN_NULL : it->second;
+}
+
+// Core fork copy (approach A', see docs/decisions/0004-fork-copy-semantics.md):
+// deep-copy src's seq-0 KV into a fresh context and refresh logits by re-decoding
+// src_last at its (freed) position. Returns the new context (caller owns) or
+// nullptr on failure. Shared by POST /sessions/{id}/fork and the startup warm-up
+// (so the first real fork isn't a cold CUDA-JIT hit).
+//
+// src_last == LLAMA_TOKEN_NULL means the source's last inject ended in an
+// image/audio EMBEDDING chunk (no discrete token to re-decode). The KV is still
+// copied, but logits are NOT refreshed — the forked session must inject one text
+// token before it can generate (the chat protocol always closes a turn with text
+// markers, so the normal audio flow ends in text and is fully forkable).
+llama_context * fork_context(const AppState & app, llama_context * src, llama_token src_last) {
+    llama_context * dst = create_session_ctx(app);
+    if (!dst) return nullptr;
+    const size_t seq_size = llama_state_seq_get_size(src, /*seq_id*/ 0);
+    std::vector<uint8_t> buf(seq_size);
+    llama_state_seq_get_data(src, buf.data(), seq_size, /*seq_id*/ 0);
+    llama_state_seq_set_data(dst, buf.data(), seq_size, /*dest_seq_id*/ 0);
+    if (src_last != LLAMA_TOKEN_NULL) {
+        llama_memory_t dmem = llama_get_memory(dst);
+        const llama_pos pmax = llama_memory_seq_pos_max(dmem, 0);
+        // Re-decoding at an already-cached position yields no logits row, so free
+        // the last cell then re-evaluate src_last there: identical K/V + logits.
+        // (This is the first decode in the new dst context, so it pays that
+        // context's one-time first-decode cost — see ADR 0004.)
+        llama_memory_seq_rm(dmem, 0, pmax, pmax + 1);
+        llama_batch b = llama_batch_init(/*n_tokens*/ 1, /*embd*/ 0, /*n_seq_max*/ 1);
+        b.n_tokens     = 1;
+        b.token[0]     = src_last;
+        b.pos[0]       = pmax;
+        b.n_seq_id[0]  = 1;
+        b.seq_id[0][0] = 0;
+        b.logits[0]    = 1;  // request logits for this token
+        llama_decode(dst, b);
+        llama_batch_free(b);
+    }
+    return dst;
 }
 
 // Seed an empty session with BOS so there are logits to sample from.
@@ -302,13 +348,18 @@ int main(int argc, char ** argv) {
             // as its JSON serialization (mirrors common/arg.cpp); re-parsed by
             // common_chat_templates_apply when rendering.
             std::string v = next();
-            json parsed = json::parse(v);
-            if (!parsed.is_object()) {
-                std::cerr << "error: --chat-template-kwargs must be a JSON object\n";
+            try {
+                json parsed = json::parse(v);
+                if (!parsed.is_object()) {
+                    std::cerr << "error: --chat-template-kwargs must be a JSON object\n";
+                    return 2;
+                }
+                for (auto it = parsed.begin(); it != parsed.end(); ++it) {
+                    cfg.chat_template_kwargs[it.key()] = it.value().dump();
+                }
+            } catch (const std::exception & e) {
+                std::cerr << "error: --chat-template-kwargs must be valid JSON: " << e.what() << "\n";
                 return 2;
-            }
-            for (auto it = parsed.begin(); it != parsed.end(); ++it) {
-                cfg.chat_template_kwargs[it.key()] = it.value().dump();
             }
         }
         else if (a == "--help" || a == "-h") {
@@ -407,6 +458,21 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // Warm up the fork path (KV deep-copy + last-token re-decode) so the first
+    // real fork doesn't pay the one-time CUDA graph/JIT cost (~hundreds of ms).
+    {
+        std::cerr << "warming up fork path...\n";
+        if (llama_context * wsrc = create_session_ctx(app)) {
+            llama_token bos = llama_vocab_bos(app.vocab);
+            llama_batch b = llama_batch_get_one(&bos, 1);
+            if (llama_decode(wsrc, b) == 0) {
+                if (llama_context * wdst = fork_context(app, wsrc, bos)) llama_free(wdst);
+            }
+            llama_free(wsrc);
+            std::cerr << "fork warmup done.\n";
+        }
+    }
+
     httplib::Server svr;
 
     svr.Get("/health", [](const httplib::Request &, httplib::Response &res) {
@@ -457,43 +523,12 @@ int main(int argc, char ** argv) {
         }
 
         const double t0 = now_s();
-        // Snapshot source seq 0's KV into a host buffer, then restore into a new ctx.
-        const size_t seq_size = llama_state_seq_get_size(src, /*seq_id*/ 0);
-        std::vector<uint8_t> buf(seq_size);
-        llama_state_seq_get_data(src, buf.data(), buf.size(), /*seq_id*/ 0);
-        llama_context * dst = create_session_ctx(app);
+        const llama_token src_last = get_last_token(app, parse_session_id_num(sid));
+        llama_context * dst = fork_context(app, src, src_last);
         if (!dst) {
             res.status = 500;
             res.set_content(error_body("failed to create forked context", 500).dump(), "application/json");
             return;
-        }
-        llama_state_seq_set_data(dst, buf.data(), buf.size(), /*dest_seq_id*/ 0);
-        // The restore carries KV but NOT the output/logits buffer, so the forked
-        // session can't sample until logits are recomputed. Re-decode the source's
-        // last token at its existing position (same token -> identical K/V, plus a
-        // fresh logits row). When the last token is unknown (a session whose last
-        // inject ended in an image/audio embedding chunk), there is no discrete
-        // token to re-decode; the client should inject one text token before
-        // generating from such a fork (the chat protocol always closes a turn with
-        // text markers, so this is the normal flow).
-        const llama_token src_last = get_last_token(app, parse_session_id_num(sid));
-        if (src_last != LLAMA_TOKEN_NULL) {
-            llama_memory_t dmem = llama_get_memory(dst);
-            const llama_pos pmax = llama_memory_seq_pos_max(dmem, 0);
-            // Re-decoding at an already-cached position won't produce a logits row,
-            // so free the last cell then re-evaluate the source's last token there:
-            // it recomputes identical K/V and yields a fresh logits row, making the
-            // forked session immediately generation-ready.
-            llama_memory_seq_rm(dmem, 0, pmax, pmax + 1);
-            llama_batch b = llama_batch_init(/*n_tokens*/ 1, /*embd*/ 0, /*n_seq_max*/ 1);
-            b.n_tokens    = 1;
-            b.token[0]    = src_last;
-            b.pos[0]      = pmax;
-            b.n_seq_id[0] = 1;
-            b.seq_id[0][0]= 0;
-            b.logits[0]   = 1;  // request logits for this token
-            llama_decode(dst, b);
-            llama_batch_free(b);
         }
         const double dt = now_s() - t0;
 
@@ -654,6 +689,10 @@ int main(int argc, char ** argv) {
                         {"n_media", bitmaps.size()},
                     };
                     if (return_prompt) body["prompt"] = text;
+                    // last inject ended in an image/audio embedding chunk: no
+                    // discrete last token, so clear any stale value (a fork must
+                    // not re-decode a wrong token at a media cell — see ADR 0004).
+                    set_last_token(app, sid_num, LLAMA_TOKEN_NULL);
                     res.set_content(body.dump(), "application/json");
                     return;
                 }
@@ -758,6 +797,11 @@ int main(int argc, char ** argv) {
                     {"used_multimodal", true},
                     {"n_media", 1}
                 };
+                // streaming-audio inject ends in an audio embedding chunk: clear
+                // any stale last token so a later fork doesn't re-decode it at the
+                // wrong (media) position. The chat protocol follows audio with a
+                // text turn-close, which sets a valid last token again.
+                set_last_token(app, sid_num, LLAMA_TOKEN_NULL);
                 res.set_content(body.dump(), "application/json");
                 return;
             } else {
