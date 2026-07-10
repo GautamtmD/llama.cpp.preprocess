@@ -13,6 +13,7 @@
 // modify the upstream llama.cpp fork. One model is loaded and shared; each
 // session is its own llama_context (owning its KV cache).
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -35,6 +36,8 @@
 
 #include "common.h"
 #include "chat.h"
+#include "sampling.h"
+#include "json-schema-to-grammar.h"
 #include "ggml.h"
 #include "llama.h"
 #include "mtmd.h"
@@ -99,13 +102,23 @@ struct GenParams {
     int   max_tokens = 256;
     float temp       = 0.8f;
     float top_p      = 1.0f;
+    int   top_k      = 40;
+    float min_p      = 0.05f;
     int   seed       = -1;
+    bool  ignore_eos = false;
+    std::vector<std::string> stop;
+    json response_format;          // {type: json_object|json_schema|text, ...}
+    std::string grammar;           // raw GBNF (XOR response_format)
+    json tools;                    // OpenAI tool schemas array
+    std::string tool_choice = "auto";  // none | auto | required
+    json sampling;                 // extra common_params_sampling overrides
 };
 
 struct GenResult {
     std::string text;
     std::vector<int64_t> ids;
     double gen_s = 0.0;
+    json tool_calls = json::array();
 };
 
 double now_s() {
@@ -113,20 +126,107 @@ double now_s() {
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
-llama_sampler * make_sampler(float temp, float top_p, int seed) {
-    // temp <= 0 -> GREEDY (deterministic argmax). This is the standard meaning of
-    // "temperature 0" and makes generation reproducible: two sessions with the
-    // same prompt produce identical tokens, which is what lets tests assert exact
-    // fork/source parity. top_p/seed are only consulted when temp > 0.
-    if (temp <= 0.0f) {
-        return llama_sampler_init_greedy();
+// Apply the optional `sampling` object (extra common_params_sampling fields:
+// penalties, dry, mirostat, top_n_sigma, min_keep, n_probs, …) onto sparams.
+// Only known scalar fields are mapped; unknown keys are ignored.
+void apply_sampling_overrides(common_params_sampling & sparams, const json & s) {
+    if (!s.is_object()) return;
+    auto getf = [&](const char * k, float def) { return s.value(k, def); };
+    auto geti = [&](const char * k, int   def) { return s.value(k, def); };
+    if (s.contains("top_k"))       sparams.top_k       = geti("top_k", sparams.top_k);
+    if (s.contains("top_p"))       sparams.top_p       = getf("top_p", sparams.top_p);
+    if (s.contains("min_p"))       sparams.min_p       = getf("min_p", sparams.min_p);
+    if (s.contains("top_n_sigma")) sparams.top_n_sigma = getf("top_n_sigma", sparams.top_n_sigma);
+    if (s.contains("typical_p"))   sparams.typ_p       = getf("typical_p", sparams.typ_p);
+    if (s.contains("xtc_probability")) sparams.xtc_probability = getf("xtc_probability", sparams.xtc_probability);
+    if (s.contains("xtc_threshold"))   sparams.xtc_threshold   = getf("xtc_threshold", sparams.xtc_threshold);
+    if (s.contains("min_keep"))    sparams.min_keep    = geti("min_keep", sparams.min_keep);
+    if (s.contains("n_probs"))     sparams.n_probs     = geti("n_probs", sparams.n_probs);
+    if (s.contains("penalty_last_n"))  sparams.penalty_last_n  = geti("penalty_last_n", sparams.penalty_last_n);
+    if (s.contains("penalty_repeat"))  sparams.penalty_repeat  = getf("penalty_repeat", sparams.penalty_repeat);
+    if (s.contains("penalty_freq"))    sparams.penalty_freq    = getf("penalty_freq", sparams.penalty_freq);
+    if (s.contains("penalty_present")) sparams.penalty_present = getf("penalty_present", sparams.penalty_present);
+    if (s.contains("dry_multiplier"))  sparams.dry_multiplier  = getf("dry_multiplier", sparams.dry_multiplier);
+    if (s.contains("dry_base"))        sparams.dry_base        = getf("dry_base", sparams.dry_base);
+    if (s.contains("dry_allowed_length")) sparams.dry_allowed_length = geti("dry_allowed_length", sparams.dry_allowed_length);
+    if (s.contains("dry_penalty_last_n")) sparams.dry_penalty_last_n = geti("dry_penalty_last_n", sparams.dry_penalty_last_n);
+    if (s.contains("mirostat"))     sparams.mirostat     = geti("mirostat", sparams.mirostat);
+    if (s.contains("mirostat_tau")) sparams.mirostat_tau = getf("mirostat_tau", sparams.mirostat_tau);
+    if (s.contains("mirostat_eta")) sparams.mirostat_eta = getf("mirostat_eta", sparams.mirostat_eta);
+    if (s.contains("dynatemp_range"))   sparams.dynatemp_range  = getf("dynatemp_range", sparams.dynatemp_range);
+    if (s.contains("dynatemp_exponent")) sparams.dynatemp_exponent = getf("dynatemp_exponent", sparams.dynatemp_exponent);
+    if (s.contains("dry_sequence_breakers") && s["dry_sequence_breakers"].is_array()) {
+        sparams.dry_sequence_breakers = s["dry_sequence_breakers"].get<std::vector<std::string>>();
     }
-    auto * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    if (top_p < 1.0f) llama_sampler_chain_add(chain, llama_sampler_init_top_p(top_p, 1));
-    llama_sampler_chain_add(chain, llama_sampler_init_temp(temp));
-    const uint32_t s = (seed < 0) ? LLAMA_DEFAULT_SEED : (uint32_t)seed;
-    llama_sampler_chain_add(chain, llama_sampler_init_dist(s));
-    return chain;
+}
+
+// Build a common_params_sampling from GenParams: maps the request-level decoding
+// fields, applies the `sampling` overrides, and seeds the EOG logit-bias table
+// (copied into the active bias set when ignore_eos is set). The grammar / tools
+// derivation is done separately in run_generation (it needs the chat templates).
+common_params_sampling build_sampling_params(const AppState & app, const GenParams & p) {
+    common_params_sampling sparams;
+    sparams.temp       = p.temp;
+    sparams.top_p      = p.top_p;
+    sparams.top_k      = p.top_k;
+    sparams.min_p      = p.min_p;
+    sparams.seed       = (p.seed < 0) ? LLAMA_DEFAULT_SEED : (uint32_t) p.seed;
+    sparams.ignore_eos = p.ignore_eos;
+    sparams.no_perf    = true;
+    if (p.sampling.is_object()) apply_sampling_overrides(sparams, p.sampling);
+
+    // Pre-compute the EOG logit-bias table once (-INFINITY on every EOG token),
+    // mirroring common/common.cpp. When ignore_eos is set, fold it into the
+    // active bias set so the logit-bias sampler suppresses EOG tokens entirely.
+    if (sparams.logit_bias_eog.empty()) {
+        const int n = llama_vocab_n_tokens(app.vocab);
+        for (llama_token i = 0; i < n; ++i) {
+            if (llama_vocab_is_eog(app.vocab, i)) {
+                sparams.logit_bias_eog.push_back({i, -INFINITY});
+            }
+        }
+    }
+    if (p.ignore_eos) {
+        sparams.logit_bias.insert(sparams.logit_bias.end(),
+                                  sparams.logit_bias_eog.begin(),
+                                  sparams.logit_bias_eog.end());
+    }
+    return sparams;
+}
+
+// Streaming stop-sequence buffering. Tokens accumulate in `buf`; this flushes
+// the longest safe prefix to the SSE stream, holding back any tail that is a
+// partial prefix of a stop sequence (so raw stop characters never leak). Returns
+// true (and clears the matched part) if a FULL stop sequence is present, meaning
+// generation should stop. `emit` writes one chunk to the stream.
+struct stop_match { bool matched = false; };
+stop_match flush_stream_buffer(std::string & buf, const std::vector<std::string> & stops,
+                               const std::function<bool(const std::string &)> & emit) {
+    // 1. Full stop present? Truncate the buffer at it and stop.
+    for (const auto & s : stops) {
+        if (s.empty()) continue;
+        auto pos = buf.find(s);
+        if (pos != std::string::npos) {
+            if (pos > 0) emit(buf.substr(0, pos));
+            buf.clear();
+            return {true};
+        }
+    }
+    // 2. Hold back the longest tail that is a proper prefix of some stop.
+    size_t hold = 0;
+    for (const auto & s : stops) {
+        const size_t maxp = std::min(buf.size(), s.size() - 1);
+        for (size_t l = maxp; l > hold; --l) {
+            if (std::equal(s.begin(), s.begin() + (std::ptrdiff_t) l, buf.end() - (std::ptrdiff_t) l)) {
+                hold = l;
+                break;
+            }
+        }
+    }
+    const size_t emit_len = buf.size() - hold;
+    if (emit_len > 0) emit(buf.substr(0, emit_len));
+    buf.erase(0, emit_len);
+    return {false};
 }
 
 // Find a session by id under the lock. Returns nullptr if absent. Does NOT hold
@@ -217,40 +317,197 @@ bool seed_if_empty(const AppState & app, llama_context * ctx) {
     return llama_decode(ctx, b) == 0;
 }
 
-// Shared generation loop. Calls `on_token(piece, id)` per produced token (after
-// the token's text is known and it has been fed back into the cache). The
-// callback may return false to stop generation early (e.g. client disconnect).
-// Errors are surfaced by returning a non-empty `error` string.
+// Shared generation loop, now built on llama.cpp's `common_sampler` (ADR 0005).
 //
-// Both the streaming and non-streaming handlers use this so generation logic
-// lives in exactly one place.
+// `on_event` receives full SSE-event JSON objects. When non-null (streaming),
+// it is called with {"type":"token","token":...,"id":N} or
+// {"type":"tool_call","tool_call":{...}} per produced delta and may return false
+// to stop early (client disconnect). When null (non-streaming), everything is
+// accumulated into GenResult. Both handlers go through this one path.
+//
+// Grammar / response_format / tools are derived here (they need the chat
+// templates): tools → common_chat_templates_apply (grammar + lazy triggers +
+// parser); response_format → json_schema_to_grammar; raw grammar → GBNF.
 GenResult run_generation(
     const AppState & app, llama_context * ctx, const GenParams & p,
-    std::function<bool(const std::string & piece, int64_t id)> on_token
+    std::function<bool(const json & event)> on_event
 ) {
     GenResult r;
     if (!seed_if_empty(app, ctx)) return r;
 
-    llama_sampler * smpl = make_sampler(p.temp, p.top_p, p.seed);
+    common_params_sampling sparams = build_sampling_params(app, p);
+
+    bool tool_calling_active = false;
+    common_chat_parser_params parser_params;
+
+    // ---- derive grammar / parser / triggers from tools or response_format ----
+    if (p.tools.is_array() && !p.tools.empty() && app.chat_templates) {
+        // Tool-calling path (ADR 0006): parse the OpenAI tool defs, then let
+        // common_chat_templates_apply derive the GBNF grammar, lazy triggers,
+        // preserved tokens, and the per-format PEG parser — exactly as
+        // llama-server does. A dummy user message is supplied only because the
+        // template requires a non-empty message list; common_chat_templates_apply
+        // derives grammar/triggers/parser solely from tools + tool_choice + the
+        // template definition, NOT from message content, so "hello" is harmless.
+        common_chat_templates_inputs inputs;
+        inputs.use_jinja            = app.use_jinja;
+        inputs.chat_template_kwargs = app.chat_template_kwargs;
+        inputs.tools                = common_chat_tools_parse_oaicompat(p.tools);
+        inputs.tool_choice          = common_chat_tool_choice_parse_oaicompat(p.tool_choice);
+        inputs.add_generation_prompt = true;
+        common_chat_msg dummy;
+        dummy.role    = "user";
+        dummy.content = "hello";
+        inputs.messages.push_back(std::move(dummy));
+
+        common_chat_params cp = common_chat_templates_apply(app.chat_templates.get(), inputs);
+        if (!cp.grammar.empty()) {
+            sparams.grammar = {COMMON_GRAMMAR_TYPE_TOOL_CALLS, cp.grammar};
+        }
+        sparams.grammar_lazy = cp.grammar_lazy;
+        // Preserved tokens + triggers: tokenize each (single-token results become
+        // TOKEN triggers / preserved ids), mirroring the server's schema handler.
+        for (const auto & s : cp.preserved_tokens) {
+            auto ids = common_tokenize(app.vocab, s, false, true);
+            if (ids.size() == 1) sparams.preserved_tokens.insert(ids[0]);
+        }
+        for (auto trig : cp.grammar_triggers) {
+            if (trig.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD) {
+                auto ids = common_tokenize(app.vocab, trig.value, false, true);
+                if (ids.size() == 1) { trig.type = COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN; trig.token = ids[0]; }
+            }
+            sparams.grammar_triggers.push_back(std::move(trig));
+        }
+        parser_params = common_chat_parser_params(cp);
+        if (!cp.parser.empty()) parser_params.parser.load(cp.parser);
+        tool_calling_active = true;
+        // NOTE: generation_prompt is intentionally left empty. For models like
+        // Gemma 4 the chat handler leaves cp.generation_prompt empty in the
+        // normal (non-continuation) case and the grammar's optional `start`
+        // rule absorbs the assistant turn marker that is already in the KV cache
+        // (injected via /inject with add_generation_prompt=true). Pre-filling it
+        // would wrongly advance the grammar past tokens the model must generate.
+    } else if (p.response_format.is_object()) {
+        // response_format → GBNF via json_schema_to_grammar (ADR 0007).
+        std::string rf_type = p.response_format.value("type", std::string{});
+        if (rf_type == "json_object") {
+            json schema = p.response_format.value("schema", json::object());
+            sparams.grammar = {COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, json_schema_to_grammar(schema)};
+        } else if (rf_type == "json_schema") {
+            json schema = p.response_format.value("json_schema", json::object()).value("schema", json::object());
+            sparams.grammar = {COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, json_schema_to_grammar(schema)};
+        }
+        // type == "text" applies no constraint (no grammar set).
+    } else if (!p.grammar.empty()) {
+        sparams.grammar = {COMMON_GRAMMAR_TYPE_USER, p.grammar};
+    }
+
+    common_sampler * smpl = common_sampler_init(app.model, sparams);
     const int n_ctx = llama_n_ctx(ctx);
     const double t0 = now_s();
     bool keep_going = true;
-    for (int step = 0; step < p.max_tokens && keep_going; ++step) {
-        const int used = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
-        if (used + 1 > n_ctx) break;
-        llama_token id = llama_sampler_sample(smpl, ctx, -1);
-        if (llama_vocab_is_eog(app.vocab, id)) break;
-        char buf[64];
-        const int n = llama_token_to_piece(app.vocab, id, buf, sizeof(buf), 0, true);
-        std::string piece = (n > 0) ? std::string(buf, n) : std::string{};
-        r.ids.push_back((int64_t)id);
-        r.text += piece;
-        if (on_token) keep_going = on_token(piece, (int64_t)id);
-        llama_batch batch = llama_batch_get_one(&id, 1);
-        if (llama_decode(ctx, batch) != 0) break;
+
+    if (tool_calling_active) {
+        // ---- tool-calling loop: parse the accumulated text each step ----
+        std::string acc;                          // full accumulated generation
+        common_chat_msg prev_msg;                 // previous parse (for diffing)
+        std::vector<std::string> tc_ids_cache;    // stable ids across re-parses
+        int tc_counter = 0;
+        auto gen_tc_id = [&]() { return std::to_string(++tc_counter); };
+        auto emit_diffs = [&](const std::vector<common_chat_msg_diff> & diffs) {
+            for (const auto & d : diffs) {
+                if (!keep_going) break;
+                if (d.tool_call_index == std::string::npos) {
+                    // content / reasoning delta → token event
+                    if (!d.content_delta.empty() && on_event) {
+                        keep_going = on_event(json{{"type", "token"}, {"token", d.content_delta}});
+                    }
+                    if (keep_going && !d.reasoning_content_delta.empty() && on_event) {
+                        keep_going = on_event(json{{"type", "token"}, {"token", d.reasoning_content_delta}});
+                    }
+                } else if (on_event) {
+                    json tc = {{"index", (int) d.tool_call_index}};
+                    if (!d.tool_call_delta.id.empty())        tc["id"]        = std::string("fc_") + d.tool_call_delta.id;
+                    if (!d.tool_call_delta.name.empty())      tc["name"]      = d.tool_call_delta.name;
+                    if (!d.tool_call_delta.arguments.empty()) tc["arguments"] = d.tool_call_delta.arguments;
+                    keep_going = on_event(json{{"type", "tool_call"}, {"tool_call", std::move(tc)}});
+                }
+            }
+        };
+        for (int step = 0; step < p.max_tokens && keep_going; ++step) {
+            const int used = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
+            if (used + 1 > n_ctx) break;
+            llama_token id = common_sampler_sample(smpl, ctx, -1);
+            if (llama_vocab_is_eog(app.vocab, id)) break;
+            std::string piece = common_token_to_piece(app.vocab, id, true);
+            common_sampler_accept(smpl, id, true);
+            r.ids.push_back((int64_t) id);
+            acc += piece;
+            r.text += piece;
+            // TECH DEBT: re-parse the ENTIRE accumulated text on each step —
+            // O(n²) over generation length. Incremental parsing is future work.
+            auto new_msg = common_chat_parse(acc, /*is_partial*/ true, parser_params);
+            if (!new_msg.empty()) {
+                new_msg.set_tool_call_ids(tc_ids_cache, gen_tc_id);
+                auto diffs = common_chat_msg_diff::compute_diffs(prev_msg, new_msg);
+                prev_msg = new_msg;
+                emit_diffs(diffs);
+            }
+            llama_batch batch = llama_batch_get_one(&id, 1);
+            if (llama_decode(ctx, batch) != 0) break;
+        }
+        // Final non-partial parse: emit remaining diffs and extract tool_calls.
+        auto final_msg = common_chat_parse(acc, /*is_partial*/ false, parser_params);
+        if (!final_msg.empty()) {
+            final_msg.set_tool_call_ids(tc_ids_cache, gen_tc_id);
+            emit_diffs(common_chat_msg_diff::compute_diffs(prev_msg, final_msg));
+            for (const auto & tc : final_msg.tool_calls) {
+                r.tool_calls.push_back({
+                    {"id", std::string("fc_") + tc.id},
+                    {"type", "function"},
+                    {"function", {{"name", tc.name}, {"arguments", tc.arguments}}},
+                });
+            }
+        }
+    } else {
+        // ---- plain loop with streaming stop-sequence buffering ----
+        std::string stream_buf;
+        for (int step = 0; step < p.max_tokens && keep_going; ++step) {
+            const int used = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
+            if (used + 1 > n_ctx) break;
+            llama_token id = common_sampler_sample(smpl, ctx, -1);
+            if (llama_vocab_is_eog(app.vocab, id)) break;
+            std::string piece = common_token_to_piece(app.vocab, id, true);
+            common_sampler_accept(smpl, id, true);
+            r.ids.push_back((int64_t) id);
+            r.text += piece;
+            if (on_event) {
+                stream_buf += piece;
+                auto m = flush_stream_buffer(stream_buf, p.stop, [&](const std::string & chunk) {
+                    bool ok = on_event(json{{"type", "token"}, {"token", chunk}, {"id", (int64_t) id}});
+                    if (!ok) keep_going = false;  // client disconnect
+                    return ok;
+                });
+                if (m.matched) keep_going = false;
+            }
+            llama_batch batch = llama_batch_get_one(&id, 1);
+            if (llama_decode(ctx, batch) != 0) break;
+        }
+        // Flush any held-back tail (a partial stop that never completed).
+        if (on_event && !stream_buf.empty() && keep_going) {
+            on_event(json{{"type", "token"}, {"token", stream_buf},
+                          {"id", r.ids.empty() ? (int64_t) 0 : r.ids.back()}});
+        }
+        // Truncate the final text at the first stop sequence (non-streaming
+        // result, and the authoritative text for streaming too).
+        for (const auto & s : p.stop) {
+            auto pos = r.text.find(s);
+            if (pos != std::string::npos) { r.text = r.text.substr(0, pos); break; }
+        }
     }
+
     r.gen_s = now_s() - t0;
-    llama_sampler_free(smpl);
+    common_sampler_free(smpl);
     return r;
 }
 
@@ -451,7 +708,8 @@ int main(int argc, char ** argv) {
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = 512; cp.n_batch = 512; cp.no_perf = true;
         if (llama_context * wctx = llama_init_from_model(app.model, cp)) {
-            GenParams gp{5, 0.0f, 1.0f, 0};
+            GenParams gp;  // greedy warmup: temp=0 set explicitly below
+            gp.max_tokens = 5; gp.temp = 0.0f; gp.seed = 0;
             run_generation(app, wctx, gp, nullptr);
             llama_free(wctx);
             std::cerr << "warmup done.\n";
@@ -650,6 +908,14 @@ int main(int argc, char ** argv) {
                 inputs.add_generation_prompt = j.value("add_generation_prompt", true);
                 inputs.use_jinja             = app.use_jinja;
                 inputs.chat_template_kwargs  = app.chat_template_kwargs;
+                // Optional tools/tool_choice: render the tool instructions into the
+                // prompt at inject time (ADR 0006), so the cached conversation
+                // already carries the tool contract for the following /generate.
+                if (j.contains("tools") && j["tools"].is_array() && !j["tools"].empty()) {
+                    inputs.tools = common_chat_tools_parse_oaicompat(j["tools"]);
+                    inputs.tool_choice =
+                        common_chat_tool_choice_parse_oaicompat(j.value("tool_choice", std::string("auto")));
+                }
                 // Prepend a global --system-prompt if configured.
                 if (!app.system_prompt.empty()) {
                     common_chat_msg sys;
@@ -878,14 +1144,54 @@ int main(int argc, char ** argv) {
             gp.max_tokens = j.value("max_tokens", 256);
             gp.temp       = j.value("temperature", 0.8f);
             gp.top_p      = j.value("top_p", 1.0f);
+            gp.top_k      = j.value("top_k", 40);
+            gp.min_p      = j.value("min_p", 0.05f);
             gp.seed       = j.value("seed", -1);
+            gp.ignore_eos = j.value("ignore_eos", false);
             stream        = j.value("stream", false);
-        } catch (...) {}
+            // stop: accept an array or a single string.
+            if (j.contains("stop")) {
+                if (j["stop"].is_array()) {
+                    for (const auto & s : j["stop"]) gp.stop.push_back(s.get<std::string>());
+                } else if (j["stop"].is_string()) {
+                    gp.stop.push_back(j["stop"].get<std::string>());
+                }
+            }
+            if (j.contains("grammar"))         gp.grammar         = j["grammar"].get<std::string>();
+            if (j.contains("response_format")) gp.response_format = j["response_format"];
+            if (j.contains("tools"))           gp.tools           = j["tools"];
+            if (j.contains("tool_choice"))     gp.tool_choice     = j["tool_choice"].get<std::string>();
+            if (j.contains("sampling"))        gp.sampling        = j["sampling"];
+        } catch (const std::exception & e) {
+            res.status = 400;
+            res.set_content(error_body(std::string("bad request: ") + e.what(), 400).dump(), "application/json");
+            return;
+        }
+
+        // response_format XOR grammar (both → 400). tools take precedence over
+        // both (the chat template derives its own grammar), so the conflict only
+        // applies when tools are absent.
+        const bool has_rf = gp.response_format.is_object();
+        const bool has_gr = !gp.grammar.empty();
+        const bool has_tools = gp.tools.is_array() && !gp.tools.empty();
+        if (!has_tools && has_rf && has_gr) {
+            res.status = 400;
+            res.set_content(error_body("cannot specify both response_format and grammar", 400).dump(), "application/json");
+            return;
+        }
+        if (has_rf) {
+            std::string rf_type = gp.response_format.value("type", std::string{});
+            if (rf_type != "json_object" && rf_type != "json_schema" && rf_type != "text") {
+                res.status = 400;
+                res.set_content(error_body("invalid response_format.type (expected json_object, json_schema, or text)", 400).dump(), "application/json");
+                return;
+            }
+        }
 
         if (!stream) {
-            // slice-1 behavior: whole response as JSON.
+            // Non-streaming: whole response as JSON (incl. tool_calls if any).
             GenResult r = run_generation(app, ctx, gp, nullptr);
-            if (!r.ids.empty()) set_last_token(app, sid_num, (llama_token)r.ids.back());
+            if (!r.ids.empty()) set_last_token(app, sid_num, (llama_token) r.ids.back());
             const double tok_s = (r.gen_s > 0) ? (r.ids.size() / r.gen_s) : 0.0;
             json body = {
                 {"session_id", sid},
@@ -895,13 +1201,14 @@ int main(int argc, char ** argv) {
                 {"gen_ms", (int)(r.gen_s * 1000)},
                 {"tokens_per_s", tok_s},
             };
+            if (!r.tool_calls.empty()) body["tool_calls"] = r.tool_calls;
             res.set_content(body.dump(), "application/json");
             return;
         }
 
         // Streaming: text/event-stream. Generate tokens directly inside the
         // chunked provider callback — httplib calls it on its worker thread, and
-        // each token piece is written to the DataSink the instant it is produced.
+        // each event is written to the DataSink the instant it is produced.
         // No separate thread, no lifetime issues. The provider blocks httplib's
         // worker until generation finishes, which is fine (one request at a time).
         res.set_header("Cache-Control", "no-cache");
@@ -909,20 +1216,20 @@ int main(int argc, char ** argv) {
         res.set_chunked_content_provider(
             "text/event-stream",
             [&app, ctx, gp, sid, sid_num](size_t, httplib::DataSink & ds) -> bool {
-                GenResult r = run_generation(app, ctx, gp, [&ds](const std::string & piece, int64_t id) {
-                    std::string ev = sse_event(json{
-                        {"type", "token"}, {"token", piece}, {"id", id}
-                    });
+                GenResult r = run_generation(app, ctx, gp, [&ds](const json & event) {
+                    std::string ev = sse_event(event);
                     return ds.write(ev.data(), ev.size());
                 });
-                if (!r.ids.empty()) set_last_token(app, sid_num, (llama_token)r.ids.back());
+                if (!r.ids.empty()) set_last_token(app, sid_num, (llama_token) r.ids.back());
                 const double tok_s = (r.gen_s > 0) ? (r.ids.size() / r.gen_s) : 0.0;
-                std::string done = sse_event(json{
+                json done_body = {
                     {"type", "done"},
                     {"n_tokens", r.ids.size()},
                     {"gen_ms", (int)(r.gen_s * 1000)},
                     {"tokens_per_s", tok_s},
-                });
+                };
+                if (!r.tool_calls.empty()) done_body["tool_calls"] = r.tool_calls;
+                std::string done = sse_event(done_body);
                 ds.write(done.data(), done.size());
                 ds.done();
                 return true;
