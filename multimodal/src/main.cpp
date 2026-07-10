@@ -164,6 +164,8 @@ struct ServerConfig {
     std::string config_path;                                  // --config (optional path to model config JSON file)
 };
 
+double now_s();
+
 // One model loaded once; many sessions (each its own context / KV cache).
 struct AppState {
     llama_model * model = nullptr;
@@ -188,6 +190,57 @@ struct AppState {
     // whose last inject ended in a media/audio embedding chunk — see fork handler).
     std::map<int64_t, llama_token> last_tokens;
     std::atomic<int64_t> next_id{1};
+    std::mutex generations_mu;
+    std::map<std::string, std::shared_ptr<std::atomic<bool>>> active_generations;
+};
+
+struct GenerationRegistration {
+    AppState & app;
+    std::string sid;
+    std::shared_ptr<std::atomic<bool>> cancelled = std::make_shared<std::atomic<bool>>(false);
+
+    GenerationRegistration(AppState & app, std::string sid) : app(app), sid(std::move(sid)) {
+        std::lock_guard<std::mutex> lk(app.generations_mu);
+        app.active_generations[this->sid] = cancelled;
+    }
+
+    bool finish(llama_context * ctx, llama_pos p_start, llama_token last_token,
+                bool disconnected, double & rewind_s) {
+        std::lock_guard<std::mutex> lk(app.generations_mu);
+        const bool must_rewind = disconnected || cancelled->load(std::memory_order_relaxed);
+        if (must_rewind) {
+            const double rewind_start = now_s();
+            llama_memory_t mem = llama_get_memory(ctx);
+            llama_memory_seq_rm(mem, 0, p_start, -1);
+            const llama_pos pmax = llama_memory_seq_pos_max(mem, 0);
+            if (last_token != LLAMA_TOKEN_NULL && pmax >= 0) {
+                llama_memory_seq_rm(mem, 0, pmax, pmax + 1);
+                llama_batch b = llama_batch_init(/*n_tokens*/ 1, /*embd*/ 0, /*n_seq_max*/ 1);
+                b.n_tokens     = 1;
+                b.token[0]     = last_token;
+                b.pos[0]       = pmax;
+                b.n_seq_id[0]  = 1;
+                b.seq_id[0][0] = 0;
+                b.logits[0]    = 1;
+                llama_decode(ctx, b);
+                llama_batch_free(b);
+            }
+            rewind_s = now_s() - rewind_start;
+        }
+        const auto it = app.active_generations.find(sid);
+        if (it != app.active_generations.end() && it->second == cancelled) {
+            app.active_generations.erase(it);
+        }
+        return must_rewind;
+    }
+
+    ~GenerationRegistration() {
+        std::lock_guard<std::mutex> lk(app.generations_mu);
+        const auto it = app.active_generations.find(sid);
+        if (it != app.active_generations.end() && it->second == cancelled) {
+            app.active_generations.erase(it);
+        }
+    }
 };
 
 struct GenParams {
@@ -210,6 +263,8 @@ struct GenResult {
     std::string text;
     std::vector<int64_t> ids;
     double gen_s = 0.0;
+    double rewind_s = 0.0;
+    bool cancelled = false;
     json tool_calls = json::array();
 };
 
@@ -422,10 +477,13 @@ bool seed_if_empty(const AppState & app, llama_context * ctx) {
 // parser); response_format → json_schema_to_grammar; raw grammar → GBNF.
 GenResult run_generation(
     const AppState & app, llama_context * ctx, const GenParams & p,
-    std::function<bool(const json & event)> on_event
+    std::function<bool(const json & event)> on_event,
+    GenerationRegistration * generation = nullptr,
+    llama_token rewind_token = LLAMA_TOKEN_NULL
 ) {
     GenResult r;
     if (!seed_if_empty(app, ctx)) return r;
+    const llama_pos p_start = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
 
     common_params_sampling sparams = build_sampling_params(app, p);
 
@@ -513,9 +571,11 @@ GenResult run_generation(
                     // content / reasoning delta → token event
                     if (!d.content_delta.empty() && on_event) {
                         keep_going = on_event(json{{"type", "token"}, {"token", d.content_delta}});
+                        if (!keep_going) r.cancelled = true;
                     }
                     if (keep_going && !d.reasoning_content_delta.empty() && on_event) {
                         keep_going = on_event(json{{"type", "token"}, {"token", d.reasoning_content_delta}});
+                        if (!keep_going) r.cancelled = true;
                     }
                 } else if (on_event) {
                     json tc = {{"index", (int) d.tool_call_index}};
@@ -523,10 +583,15 @@ GenResult run_generation(
                     if (!d.tool_call_delta.name.empty())      tc["name"]      = d.tool_call_delta.name;
                     if (!d.tool_call_delta.arguments.empty()) tc["arguments"] = d.tool_call_delta.arguments;
                     keep_going = on_event(json{{"type", "tool_call"}, {"tool_call", std::move(tc)}});
+                    if (!keep_going) r.cancelled = true;
                 }
             }
         };
         for (int step = 0; step < p.max_tokens && keep_going; ++step) {
+            if (generation && generation->cancelled->load(std::memory_order_relaxed)) {
+                r.cancelled = true;
+                break;
+            }
             const int used = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
             if (used + 1 > n_ctx) break;
             llama_token id = common_sampler_sample(smpl, ctx, -1);
@@ -545,6 +610,7 @@ GenResult run_generation(
                 prev_msg = new_msg;
                 emit_diffs(diffs);
             }
+            if (!keep_going) break;
             llama_batch batch = llama_batch_get_one(&id, 1);
             if (llama_decode(ctx, batch) != 0) break;
         }
@@ -565,6 +631,10 @@ GenResult run_generation(
         // ---- plain loop with streaming stop-sequence buffering ----
         std::string stream_buf;
         for (int step = 0; step < p.max_tokens && keep_going; ++step) {
+            if (generation && generation->cancelled->load(std::memory_order_relaxed)) {
+                r.cancelled = true;
+                break;
+            }
             const int used = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
             if (used + 1 > n_ctx) break;
             llama_token id = common_sampler_sample(smpl, ctx, -1);
@@ -577,7 +647,10 @@ GenResult run_generation(
                 stream_buf += piece;
                 auto m = flush_stream_buffer(stream_buf, p.stop, [&](const std::string & chunk) {
                     bool ok = on_event(json{{"type", "token"}, {"token", chunk}, {"id", (int64_t) id}});
-                    if (!ok) keep_going = false;  // client disconnect
+                    if (!ok) {
+                        keep_going = false;
+                        r.cancelled = true;
+                    }
                     return ok;
                 });
                 if (m.matched) keep_going = false;
@@ -587,8 +660,12 @@ GenResult run_generation(
         }
         // Flush any held-back tail (a partial stop that never completed).
         if (on_event && !stream_buf.empty() && keep_going) {
-            on_event(json{{"type", "token"}, {"token", stream_buf},
-                          {"id", r.ids.empty() ? (int64_t) 0 : r.ids.back()}});
+            const bool delivered = on_event(json{{"type", "token"}, {"token", stream_buf},
+                                                 {"id", r.ids.empty() ? (int64_t) 0 : r.ids.back()}});
+            if (!delivered) {
+                keep_going = false;
+                r.cancelled = true;
+            }
         }
         // Truncate the final text at the first stop sequence (non-streaming
         // result, and the authoritative text for streaming too).
@@ -596,6 +673,10 @@ GenResult run_generation(
             auto pos = r.text.find(s);
             if (pos != std::string::npos) { r.text = r.text.substr(0, pos); break; }
         }
+    }
+
+    if (generation) {
+        r.cancelled = generation->finish(ctx, p_start, rewind_token, r.cancelled, r.rewind_s);
     }
 
     r.gen_s = now_s() - t0;
@@ -1224,6 +1305,27 @@ int main(int argc, char ** argv) {
         res.set_content(body.dump(), "application/json");
     });
 
+    // ---- POST /sessions/{id}/cancel : signal an active generation ----
+    svr.Post(R"(/sessions/[^/]+/cancel)", [&](const httplib::Request &req, httplib::Response &res) {
+        const std::string sid = extract_session_id(req.path, "cancel");
+        const int64_t sid_num = parse_session_id_num(sid);
+        if (!lookup_session(app, sid_num)) {
+            res.status = 404;
+            res.set_content(error_body("unknown session", 404).dump(), "application/json");
+            return;
+        }
+        bool cancelled = false;
+        {
+            std::lock_guard<std::mutex> lk(app.generations_mu);
+            const auto it = app.active_generations.find(sid);
+            if (it != app.active_generations.end()) {
+                it->second->store(true, std::memory_order_relaxed);
+                cancelled = true;
+            }
+        }
+        res.set_content(json{{"session_id", sid}, {"cancelled", cancelled}}.dump(), "application/json");
+    });
+
     // ---- POST /sessions/{id}/generate : streaming (SSE) or JSON ----
     svr.Post(R"(/sessions/[^/]+/generate)", [&](const httplib::Request &req, httplib::Response &res) {
         std::string sid = extract_session_id(req.path, "generate");
@@ -1284,11 +1386,26 @@ int main(int argc, char ** argv) {
                 return;
             }
         }
+        const bool was_empty = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == -1;
+        if (!seed_if_empty(app, ctx)) {
+            res.status = 500;
+            res.set_content(error_body("failed to seed generation", 500).dump(), "application/json");
+            return;
+        }
+        llama_token pre_generation_last = get_last_token(app, sid_num);
+        if (was_empty && pre_generation_last == LLAMA_TOKEN_NULL) {
+            pre_generation_last = llama_vocab_bos(app.vocab);
+        }
+        auto generation = std::make_shared<GenerationRegistration>(app, sid);
+
 
         if (!stream) {
             // Non-streaming: whole response as JSON (incl. tool_calls if any).
-            GenResult r = run_generation(app, ctx, gp, nullptr);
-            if (!r.ids.empty()) set_last_token(app, sid_num, (llama_token) r.ids.back());
+            GenResult r = run_generation(app, ctx, gp, nullptr, generation.get(), pre_generation_last);
+            if (!r.cancelled && !r.ids.empty()) set_last_token(app, sid_num, (llama_token) r.ids.back());
+            if (r.cancelled) {
+                std::cerr << "generation cancelled for " << sid << "; rewind=" << r.rewind_s * 1000.0 << " ms\n";
+            }
             const double tok_s = (r.gen_s > 0) ? (r.ids.size() / r.gen_s) : 0.0;
             json body = {
                 {"session_id", sid},
@@ -1310,14 +1427,19 @@ int main(int argc, char ** argv) {
         // worker until generation finishes, which is fine (one request at a time).
         res.set_header("Cache-Control", "no-cache");
         res.set_header("Connection", "keep-alive");
+        const auto is_connection_closed = req.is_connection_closed;
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&app, ctx, gp, sid, sid_num](size_t, httplib::DataSink & ds) -> bool {
-                GenResult r = run_generation(app, ctx, gp, [&ds](const json & event) {
+            [&app, ctx, gp, sid, sid_num, generation, pre_generation_last, is_connection_closed](size_t, httplib::DataSink & ds) -> bool {
+                GenResult r = run_generation(app, ctx, gp, [&ds, &is_connection_closed](const json & event) {
+                    if (is_connection_closed()) return false;
                     std::string ev = sse_event(event);
                     return ds.write(ev.data(), ev.size());
-                });
-                if (!r.ids.empty()) set_last_token(app, sid_num, (llama_token) r.ids.back());
+                }, generation.get(), pre_generation_last);
+                if (!r.cancelled && !r.ids.empty()) set_last_token(app, sid_num, (llama_token) r.ids.back());
+                if (r.cancelled) {
+                    std::cerr << "generation cancelled for " << sid << "; rewind=" << r.rewind_s * 1000.0 << " ms\n";
+                }
                 const double tok_s = (r.gen_s > 0) ? (r.ids.size() / r.gen_s) : 0.0;
                 json done_body = {
                     {"type", "done"},
