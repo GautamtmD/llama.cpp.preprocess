@@ -28,6 +28,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <filesystem>
 
 #include "httplib.h"
 #include "nlohmann/json.hpp"
@@ -56,6 +57,95 @@ static std::string read_file_contents(const std::string & path) {
 
 namespace {
 
+static std::string detect_config_path(const std::string & model_path) {
+    try {
+        std::filesystem::path mp(model_path);
+        if (!std::filesystem::exists(mp)) {
+            return "";
+        }
+        // 1. model_path_without_ext + ".json"
+        std::filesystem::path p1 = mp;
+        p1.replace_extension(".json");
+        if (std::filesystem::exists(p1)) return p1.string();
+
+        // 2. model_path_without_ext + "_config.json"
+        std::filesystem::path p2 = mp;
+        p2.replace_extension("");
+        p2 += "_config.json";
+        if (std::filesystem::exists(p2)) return p2.string();
+
+        // 3. model_dir / "config.json"
+        std::filesystem::path dir = mp.parent_path();
+        std::filesystem::path p3 = dir / "config.json";
+        if (std::filesystem::exists(p3)) return p3.string();
+
+        // 4. model_dir / "model_config.json"
+        std::filesystem::path p4 = dir / "model_config.json";
+        if (std::filesystem::exists(p4)) return p4.string();
+    } catch (...) {
+        // ignore filesystem exceptions and return empty
+    }
+    return "";
+}
+
+static ModelConfig load_config_for_model(const std::string & model_path, const std::string & explicit_config_path, const struct llama_model * model) {
+    std::string path_to_load;
+
+    if (!explicit_config_path.empty()) {
+        if (std::filesystem::exists(explicit_config_path)) {
+            path_to_load = explicit_config_path;
+        } else {
+            std::cerr << "warning: explicit config file not found: " << explicit_config_path << "\n";
+            std::cerr << "falling back to metadata auto-detection...\n";
+        }
+    } else {
+        path_to_load = detect_config_path(model_path);
+    }
+
+    ModelConfig cfg;
+    bool loaded = false;
+    if (!path_to_load.empty()) {
+        std::cerr << "loading model config from: " << path_to_load << " ...\n";
+        try {
+            std::string content = read_file_contents(path_to_load);
+            auto j = nlohmann::ordered_json::parse(content);
+            cfg = ModelConfig::from_json(j);
+            loaded = true;
+        } catch (const std::exception & e) {
+            std::cerr << "warning: failed to load or parse config from " << path_to_load << ": " << e.what() << "\n";
+            std::cerr << "falling back to metadata auto-detection...\n";
+        }
+    }
+
+    if (!loaded) {
+        // Auto-detect / Fallback based on model metadata
+        int32_t n_embd = llama_model_n_embd(model);
+        char desc[512] = "";
+        llama_model_desc(model, desc, sizeof(desc));
+        std::string desc_str(desc);
+
+        std::cerr << "info: no config file loaded, auto-detecting model properties from GGUF metadata...\n";
+        std::cerr << "  model embedding length: " << n_embd << "\n";
+        std::cerr << "  model description: " << desc_str << "\n";
+
+        if (n_embd == 2560 || desc_str.find("E4B") != std::string::npos || desc_str.find("4B") != std::string::npos) {
+            cfg.audio_frame_size = 1; // E4B / gemma4a models do not require a divisor constraint in server
+            std::cerr << "  detected Gemma 4 E4B (4B) model. Setting audio_frame_size = 1.\n";
+        } else {
+            cfg.audio_frame_size = 640; // Default Gemma 4 12B audio frame size
+            std::cerr << "  defaulting to Gemma 4 12B model. Setting audio_frame_size = 640.\n";
+        }
+    }
+
+    // Guard audio_frame_size against invalid non-positive values
+    if (cfg.audio_frame_size <= 0) {
+        std::cerr << "warning: invalid audio_frame_size (" << cfg.audio_frame_size << ") in config, falling back to 640.\n";
+        cfg.audio_frame_size = 640;
+    }
+
+    return cfg;
+}
+
 struct ServerConfig {
     std::string model_path;
     std::string mmproj_path;   // multimodal projector gguf (empty = text-only)
@@ -71,6 +161,7 @@ struct ServerConfig {
     bool        enable_chat_template = true;                  // --no-chat-template disables the 'messages' inject path
     std::map<std::string, std::string> chat_template_kwargs;  // --chat-template-kwargs (key -> JSON value serialized as a string)
     std::string system_prompt;                                // --system-prompt (prepended as a system message to every conversation)
+    std::string config_path;                                  // --config (optional path to model config JSON file)
 };
 
 // One model loaded once; many sessions (each its own context / KV cache).
@@ -87,6 +178,7 @@ struct AppState {
     bool                                 enable_chat_template = true;
     std::map<std::string, std::string>   chat_template_kwargs;
     std::string                          system_prompt;
+    ModelConfig                          model_cfg;
     std::mutex mu;
     std::map<int64_t, llama_context *> sessions;  // owns the contexts
     // Last token in each session's cache (seq 0). Used to refresh logits after a
@@ -101,7 +193,7 @@ struct AppState {
 struct GenParams {
     int   max_tokens = 256;
     float temp       = 0.8f;
-    float top_p      = 1.0f;
+    float top_p      = 0.95f;
     int   top_k      = 40;
     float min_p      = 0.05f;
     int   seed       = -1;
@@ -600,6 +692,7 @@ int main(int argc, char ** argv) {
         else if (a == "--no-jinja")           cfg.use_jinja = false;
         else if (a == "--no-chat-template")   cfg.enable_chat_template = false;
         else if (a == "--system-prompt")      cfg.system_prompt = next();
+        else if (a == "--config")             cfg.config_path = next();
         else if (a == "--chat-template-kwargs") {
             // Parse a JSON object string, e.g. '{"k":"v"}'. Each value is stored
             // as its JSON serialization (mirrors common/arg.cpp); re-parsed by
@@ -633,7 +726,8 @@ int main(int argc, char ** argv) {
                 "      --jinja / --no-jinja  use the Jinja template engine (default: enabled)\n"
                 "      --no-chat-template    disable templating: 'messages' inject is rejected\n"
                 "      --system-prompt TEXT  system prompt prepended to every conversation\n"
-                "      --chat-template-kwargs JSON  extra Jinja vars, e.g. '{\"k\":\"v\"}'\n";
+                "      --chat-template-kwargs JSON  extra Jinja vars, e.g. '{\"k\":\"v\"}'\n"
+                "      --config PATH         path to model config JSON file\n";
             return 0;
         }
     }
@@ -668,6 +762,7 @@ int main(int argc, char ** argv) {
     AppState app;
     app.model = llama_model_load_from_file(cfg.model_path.c_str(), mp);
     if (!app.model) { std::cerr << "error: failed to load model\n"; return 1; }
+    app.model_cfg = load_config_for_model(cfg.model_path, cfg.config_path, app.model);
     app.vocab = llama_model_get_vocab(app.model);
     app.chat_templates = common_chat_templates_init(app.model, /* override */ cfg.chat_template);
     app.use_jinja            = cfg.use_jinja;
@@ -983,9 +1078,11 @@ int main(int argc, char ** argv) {
                 }
 
                 size_t n_samples = bytes.size() / sizeof(float);
-                if (n_samples % 640 != 0) {
+                if (n_samples % app.model_cfg.audio_frame_size != 0) {
                     res.status = 400;
-                    res.set_content(error_body("audio sample count must be a multiple of 640 (Gemma 4 audio frame size)", 400).dump(), "application/json");
+                    std::ostringstream os;
+                    os << "audio sample count must be a multiple of " << app.model_cfg.audio_frame_size << " (model audio frame size)";
+                    res.set_content(error_body(os.str(), 400).dump(), "application/json");
                     return;
                 }
 
@@ -1142,10 +1239,10 @@ int main(int argc, char ** argv) {
         try {
             auto j = json::parse(req.body);
             gp.max_tokens = j.value("max_tokens", 256);
-            gp.temp       = j.value("temperature", 0.8f);
-            gp.top_p      = j.value("top_p", 1.0f);
-            gp.top_k      = j.value("top_k", 40);
-            gp.min_p      = j.value("min_p", 0.05f);
+            gp.temp       = j.value("temperature", app.model_cfg.temperature);
+            gp.top_p      = j.value("top_p", app.model_cfg.top_p);
+            gp.top_k      = j.value("top_k", app.model_cfg.top_k);
+            gp.min_p      = j.value("min_p", app.model_cfg.min_p);
             gp.seed       = j.value("seed", -1);
             gp.ignore_eos = j.value("ignore_eos", false);
             stream        = j.value("stream", false);

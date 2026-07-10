@@ -120,6 +120,42 @@ static void test_sse_event() {
     CHECK(payload.find("\"id\"") != std::string::npos);
 }
 
+static void test_model_config() {
+    // Default constructor
+    ModelConfig c1;
+    CHECK_EQ(c1.audio_frame_size, 640);
+    CHECK(std::abs(c1.temperature - 0.8f) < 1e-5f);
+    CHECK(std::abs(c1.top_p - 0.95f) < 1e-5f);
+    CHECK_EQ(c1.top_k, 40);
+    CHECK(std::abs(c1.min_p - 0.05f) < 1e-5f);
+
+    // Parse empty json
+    nlohmann::ordered_json j_empty = nlohmann::ordered_json::object();
+    ModelConfig c2 = ModelConfig::from_json(j_empty);
+    CHECK_EQ(c2.audio_frame_size, 640);
+
+    // Parse custom values
+    nlohmann::ordered_json j_custom = nlohmann::ordered_json::parse(
+        "{\"audio_frame_size\": 160, \"sampler\": {\"temperature\": 0.5, \"top_k\": 20}}"
+    );
+    ModelConfig c3 = ModelConfig::from_json(j_custom);
+    CHECK_EQ(c3.audio_frame_size, 160);
+    CHECK(std::abs(c3.temperature - 0.5f) < 1e-5f);
+    CHECK(std::abs(c3.top_p - 0.95f) < 1e-5f);
+    CHECK_EQ(c3.top_k, 20);
+
+    // Parse flat layout
+    nlohmann::ordered_json j_flat = nlohmann::ordered_json::parse(
+        "{\"audio_frame_size\": 1, \"temperature\": 0.1, \"top_p\": 0.9, \"top_k\": 10, \"min_p\": 0.01}"
+    );
+    ModelConfig c4 = ModelConfig::from_json(j_flat);
+    CHECK_EQ(c4.audio_frame_size, 1);
+    CHECK(std::abs(c4.temperature - 0.1f) < 1e-5f);
+    CHECK(std::abs(c4.top_p - 0.9f) < 1e-5f);
+    CHECK_EQ(c4.top_k, 10);
+    CHECK(std::abs(c4.min_p - 0.01f) < 1e-5f);
+}
+
 int main() {
     test_base64_decode();
     test_make_session_id();
@@ -127,6 +163,7 @@ int main() {
     test_parse_session_id_num();
     test_error_body();
     test_sse_event();
+    test_model_config();
 
     if (g_failures) {
         std::cerr << g_failures << " util test check(s) FAILED\n";

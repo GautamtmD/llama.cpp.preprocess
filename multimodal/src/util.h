@@ -81,3 +81,32 @@ inline std::string sse_event(const nlohmann::ordered_json & j) {
     os << "data: " << j.dump() << "\n\n";
     return os.str();
 }
+
+struct ModelConfig {
+    int32_t audio_frame_size = 640;
+    float temperature = 0.8f;
+    float top_p = 0.95f;
+    int32_t top_k = 40;
+    float min_p = 0.05f;
+
+    static ModelConfig from_json(const nlohmann::ordered_json & j) {
+        ModelConfig cfg;
+        if (j.contains("audio_frame_size")) {
+            cfg.audio_frame_size = j["audio_frame_size"].get<int32_t>();
+        }
+        if (j.contains("sampler")) {
+            auto s = j["sampler"];
+            if (s.is_object()) {
+                if (s.contains("temperature")) cfg.temperature = s["temperature"].get<float>();
+                if (s.contains("top_p"))       cfg.top_p       = s["top_p"].get<float>();
+                if (s.contains("top_k"))       cfg.top_k       = s["top_k"].get<int32_t>();
+                if (s.contains("min_p"))       cfg.min_p       = s["min_p"].get<float>();
+            }
+        }
+        if (j.contains("temperature")) cfg.temperature = j["temperature"].get<float>();
+        if (j.contains("top_p"))       cfg.top_p       = j["top_p"].get<float>();
+        if (j.contains("top_k"))       cfg.top_k       = j["top_k"].get<int32_t>();
+        if (j.contains("min_p"))       cfg.min_p       = j["min_p"].get<float>();
+        return cfg;
+    }
+};
