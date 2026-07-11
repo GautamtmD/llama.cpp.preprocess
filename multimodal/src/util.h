@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <sstream>
 #include <string>
+#include <vector>
 
 // RFC4648 base64 decode (no URL-safe; ignores whitespace and '='; skips any
 // non-alphabet character).
@@ -88,6 +89,13 @@ struct ModelConfig {
     float top_p = 0.95f;
     int32_t top_k = 40;
     float min_p = 0.05f;
+    // Declared modalities (text/image/audio in; text out). When empty, the
+    // server infers them at runtime from the loaded projector (backward compat).
+    // When authored (model_config.json `modalities` block), they are the source
+    // of truth — surfaced and reconciled via GET /info so tests can select by
+    // capability (e.g. skip audio tests on a vision+text model).
+    std::vector<std::string> input_modalities;
+    std::vector<std::string> output_modalities;
 
     static ModelConfig from_json(const nlohmann::ordered_json & j) {
         ModelConfig cfg;
@@ -107,6 +115,19 @@ struct ModelConfig {
         if (j.contains("top_p"))       cfg.top_p       = j["top_p"].get<float>();
         if (j.contains("top_k"))       cfg.top_k       = j["top_k"].get<int32_t>();
         if (j.contains("min_p"))       cfg.min_p       = j["min_p"].get<float>();
+        if (j.contains("modalities")) {
+            const auto & m = j["modalities"];
+            if (m.is_object()) {
+                if (m.contains("input") && m["input"].is_array()) {
+                    for (const auto & x : m["input"])
+                        if (x.is_string()) cfg.input_modalities.push_back(x.get<std::string>());
+                }
+                if (m.contains("output") && m["output"].is_array()) {
+                    for (const auto & x : m["output"])
+                        if (x.is_string()) cfg.output_modalities.push_back(x.get<std::string>());
+                }
+            }
+        }
         return cfg;
     }
 };

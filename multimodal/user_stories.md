@@ -199,3 +199,65 @@ Test:
 > [0006](../../../docs/decisions/0006-tools-prompt-based-engine-tool-agnostic.md),
 > [0007](../../../docs/decisions/0007-grammar-constrained-generation.md),
 > [0008](../../../docs/decisions/0008-generate-parameter-resolution-3-tier-profiles.md).
+
+---
+
+### EUS-6: KV-cache offload — swap a session's state between VRAM and host RAM
+Move a session's swappable state out of VRAM into host RAM (release its VRAM
+without destroying it) and bring it back unchanged. This is US-9's VRAM-pressure
+valve: a preempted task can be parked (RAM) and later resumed (load) or discarded
+(delete), so a pruning task can reclaim VRAM. Disk serialization is separate
+(backlog) and out of scope.
+
+Input / trigger:
+- `POST /sessions/{id}/offload`, `POST /sessions/{id}/load`,
+  `GET /sessions/{id}`, `GET /sessions/usage`.
+
+Expected:
+- **Offload** moves a resident session to RAM; afterwards its VRAM footprint
+  (via `/usage`) is ~0 and `GET /sessions/{id}` reports `location:"ram"`. Returns
+  `{session_id, location:"ram", cache_size, state_bytes, offload_ms}`. Idempotent
+  (`offload_ms:0` on an already-RAM session).
+- **Load** restores a RAM session to VRAM; the session then reproduces its exact
+  pre-offload greedy (`temperature`≤0) output on `/generate` (round-trip
+  correctness — the KV/SSM state survived unchanged). Returns
+  `{session_id, location:"vram", cache_size, state_bytes, load_ms}`. Idempotent.
+- **GET /sessions/{id}** returns `{session_id, location, cache_size, state_bytes}`.
+- **GET /sessions/usage** returns `{vram:{n_sessions,total_state_bytes,sessions:[{session_id,state_bytes}]},
+  ram:{...}}`.
+- **Offloaded sessions cannot be silently used (409, no auto-load):**
+  `inject`/`generate`/`fork` against a RAM session return **409**
+  ("session is offloaded; POST /sessions/{id}/load first"); `delete` works on a
+  RAM session (frees the RAM buffer); `cancel` is a no-op `{cancelled:false}`.
+  Offloading a session with an active generation returns 409 (use-after-free
+  guard). Unknown session → 404 for all new ops.
+- `state_bytes` is the per-sequence serializable state (`llama_state_seq_get_size`,
+  seq 0) — KV + SSM/Mamba recurrent state for hybrid models; symmetric across
+  offload/load so `/usage` is meaningful in both states.
+- **Must not assume exclusive KV ownership** (forward-compat with EUS-4 shared KV):
+  offloading/loading one session must not corrupt, evict, or stall a cache another
+  live session depends on. Proven on the strongest sharing the current fork
+  supports (ADR 0004 A' deep-copy) + a shared-KV sentinel test for the slice-5
+  future.
+
+Latency / performance budget:
+- **The bar is inference impact, not offload/load speed.** Offload/load of session
+  X must not stall or significantly slow generation on another session Y: the
+  GPU→host serialize on X is performed **outside** the global sessions mutex
+  (the decode loop holds no such lock during `llama_decode`). Required test: a
+  sustained streaming `/generate` on A establishes a baseline (tok/s, per-token
+  latency); offload/load on other sessions during A's generation keeps A's
+  sustained tok/s within a chosen fraction of baseline, bounds any single-token
+  stall, and leaves A's greedy output **byte-identical** to a solo run. Threshold
+  set from measurement (see worklog `2026-07-11-kv-cache-offload.md`).
+- Offload/load wall-clock latency is **reported** (in `offload_ms`/`load_ms`) but
+  is **not** a gate.
+
+Test:
+- tests/test_offload.py (functional + round-trip + KV-sharing correctness)
+- tests/test_offload_concurrent.py (SC #8 inference-impact gate + shared-KV sentinel)
+
+> Enables [US-9](../../../user_stories.md) (preemption & redundancy pruning).
+> Design survives [EUS-4](../../../docs/decisions/0004-fork-copy-semantics.md)
+> slice-5 shared KV (`llama_memory_seq_cp`) — the sequence-scoped serialize
+> primitive (`llama_state_seq_*`) won't corrupt another session's shared cells.

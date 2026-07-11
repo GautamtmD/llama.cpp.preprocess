@@ -166,6 +166,19 @@ struct ServerConfig {
 
 double now_s();
 
+// A session parked in host RAM (offloaded from VRAM). The live llama_context
+// has been freed (that is what actually releases VRAM — llama_memory_seq_rm only
+// clears logical cells, not the pre-allocated KV buffer); this holds the
+// serialized seq-0 state so the session can be loaded back into a fresh
+// context unchanged. `state` is the per-sequence serializable state (KV +, for
+// hybrid models like Qwen3.5/MiniCPM-V-4.6, the SSM/Mamba recurrent state).
+struct OffloadedState {
+    std::vector<uint8_t> state;                       // llama_state_seq_get_data output
+    llama_token          last_token = LLAMA_TOKEN_NULL; // for logits refresh on load
+    int                  cache_size = 0;              // tokens at offload time
+    size_t               state_bytes = 0;             // == state.size(); symmetric offload/load
+};
+
 // One model loaded once; many sessions (each its own context / KV cache).
 struct AppState {
     llama_model * model = nullptr;
@@ -189,6 +202,9 @@ struct AppState {
     // token before it can generate). LLAMA_TOKEN_NULL when unknown (e.g. a session
     // whose last inject ended in a media/audio embedding chunk — see fork handler).
     std::map<int64_t, llama_token> last_tokens;
+    // Sessions parked in host RAM (KV offloaded from VRAM). A session id is in
+    // exactly one of `sessions` (live, VRAM) or `offloaded_sessions` (RAM).
+    std::map<int64_t, OffloadedState> offloaded_sessions;
     std::atomic<int64_t> next_id{1};
     std::mutex generations_mu;
     std::map<std::string, std::shared_ptr<std::atomic<bool>>> active_generations;
@@ -417,6 +433,60 @@ llama_token get_last_token(AppState & app, int64_t n) {
     return (it == app.last_tokens.end()) ? LLAMA_TOKEN_NULL : it->second;
 }
 
+// True iff session n is currently parked in host RAM (offloaded).
+bool is_offloaded(AppState & app, int64_t n) {
+    std::lock_guard<std::mutex> lk(app.mu);
+    return app.offloaded_sessions.count(n) > 0;
+}
+
+// Resolve a live (VRAM) session by id. Sets res to 409 (offloaded) or 404
+// (unknown) and returns nullptr when not live; otherwise returns the ctx. Used
+// by inject/generate/fork so a parked (RAM) session cannot be silently used —
+// the client must POST /sessions/{id}/load first.
+llama_context * require_live_session(AppState & app, int64_t sid_num,
+                                     httplib::Response & res) {
+    llama_context * ctx = lookup_session(app, sid_num);
+    if (!ctx) {
+        if (is_offloaded(app, sid_num)) {
+            res.status = 409;
+            res.set_content(error_body("session is offloaded; POST /sessions/{id}/load first", 409).dump(),
+                            "application/json");
+        } else {
+            res.status = 404;
+            res.set_content(error_body("unknown session", 404).dump(), "application/json");
+        }
+        return nullptr;
+    }
+    return ctx;
+}
+
+// Restore a serialized seq-0 state into a fresh context and refresh logits by
+// re-decoding last_token at its (freed) position. Shared by fork_context (state
+// copied from a source ctx) and load (state from an offloaded RAM buffer).
+// last_token == LLAMA_TOKEN_NULL means the state ended in an image/audio
+// embedding chunk (no discrete token); KV/SSM is restored but logits are NOT
+// refreshed — the caller must inject one text token before generating.
+void restore_state_and_refresh(llama_context * dst, const uint8_t * data, size_t size,
+                               llama_token last_token) {
+    llama_state_seq_set_data(dst, data, size, /*dest_seq_id*/ 0);
+    if (last_token != LLAMA_TOKEN_NULL) {
+        llama_memory_t dmem = llama_get_memory(dst);
+        const llama_pos pmax = llama_memory_seq_pos_max(dmem, 0);
+        // Re-decoding at an already-cached position yields no logits row, so free
+        // the last cell then re-evaluate last_token there: identical K/V + logits.
+        llama_memory_seq_rm(dmem, 0, pmax, pmax + 1);
+        llama_batch b = llama_batch_init(/*n_tokens*/ 1, /*embd*/ 0, /*n_seq_max*/ 1);
+        b.n_tokens     = 1;
+        b.token[0]     = last_token;
+        b.pos[0]       = pmax;
+        b.n_seq_id[0]  = 1;
+        b.seq_id[0][0] = 0;
+        b.logits[0]    = 1;  // request logits for this token
+        llama_decode(dst, b);
+        llama_batch_free(b);
+    }
+}
+
 // Core fork copy (approach A', see docs/decisions/0004-fork-copy-semantics.md):
 // deep-copy src's seq-0 KV into a fresh context and refresh logits by re-decoding
 // src_last at its (freed) position. Returns the new context (caller owns) or
@@ -434,25 +504,7 @@ llama_context * fork_context(const AppState & app, llama_context * src, llama_to
     const size_t seq_size = llama_state_seq_get_size(src, /*seq_id*/ 0);
     std::vector<uint8_t> buf(seq_size);
     llama_state_seq_get_data(src, buf.data(), seq_size, /*seq_id*/ 0);
-    llama_state_seq_set_data(dst, buf.data(), seq_size, /*dest_seq_id*/ 0);
-    if (src_last != LLAMA_TOKEN_NULL) {
-        llama_memory_t dmem = llama_get_memory(dst);
-        const llama_pos pmax = llama_memory_seq_pos_max(dmem, 0);
-        // Re-decoding at an already-cached position yields no logits row, so free
-        // the last cell then re-evaluate src_last there: identical K/V + logits.
-        // (This is the first decode in the new dst context, so it pays that
-        // context's one-time first-decode cost — see ADR 0004.)
-        llama_memory_seq_rm(dmem, 0, pmax, pmax + 1);
-        llama_batch b = llama_batch_init(/*n_tokens*/ 1, /*embd*/ 0, /*n_seq_max*/ 1);
-        b.n_tokens     = 1;
-        b.token[0]     = src_last;
-        b.pos[0]       = pmax;
-        b.n_seq_id[0]  = 1;
-        b.seq_id[0][0] = 0;
-        b.logits[0]    = 1;  // request logits for this token
-        llama_decode(dst, b);
-        llama_batch_free(b);
-    }
+    restore_state_and_refresh(dst, buf.data(), seq_size, src_last);
     return dst;
 }
 
@@ -915,11 +967,37 @@ int main(int argc, char ** argv) {
 
     // ---- GET /info : capabilities (what the model + projector support) ----
     svr.Get("/info", [&](const httplib::Request &, httplib::Response &res) {
+        // Reconcile the model-config-declared modalities with what is actually
+        // loaded: a modality is available iff declared AND its projector is
+        // loaded (text is always available). When the config declares nothing,
+        // infer from the projector (backward compat). This is the source of truth
+        // tests use to select by capability (e.g. skip audio tests on a
+        // vision+text model).
+        const bool v = app.mtmd_ctx && mtmd_support_vision(app.mtmd_ctx);
+        const bool a = app.mtmd_ctx && mtmd_support_audio(app.mtmd_ctx);
+        std::vector<std::string> in_mods;
+        if (app.model_cfg.input_modalities.empty()) {
+            in_mods = {"text"};
+            if (v) in_mods.push_back("image");
+            if (a) in_mods.push_back("audio");
+        } else {
+            for (const auto & m : app.model_cfg.input_modalities) {
+                if (m == "text" || (m == "image" && v) || (m == "audio" && a)) in_mods.push_back(m);
+            }
+            if (in_mods.empty()) in_mods = {"text"};
+        }
+        std::vector<std::string> out_mods = app.model_cfg.output_modalities;
+        if (out_mods.empty()) out_mods = {"text"};
+        json in_arr = json::array(), out_arr = json::array();
+        for (const auto & m : in_mods)  in_arr.push_back(m);
+        for (const auto & m : out_mods) out_arr.push_back(m);
         json body = {
             {"model_loaded", app.model != nullptr},
-            {"supports_vision", app.mtmd_ctx ? mtmd_support_vision(app.mtmd_ctx) : false},
-            {"supports_audio", app.mtmd_ctx ? mtmd_support_audio(app.mtmd_ctx) : false},
+            {"supports_vision", std::find(in_mods.begin(), in_mods.end(), "image") != in_mods.end()},
+            {"supports_audio",  std::find(in_mods.begin(), in_mods.end(), "audio")  != in_mods.end()},
             {"audio_sample_rate", app.mtmd_ctx ? mtmd_get_audio_sample_rate(app.mtmd_ctx) : 0},
+            {"input_modalities", in_arr},
+            {"output_modalities", out_arr},
         };
         res.set_content(body.dump(), "application/json");
     });
@@ -949,12 +1027,9 @@ int main(int argc, char ** argv) {
     // sessions become sequences in a pooled context — see the ADR.)
     svr.Post(R"(/sessions/[^/]+/fork)", [&](const httplib::Request &req, httplib::Response &res) {
         std::string sid = extract_session_id(req.path, "fork");
-        llama_context * src = lookup_session(app, parse_session_id_num(sid));
-        if (!src) {
-            res.status = 404;
-            res.set_content(error_body("unknown session", 404).dump(), "application/json");
-            return;
-        }
+        const int64_t sid_num = parse_session_id_num(sid);
+        llama_context * src = require_live_session(app, sid_num, res);
+        if (!src) return;
 
         const double t0 = now_s();
         const llama_token src_last = get_last_token(app, parse_session_id_num(sid));
@@ -982,12 +1057,8 @@ int main(int argc, char ** argv) {
     svr.Post(R"(/sessions/[^/]+/inject)", [&](const httplib::Request &req, httplib::Response &res) {
         std::string sid = extract_session_id(req.path, "inject");
         const int64_t sid_num = parse_session_id_num(sid);
-        llama_context * ctx = lookup_session(app, sid_num);
-        if (!ctx) {
-            res.status = 404;
-            res.set_content(error_body("unknown session", 404).dump(), "application/json");
-            return;
-        }
+        llama_context * ctx = require_live_session(app, sid_num, res);
+        if (!ctx) return;
         std::string text;
         bool used_template = false;
         bool used_multimodal = false;
@@ -1310,6 +1381,11 @@ int main(int argc, char ** argv) {
         const std::string sid = extract_session_id(req.path, "cancel");
         const int64_t sid_num = parse_session_id_num(sid);
         if (!lookup_session(app, sid_num)) {
+            if (is_offloaded(app, sid_num)) {
+                // No active generation on a parked (RAM) session; cancel is a no-op.
+                res.set_content(json{{"session_id", sid}, {"cancelled", false}}.dump(), "application/json");
+                return;
+            }
             res.status = 404;
             res.set_content(error_body("unknown session", 404).dump(), "application/json");
             return;
@@ -1330,12 +1406,8 @@ int main(int argc, char ** argv) {
     svr.Post(R"(/sessions/[^/]+/generate)", [&](const httplib::Request &req, httplib::Response &res) {
         std::string sid = extract_session_id(req.path, "generate");
         const int64_t sid_num = parse_session_id_num(sid);
-        llama_context * ctx = lookup_session(app, sid_num);
-        if (!ctx) {
-            res.status = 404;
-            res.set_content(error_body("unknown session", 404).dump(), "application/json");
-            return;
-        }
+        llama_context * ctx = require_live_session(app, sid_num, res);
+        if (!ctx) return;
         GenParams gp;
         bool stream = false;
         try {
@@ -1456,6 +1528,198 @@ int main(int argc, char ** argv) {
         );
     });
 
+    // ---- GET /sessions/usage : aggregate VRAM/RAM footprint (EUS-6) ----
+    // MUST be registered before GET /sessions/{id} so the literal "usage" is not
+    // shadowed by the {id} regex (cpp-httplib matches in registration order).
+    svr.Get("/sessions/usage", [&](const httplib::Request &, httplib::Response &res) {
+        json vram_sessions = json::array();
+        size_t vram_total = 0;
+        json ram_sessions  = json::array();
+        size_t ram_total  = 0;
+        {
+            std::lock_guard<std::mutex> lk(app.mu);
+            for (const auto & [n, ctx] : app.sessions) {
+                const size_t sb = llama_state_seq_get_size(ctx, /*seq_id*/ 0);
+                vram_sessions.push_back({{"session_id", make_session_id(n)}, {"state_bytes", sb}});
+                vram_total += sb;
+            }
+            for (const auto & [n, st] : app.offloaded_sessions) {
+                ram_sessions.push_back({{"session_id", make_session_id(n)}, {"state_bytes", st.state_bytes}});
+                ram_total += st.state_bytes;
+            }
+        }
+        json body = {
+            {"vram", {{"n_sessions", vram_sessions.size()}, {"total_state_bytes", vram_total}, {"sessions", vram_sessions}}},
+            {"ram",  {{"n_sessions", ram_sessions.size()},  {"total_state_bytes", ram_total},  {"sessions", ram_sessions}}},
+        };
+        res.set_content(body.dump(), "application/json");
+    });
+
+    // ---- GET /sessions/{id} : session status (location + footprint) (EUS-6) ----
+    svr.Get(R"(/sessions/[^/]+)", [&](const httplib::Request &req, httplib::Response &res) {
+        const std::string prefix = "/sessions/";
+        if (req.path.rfind(prefix, 0) != 0 || req.path.find('/', prefix.size()) != std::string::npos) {
+            res.status = 404;
+            res.set_content(error_body("not found", 404).dump(), "application/json");
+            return;
+        }
+        const int64_t sid_num = parse_session_id_num(req.path.substr(prefix.size()));
+        std::lock_guard<std::mutex> lk(app.mu);
+        auto it = (sid_num > 0) ? app.sessions.find(sid_num) : app.sessions.end();
+        if (it != app.sessions.end()) {
+            const int cache_size = llama_memory_seq_pos_max(llama_get_memory(it->second), 0) + 1;
+            const size_t state_bytes = llama_state_seq_get_size(it->second, /*seq_id*/ 0);
+            json body = {
+                {"session_id", make_session_id(sid_num)}, {"location", "vram"},
+                {"cache_size", cache_size}, {"state_bytes", state_bytes},
+            };
+            res.set_content(body.dump(), "application/json");
+            return;
+        }
+        auto oit = app.offloaded_sessions.find(sid_num);
+        if (oit != app.offloaded_sessions.end()) {
+            json body = {
+                {"session_id", make_session_id(sid_num)}, {"location", "ram"},
+                {"cache_size", oit->second.cache_size}, {"state_bytes", oit->second.state_bytes},
+            };
+            res.set_content(body.dump(), "application/json");
+            return;
+        }
+        res.status = 404;
+        res.set_content(error_body("unknown session", 404).dump(), "application/json");
+    });
+
+    // ---- POST /sessions/{id}/offload : move KV state VRAM -> host RAM (EUS-6) ----
+    // Serialize the session's seq-0 state to a host buffer (the GPU->host copy is
+    // done OUTSIDE app.mu so it cannot serialize another session's decode loop),
+    // then free the live context under app.mu (that is what actually releases
+    // VRAM) and park the bytes in offloaded_sessions. Idempotent on a RAM session.
+    svr.Post(R"(/sessions/[^/]+/offload)", [&](const httplib::Request &req, httplib::Response &res) {
+        const std::string sid = extract_session_id(req.path, "offload");
+        const int64_t sid_num = parse_session_id_num(sid);
+        // Refuse to offload a session with an active generation (use-after-free guard).
+        {
+            std::lock_guard<std::mutex> lk(app.generations_mu);
+            if (app.active_generations.count(sid)) {
+                res.status = 409;
+                res.set_content(error_body("session has an active generation; cancel or wait for it to finish before offloading", 409).dump(),
+                                "application/json");
+                return;
+            }
+        }
+        llama_context * ctx = nullptr;
+        llama_token last = LLAMA_TOKEN_NULL;
+        {
+            std::lock_guard<std::mutex> lk(app.mu);
+            auto oit = app.offloaded_sessions.find(sid_num);
+            if (oit != app.offloaded_sessions.end()) {
+                // idempotent: already RAM
+                res.set_content(json{{"session_id", sid}, {"location", "ram"},
+                                     {"cache_size", oit->second.cache_size},
+                                     {"state_bytes", oit->second.state_bytes},
+                                     {"offload_ms", 0}}.dump(), "application/json");
+                return;
+            }
+            auto it = (sid_num > 0) ? app.sessions.find(sid_num) : app.sessions.end();
+            if (it == app.sessions.end()) {
+                res.status = 404;
+                res.set_content(error_body("unknown session", 404).dump(), "application/json");
+                return;
+            }
+            ctx = it->second;
+            auto lt = app.last_tokens.find(sid_num);
+            if (lt != app.last_tokens.end()) last = lt->second;
+        }
+        // Serialize lock-free (this ctx is exclusively ours for this session).
+        // Per-sequence state (KV +, for hybrid models, the SSM recurrent state)
+        // — the same primitive fork uses (ADR 0004 A'). state_bytes is symmetric
+        // across offload/load and is what /usage sums.
+        const double t0 = now_s();
+        const size_t seq_size = llama_state_seq_get_size(ctx, /*seq_id*/ 0);
+        std::vector<uint8_t> buf(seq_size);
+        llama_state_seq_get_data(ctx, buf.data(), seq_size, /*seq_id*/ 0);
+        const int cache_size = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
+        {
+            std::lock_guard<std::mutex> lk(app.mu);
+            auto it = app.sessions.find(sid_num);
+            if (it != app.sessions.end()) {
+                llama_free(it->second);
+                app.sessions.erase(it);
+            }
+            app.last_tokens.erase(sid_num);
+            OffloadedState st;
+            st.state = std::move(buf);
+            st.last_token = last;
+            st.cache_size = cache_size;
+            st.state_bytes = seq_size;
+            app.offloaded_sessions[sid_num] = std::move(st);
+        }
+        const double dt = (now_s() - t0) * 1000.0;
+        res.set_content(json{{"session_id", sid}, {"location", "ram"},
+                             {"cache_size", cache_size}, {"state_bytes", seq_size},
+                             {"offload_ms", (int) dt}}.dump(), "application/json");
+    });
+
+    // ---- POST /sessions/{id}/load : restore KV state host RAM -> VRAM (EUS-6) ----
+    // Recreate a fresh context, restore the seq-0 state + refresh logits, and put
+    // the session back in `sessions`. Idempotent on a VRAM session.
+    svr.Post(R"(/sessions/[^/]+/load)", [&](const httplib::Request &req, httplib::Response &res) {
+        const std::string sid = extract_session_id(req.path, "load");
+        const int64_t sid_num = parse_session_id_num(sid);
+        const double t0 = now_s();
+        OffloadedState st;
+        bool was_offloaded = false;
+        {
+            std::lock_guard<std::mutex> lk(app.mu);
+            if ((sid_num > 0) && app.sessions.count(sid_num)) {
+                // idempotent: already VRAM — report current footprint.
+                llama_context * ctx = app.sessions[sid_num];
+                const int cache_size = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
+                const size_t state_bytes = llama_state_seq_get_size(ctx, /*seq_id*/ 0);
+                res.set_content(json{{"session_id", sid}, {"location", "vram"},
+                                     {"cache_size", cache_size}, {"state_bytes", state_bytes},
+                                     {"load_ms", 0}}.dump(), "application/json");
+                return;
+            }
+            auto oit = app.offloaded_sessions.find(sid_num);
+            if (oit == app.offloaded_sessions.end()) {
+                res.status = 404;
+                res.set_content(error_body("unknown session", 404).dump(), "application/json");
+                return;
+            }
+            st = std::move(oit->second);
+            app.offloaded_sessions.erase(oit);
+            was_offloaded = true;
+        }
+        llama_context * ctx = create_session_ctx(app);
+        if (!ctx) {
+            // Re-park so the session (and its state) is not lost.
+            std::lock_guard<std::mutex> lk(app.mu);
+            app.offloaded_sessions[sid_num] = std::move(st);
+            res.status = 500;
+            res.set_content(error_body("failed to create context", 500).dump(), "application/json");
+            return;
+        }
+        // Restore the per-sequence state and refresh logits by re-decoding the
+        // last token (the restore carries KV/SSM but NOT the logits buffer) —
+        // the same mechanism fork uses (ADR 0004 A'). CAVEAT: the redecode frees
+        // the last cell then re-evaluates there, which requires seq_rm to rewind
+        // the last position; that holds for pure-attention models (e.g. Gemma 4)
+        // but NOT hybrid SSM/M-RoPE models (e.g. MiniCPM-V-4.6 / Qwen3.5), where
+        // seq_rm can't rewind the recurrent state, so generate-after-restore is
+        // unsupported on hybrids today (a fork-level limitation; see worklog).
+        restore_state_and_refresh(ctx, st.state.data(), st.state_bytes, st.last_token);
+        {
+            std::lock_guard<std::mutex> lk(app.mu);
+            app.sessions[sid_num] = ctx;
+            app.last_tokens[sid_num] = st.last_token;
+        }
+        const double dt = (now_s() - t0) * 1000.0;
+        res.set_content(json{{"session_id", sid}, {"location", "vram"},
+                             {"cache_size", st.cache_size}, {"state_bytes", st.state_bytes},
+                             {"load_ms", (int) dt}}.dump(), "application/json");
+    });
+
     // ---- DELETE /sessions/{id} : free the session ----
     svr.Delete(R"(/sessions/[^/]+)", [&](const httplib::Request &req, httplib::Response &res) {
         const std::string prefix = "/sessions/";
@@ -1469,14 +1733,20 @@ int main(int argc, char ** argv) {
         {
             std::lock_guard<std::mutex> lk(app.mu);
             auto it = (n > 0) ? app.sessions.find(n) : app.sessions.end();
-            if (it == app.sessions.end()) {
-                res.status = 404;
-                res.set_content(error_body("unknown session", 404).dump(), "application/json");
-                return;
+            if (it != app.sessions.end()) {
+                llama_free(it->second);
+                app.sessions.erase(it);
+                app.last_tokens.erase(n);
+            } else {
+                auto oit = app.offloaded_sessions.find(n);
+                if (oit != app.offloaded_sessions.end()) {
+                    app.offloaded_sessions.erase(oit);  // frees the host-RAM buffer
+                } else {
+                    res.status = 404;
+                    res.set_content(error_body("unknown session", 404).dump(), "application/json");
+                    return;
+                }
             }
-            llama_free(it->second);
-            app.sessions.erase(it);
-            app.last_tokens.erase(n);
         }
         res.set_content(json{{"session_id", sid}, {"deleted", true}}.dump(), "application/json");
     });
