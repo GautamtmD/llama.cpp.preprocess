@@ -8,7 +8,7 @@ manually (no extra deps).
 from __future__ import annotations
 
 import json
-from typing import Iterator
+from collections.abc import Iterator
 
 import pytest
 import requests
@@ -20,7 +20,7 @@ def _parse_sse(response) -> Iterator[dict]:
     """Yield parsed JSON objects from an SSE text/event-stream response."""
     for line in response.iter_lines(decode_unicode=True):
         if line and line.startswith("data: "):
-            yield json.loads(line[len("data: "):])
+            yield json.loads(line[len("data: ") :])
 
 
 def _inject_chat(base, sid, user_text):
@@ -38,7 +38,8 @@ def test_stream_yields_token_events(base, make_session):
     r = requests.post(
         f"{base}/sessions/{sid}/generate",
         json={"stream": True, "max_tokens": 15, "temperature": 0.0},
-        stream=True, timeout=120,
+        stream=True,
+        timeout=120,
     )
     assert r.status_code == 200
     assert "text/event-stream" in r.headers.get("content-type", "")
@@ -66,7 +67,8 @@ def test_stream_text_concatenates(base, make_session):
     r = requests.post(
         f"{base}/sessions/{sid}/generate",
         json={"stream": True, "max_tokens": 30, "temperature": 0.0},
-        stream=True, timeout=120,
+        stream=True,
+        timeout=120,
     )
     events = list(_parse_sse(r))
     text = "".join(e["token"] for e in events if e.get("type") == "token")
@@ -82,7 +84,8 @@ def test_stream_unknown_session_404(base):
     r = requests.post(
         f"{base}/sessions/s_999999/generate",
         json={"stream": True, "max_tokens": 1},
-        stream=True, timeout=30,
+        stream=True,
+        timeout=30,
     )
     assert r.status_code == 404
 

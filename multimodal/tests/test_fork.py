@@ -165,8 +165,7 @@ def test_fork_after_generate_includes_generated_tokens(base, make_session):
     """Forking AFTER a generate snapshots the generated tokens too."""
     src = make_session()
     _inject_msgs(base, src, [{"role": "user", "content": "Say hello."}])
-    g = _generate(base, src, max_tokens=8)
-    size_after_gen = g["n_tokens"]  # not exact cache (inject+gen), but > inject alone
+    generated = _generate(base, src, max_tokens=8)
 
     f = _fork(base, src)
     # the fork's cache includes the source's injected + generated content
@@ -174,7 +173,9 @@ def test_fork_after_generate_includes_generated_tokens(base, make_session):
     # and it can continue generating
     g2 = _generate(base, f["session_id"], max_tokens=5)
     assert g2["n_tokens"] > 0
-    print(f"  [fork-after-generate] src gen {g['n_tokens']} tok, fork cache={f['cache_size']}")
+    print(
+        f"  [fork-after-generate] src gen {generated['n_tokens']} tok, fork cache={f['cache_size']}"
+    )
 
 
 # ------------------------------- latency -------------------------------------
@@ -236,9 +237,11 @@ def test_fork_after_audio_then_text_is_generation_ready(base, make_session):
     if not b64:
         pytest.skip("audio fixtures missing (run tests/generate_audio_fixtures.py)")
     src = make_session()
-    r = requests.post(f"{base}/sessions/{src}/inject", json={
-        "messages": [{"role": "user", "content": [{"type": "audio", "data": b64}]}]
-    }, timeout=120)
+    r = requests.post(
+        f"{base}/sessions/{src}/inject",
+        json={"messages": [{"role": "user", "content": [{"type": "audio", "data": b64}]}]},
+        timeout=120,
+    )
     assert r.status_code == 200, r.text
     size_after_audio = r.json()["cache_size"]
     # text turn-close sets a discrete last token -> fork can refresh logits
@@ -260,9 +263,11 @@ def test_fork_after_audio_only_restores_kv(base, make_session):
     if not b64:
         pytest.skip("audio fixtures missing (run tests/generate_audio_fixtures.py)")
     src = make_session()
-    r = requests.post(f"{base}/sessions/{src}/inject", json={
-        "messages": [{"role": "user", "content": [{"type": "audio", "data": b64}]}]
-    }, timeout=120)
+    r = requests.post(
+        f"{base}/sessions/{src}/inject",
+        json={"messages": [{"role": "user", "content": [{"type": "audio", "data": b64}]}]},
+        timeout=120,
+    )
     assert r.status_code == 200, r.text
     size = r.json()["cache_size"]
     f = _fork(base, src)

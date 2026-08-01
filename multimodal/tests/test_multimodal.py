@@ -54,8 +54,10 @@ def test_info_reports_multimodal_capabilities(base):
     assert j["supports_vision"] is True, j
     assert j["supports_audio"] is True, j
     assert isinstance(j["audio_sample_rate"], int) and j["audio_sample_rate"] > 0, j
-    print(f"  [info] vision={j['supports_vision']} audio={j['supports_audio']} "
-          f"rate={j['audio_sample_rate']}")
+    print(
+        f"  [info] vision={j['supports_vision']} audio={j['supports_audio']} "
+        f"rate={j['audio_sample_rate']}"
+    )
 
 
 # ----------------------- image inject: core contract ------------------------
@@ -67,10 +69,15 @@ def test_inject_image_returns_multimodal_metadata(base, make_session):
     sid = make_session()
     img_b64 = _solid_png_b64((255, 0, 0), (224, 224))
     body = {
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "What color is this?"},
-            {"type": "image", "data": img_b64},
-        ]}]
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What color is this?"},
+                    {"type": "image", "data": img_b64},
+                ],
+            }
+        ]
     }
     r = requests.post(f"{base}/sessions/{sid}/inject", json=body, timeout=120)
     assert r.status_code == 200, r.text
@@ -90,10 +97,15 @@ def test_inject_image_data_url_prefix_is_stripped(base, make_session):
     img_b64 = _solid_png_b64((0, 255, 0), (224, 224))
     data_url = f"data:image/png;base64,{img_b64}"
     body = {
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "Describe this image."},
-            {"type": "image_url", "image_url": {"url": data_url}},
-        ]}]
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ]
     }
     r = requests.post(f"{base}/sessions/{sid}/inject", json=body, timeout=120)
     assert r.status_code == 200, r.text
@@ -106,15 +118,21 @@ def test_inject_image_data_url_prefix_is_stripped(base, make_session):
 # successful inject + metadata for every size; the model-answer check lives in
 # its own test below (one canonical size, to keep the suite fast).
 
+
 @pytest.mark.parametrize("size", [(32, 32), (224, 224), (512, 512), (1024, 768), (768, 1024)])
 def test_inject_image_accepts_various_sizes(base, make_session, size):
     sid = make_session()
     img_b64 = _solid_png_b64((0, 0, 255), size)
     body = {
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "What color is this?"},
-            {"type": "image", "data": img_b64},
-        ]}]
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What color is this?"},
+                    {"type": "image", "data": img_b64},
+                ],
+            }
+        ]
     }
     r = requests.post(f"{base}/sessions/{sid}/inject", json=body, timeout=120)
     assert r.status_code == 200, r.text
@@ -130,14 +148,23 @@ def test_inject_image_accepts_various_sizes(base, make_session, size):
 # end-to-end proof that image patches actually reach the LLM in a usable form
 # (not just that inject returns 200).
 
+
 def test_inject_red_image_then_generate_answers_red(base, make_session):
     sid = make_session()
     img_b64 = _solid_png_b64((255, 0, 0), (224, 224))
     body = {
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "What color is in this image? Answer with a single word."},
-            {"type": "image", "data": img_b64},
-        ]}]
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "What color is in this image? Answer with a single word.",
+                    },
+                    {"type": "image", "data": img_b64},
+                ],
+            }
+        ]
     }
     r = requests.post(f"{base}/sessions/{sid}/inject", json=body, timeout=120)
     assert r.status_code == 200, r.text
@@ -158,18 +185,24 @@ def test_inject_red_image_then_generate_answers_red(base, make_session):
 # Success criterion #3: multi-image + interleaved text injects without error
 # and the model still responds.
 
+
 def test_inject_multi_image_interleaved(base, make_session):
     sid = make_session()
     red = _solid_png_b64((255, 0, 0), (224, 224))
     blue = _solid_png_b64((0, 0, 255), (224, 224))
     body = {
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "Here are two images."},
-            {"type": "image", "data": red},
-            {"type": "text", "text": "And here is the second one."},
-            {"type": "image", "data": blue},
-            {"type": "text", "text": "How many images did I show you?"},
-        ]}]
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Here are two images."},
+                    {"type": "image", "data": red},
+                    {"type": "text", "text": "And here is the second one."},
+                    {"type": "image", "data": blue},
+                    {"type": "text", "text": "How many images did I show you?"},
+                ],
+            }
+        ]
     }
     r = requests.post(f"{base}/sessions/{sid}/inject", json=body, timeout=180)
     assert r.status_code == 200, r.text
@@ -191,6 +224,7 @@ def test_inject_multi_image_interleaved(base, make_session):
 # Success criterion #4. Requires a second server started WITHOUT --mmproj.
 # Set MULTIMODAL_SERVER_URL_NO_MMPROJ to its URL; otherwise skip.
 
+
 def test_inject_image_without_mmproj_returns_error():
     no_proj = os.environ.get("MULTIMODAL_SERVER_URL_NO_MMPROJ")
     if not no_proj:
@@ -203,10 +237,15 @@ def test_inject_image_without_mmproj_returns_error():
     try:
         img_b64 = _solid_png_b64((255, 0, 0), (224, 224))
         body = {
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": "What is this?"},
-                {"type": "image", "data": img_b64},
-            ]}]
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is this?"},
+                        {"type": "image", "data": img_b64},
+                    ],
+                }
+            ]
         }
         r = requests.post(f"{no_proj}/sessions/{sid}/inject", json=body, timeout=60)
         assert r.status_code >= 400, r.text
@@ -224,6 +263,7 @@ def test_inject_image_without_mmproj_returns_error():
 # NOT take the multimodal path. (Full slice-1/2 regressions are covered by
 # test_session_api.py / test_streaming.py running alongside; this just locks
 # the multimodal flag's negative case.)
+
 
 def test_inject_string_content_is_not_multimodal(base, make_session):
     sid = make_session()

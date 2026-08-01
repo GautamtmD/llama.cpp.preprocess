@@ -128,8 +128,8 @@ def _ensure_server():
         return  # nothing to boot; collection already skipped non-SELF_BOOT modules
     if not os.path.exists(EXE):
         pytest.exit(
-            f"MULTIMODAL_SERVER_EXE not found at {EXE} (build it first: "
-            "scripts/build_engine.sh)", returncode=5,
+            f"MULTIMODAL_SERVER_EXE not found at {EXE} (build it first: scripts/build_engine.sh)",
+            returncode=5,
         )
     if not os.path.exists(MODEL):
         pytest.exit(f"MULTIMODAL_MODEL not found: {MODEL}", returncode=5)
@@ -150,7 +150,9 @@ def _ensure_server():
             out = proc.stdout.read().decode("utf-8", "replace") if proc.stdout else ""
         except Exception:
             out = ""
-        pytest.exit(f"self-booted server did not become healthy at {url}\n{out[-4000:]}", returncode=5)
+        pytest.exit(
+            f"self-booted server did not become healthy at {url}\n{out[-4000:]}", returncode=5
+        )
     BASE = url
 
 
@@ -184,6 +186,7 @@ def make_session(base):
 # Capability-aware test selection (driven by the model config via /info)
 # --------------------------------------------------------------------------- #
 
+
 class Capabilities:
     """The running model's input/output modalities, from GET /info."""
 
@@ -206,8 +209,7 @@ class Capabilities:
     def require(self, modality: str) -> None:
         if modality not in self.input:
             pytest.skip(
-                f"running model does not support '{modality}' input "
-                f"(supports {sorted(self.input)})"
+                f"running model does not support '{modality}' input (supports {sorted(self.input)})"
             )
 
 
@@ -244,6 +246,4 @@ def _skip_by_capability(request, capabilities):
         return
     for mod in m.args:
         if mod not in capabilities.input:
-            pytest.skip(
-                f"requires '{mod}' input (model supports {sorted(capabilities.input)})"
-            )
+            pytest.skip(f"requires '{mod}' input (model supports {sorted(capabilities.input)})")

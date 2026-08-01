@@ -42,14 +42,12 @@ for p in (str(GUI_SRC), str(ENGINE_SRC)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from multimodalagent.audio.voice_changable import VoiceChangeConfig
-
 
 def parse_sse(response):
     """Yield parsed JSON from an SSE response stream."""
     for line in response.iter_lines(decode_unicode=True):
         if line and line.startswith("data: "):
-            yield json.loads(line[len("data: "):])
+            yield json.loads(line[len("data: ") :])
 
 
 def split_on_sentence(text):
@@ -105,7 +103,8 @@ def main():
     response = requests.post(
         f"{args.llm_url}/sessions/{sid}/generate",
         json={"stream": True, "max_tokens": args.max_tokens, "temperature": 0.7},
-        stream=True, timeout=300,
+        stream=True,
+        timeout=300,
     )
     response.raise_for_status()
 
@@ -113,7 +112,7 @@ def main():
     buffer = ""
     full_text = ""
     audio_chunks = []
-    ttft = None          # LLM time-to-first-token
+    ttft = None  # LLM time-to-first-token
     first_audio_time = None  # end-to-end time-to-first-audio
     n_sentences_ttsed = 0
 
@@ -135,16 +134,19 @@ def main():
                 for chunk in tts.synthesize_stream(sent):
                     if first_audio_time is None:
                         first_audio_time = time.time() - gen_start
-                        print(f"[demo] first audio ready: {first_audio_time:.3f}s "
-                              f"(TTFT={ttft:.3f}s + TTS={first_audio_time - ttft:.3f}s)",
-                              file=sys.stderr)
+                        print(
+                            f"[demo] first audio ready: {first_audio_time:.3f}s "
+                            f"(TTFT={ttft:.3f}s + TTS={first_audio_time - ttft:.3f}s)",
+                            file=sys.stderr,
+                        )
                     audio_chunks.append(chunk.samples)
                 n_sentences_ttsed += 1
                 # add inter-sentence gap
                 gap = np.zeros(int(tts_sr * args.gap_ms / 1000), dtype=np.float32)
                 audio_chunks.append(gap)
-                print(f"[demo]   TTS'd sentence {n_sentences_ttsed}: {sent[:60]!r}",
-                      file=sys.stderr)
+                print(
+                    f"[demo]   TTS'd sentence {n_sentences_ttsed}: {sent[:60]!r}", file=sys.stderr
+                )
 
         elif event.get("type") == "done":
             done = event
@@ -175,12 +177,19 @@ def main():
     audio_dur = len(audio) / tts_sr if audio_chunks else 0
     llm_tok_s = done.get("tokens_per_s", 0)
 
-    print(f"\n[demo] === PIPELINE SUMMARY ===", file=sys.stderr)
-    print(f"  LLM TTFT:         {ttft:.3f}s" if ttft else "  LLM TTFT:         N/A", file=sys.stderr)
-    print(f"  End-to-end TTFA:   {first_audio_time:.3f}s" if first_audio_time else
-          "  End-to-end TTFA:   N/A", file=sys.stderr)
-    print(f"  LLM tokens:        {done.get('n_tokens', '?')} ({llm_tok_s:.1f} tok/s)",
-          file=sys.stderr)
+    print("\n[demo] === PIPELINE SUMMARY ===", file=sys.stderr)
+    print(
+        f"  LLM TTFT:         {ttft:.3f}s" if ttft else "  LLM TTFT:         N/A", file=sys.stderr
+    )
+    print(
+        f"  End-to-end TTFA:   {first_audio_time:.3f}s"
+        if first_audio_time
+        else "  End-to-end TTFA:   N/A",
+        file=sys.stderr,
+    )
+    print(
+        f"  LLM tokens:        {done.get('n_tokens', '?')} ({llm_tok_s:.1f} tok/s)", file=sys.stderr
+    )
     print(f"  Sentences TTS'd:   {n_sentences_ttsed}", file=sys.stderr)
     print(f"  Total audio:       {audio_dur:.2f}s", file=sys.stderr)
     print(f"  Total wall:        {total_wall:.2f}s", file=sys.stderr)

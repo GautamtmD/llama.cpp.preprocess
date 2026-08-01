@@ -7,24 +7,8 @@ scoped to what the C++ engine is responsible for.
 Every story MUST have an automated test in [`tests/`](tests/) that checks both
 behavior and the latency/perf budget. Tests are written **first** (TDD).
 
-Template:
-
-```
-### EUS-<n>: <title>
-<What the engine must do, scoped to engine responsibility.>
-
-Input / trigger:
-- ...
-
-Expected:
-- <observable engine behavior>
-
-Latency / performance budget:
-- <metric>: <target>  (e.g. KV-cache inject of 1s audio < 50ms; fork copy < Xms)
-
-Test:
-- tests/test_eus_<n>.cpp
-```
+Each story below names its real test coverage. Planned stories describe the
+measurement to add without inventing a placeholder filename.
 
 ---
 
@@ -39,10 +23,14 @@ Expected:
 - KV cache advances by the chunk's tokens; no tokens generated.
 
 Latency / performance budget:
-- (TBD — set real targets once the path exists)
+- Warm end-of-speech → first token: **< 1.0 s** on the current RTX 5060 Ti
+  baseline and faster than equivalent one-shot cold injection. This is the
+  measured regression gate; the system US-1 target remains < 300 ms.
 
 Test:
-- tests/test_eus_1.cpp (not yet implemented)
+- `tests/test_streaming_audio.py` (chunked-vs-one-shot cache behavior, validation,
+  transcription parity, and the warm-vs-cold latency gate)
+- `tests/test_multimodal_audio.py` (one-shot audio/media compatibility)
 
 ---
 
@@ -114,18 +102,17 @@ Expected:
   partial tokens in place (`llama_memory_seq_rm`).
 
 Latency / performance budget:
-- Cancel-to-halted: within **one decode step** (~one token-time) of the signal.
-- Cache left clean at **no extra cost** when the generation ran on a fork
-  (drop-fork). Rewind-in-place cost TBD — measure when implemented.
+- The token loop observes cancellation within **one decode step**. Returning a
+  clean reusable session additionally re-decodes the preserved boundary token;
+  the automated gate allows **2 observed decode steps + 250 ms transport**.
+- Cache rewind and logits refresh are included in that measured gate.
 
 Test:
-- tests/test_eus_3.* (cancel mid-generate → assert halted early, cache at the
-  pre-generate boundary, session reusable; fork-abort leaves BASE untouched).
-
-> Abort mechanism (drop-fork vs rewind-in-place) is the EC-D open question
-> ([architecture.md](../../../docs/architecture.md)), informed by
-> [ADR 0004](../../../docs/decisions/0004-fork-copy-semantics.md)'s fork cost
-> (drop-fork costly under A', ~free under slice-5 B).
+- `tests/test_cancel.py` (streaming and non-streaming cancellation, disconnect
+  cleanup, measured halt budget, exact greedy parity after rewind, and session
+  reuse)
+- `tests/test_fork.py` (fork independence keeps BASE untouched when a fork is
+  discarded)
 
 ---
 
@@ -156,8 +143,9 @@ Latency / performance budget (initial targets — verify when implemented):
   forks/turn inside US-1's 500 ms / US-2's 3 s budgets).
 
 Test:
-- tests/test_eus_4.* (N sessions batched → outputs match independent runs;
-  fork=`seq_cp` ≈0 cost vs EUS-2; batched-vs-sequential throughput).
+- Planned with slice 5: add a measured pooled-context test for N-session output
+  isolation, `seq_cp` cost, and batched-vs-sequential throughput. No current test
+  claims this unimplemented behavior.
 
 > [ADR 0004](../../../docs/decisions/0004-fork-copy-semantics.md) mandates
 > migrating fork to B (`seq_cp`) here; this unblocks the engagement pipeline's
@@ -165,7 +153,7 @@ Test:
 
 ---
 
-### EUS-5: Sampling + grammar-constrained generation (migrate onto `common/`)
+### EUS-5: Sampling + grammar-constrained generation via `common/`
 `/generate` uses `common/`'s sampler + grammar + tool-calling end-to-end
 (ADR 0005/0006/0007/0008): the full sampling param set, `response_format`/
 `grammar` stop-on-complete, and engine-side tool-call parsing — replacing the
@@ -185,15 +173,21 @@ Expected:
   `is_partial`); `/generate` streams tokens OR returns parsed tool calls.
 - greedy-at-`temperature`≤0 reproducibility preserved (EUS-2 fork/source parity).
 
-Latency / performance budget (initial targets — verify when implemented):
+Latency / performance budget (retained acceptance targets; functional path implemented):
 - Grammar-sampler overhead per decode step: **≤ ~10% of decode time** (the
   constraint must not dominate; measure on Gemma 4 12B).
 - Final tool-call parse: **< 5 ms**.
 - TTFT with grammar/tools must NOT regress US-5's target (< 300 ms; ~900 ms today).
 
 Test:
-- tests/test_eus_5.* (full sampling; `response_format`→valid JSON; grammar XOR→400;
-  lazy reason-then-call; tool-call parse; greedy parity vs EUS-2).
+- `tests/test_common_sampler.py` (JSON object/schema constraints, raw GBNF,
+  grammar XOR validation, required/none tool choices, streaming parsed tool-call
+  deltas, stop/ignore-EOS behavior, and greedy fork parity)
+- `tests/test_util.cpp` (model-config defaults and parsing)
+
+The functional suite is implemented. The numeric grammar-overhead/final-parse
+budgets above still require a dedicated benchmark before they can become
+measured regression gates; their thresholds are unchanged here.
 
 > Ties to [ADR 0005](../../../docs/decisions/0005-engine-reuses-common-model-agnostic.md),
 > [0006](../../../docs/decisions/0006-tools-prompt-based-engine-tool-agnostic.md),

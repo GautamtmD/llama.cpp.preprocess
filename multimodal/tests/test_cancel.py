@@ -28,7 +28,7 @@ CLEAN_REUSE_DECODE_STEPS = 2
 def _parse_sse(response) -> Iterator[dict]:
     for line in response.iter_lines(chunk_size=1, decode_unicode=True):
         if line and line.startswith("data: "):
-            yield json.loads(line[len("data: "):])
+            yield json.loads(line[len("data: ") :])
 
 
 def _inject(base: str, sid: str, text: str) -> dict:
@@ -57,8 +57,6 @@ def _cancel(base: str, sid: str) -> dict:
     return response.json()
 
 
-
-
 def _delete(base: str, sid: str) -> None:
     response = requests.delete(f"{base}/sessions/{sid}", timeout=30)
     assert response.status_code == 200, response.text
@@ -84,6 +82,7 @@ def test_cancel_without_active_generation_is_idempotent(base, make_session):
     sid = make_session()
     assert _cancel(base, sid) == {"session_id": sid, "cancelled": False}
 
+
 def test_cancel_unknown_session_404(base):
     response = requests.post(f"{base}/sessions/s_999999/cancel", timeout=30)
     assert response.status_code == 404
@@ -92,11 +91,14 @@ def test_cancel_unknown_session_404(base):
 
 def test_cancel_streaming_rewinds_cache_and_leaves_session_reusable(base, make_session):
     sid = make_session()
-    before = _inject(base, sid, "Write a very long numbered list about the solar system.")["cache_size"]
+    before = _inject(base, sid, "Write a very long numbered list about the solar system.")[
+        "cache_size"
+    ]
     control_sid = _fork(base, sid)["session_id"]
     second_token = threading.Event()
     token_times: list[float] = []
     outcome: dict[str, object] = {}
+
     def generate() -> None:
         response = requests.post(
             f"{base}/sessions/{sid}/generate",
@@ -149,7 +151,9 @@ def test_cancel_streaming_rewinds_cache_and_leaves_session_reusable(base, make_s
 
 def test_cancel_non_streaming_rewinds_cache_and_leaves_session_reusable(base, make_session):
     sid = make_session()
-    before = _inject(base, sid, "Explain the history of the Roman Empire in exhaustive detail.")["cache_size"]
+    before = _inject(base, sid, "Explain the history of the Roman Empire in exhaustive detail.")[
+        "cache_size"
+    ]
     control_sid = _fork(base, sid)["session_id"]
     timing_sid = _fork(base, sid)["session_id"]
     try:
@@ -189,8 +193,7 @@ def test_cancel_non_streaming_rewinds_cache_and_leaves_session_reusable(base, ma
     assert response["n_tokens"] < 256
     assert response["n_tokens"] <= 1
     print(
-        f"  [cancel-json] token-step={observed_step_ms:.1f} ms, "
-        f"cancel-to-clean={halted_ms:.1f} ms"
+        f"  [cancel-json] token-step={observed_step_ms:.1f} ms, cancel-to-clean={halted_ms:.1f} ms"
     )
 
     _assert_clean_and_reusable(base, sid, before, control_sid)
@@ -234,6 +237,9 @@ def test_stream_disconnect_rewinds_cache(base, make_session):
     assert cancel == {"session_id": sid, "cancelled": False}, (
         "generation remained active after client disconnect; the probe had to cancel it"
     )
-    print(f"  [disconnect] token-step={observed_step_ms:.1f} ms, inactive within {clean_completion_budget_ms:.1f} ms")
+    print(
+        f"  [disconnect] token-step={observed_step_ms:.1f} ms, "
+        f"inactive within {clean_completion_budget_ms:.1f} ms"
+    )
 
     _assert_clean_and_reusable(base, sid, before, control_sid)

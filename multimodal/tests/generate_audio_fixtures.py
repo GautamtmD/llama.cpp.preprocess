@@ -26,31 +26,34 @@ import numpy as np
 import soundfile as sf
 
 HERE = Path(__file__).resolve().parent
-ENGINE_ROOT_MULTI = HERE.parent                       # engine/multimodal
-PROJECT_ROOT = ENGINE_ROOT_MULTI.parents[1]           # worktree root
+ENGINE_ROOT_MULTI = HERE.parent  # engine/multimodal
+PROJECT_ROOT = ENGINE_ROOT_MULTI.parents[1]  # worktree root
 sys.path.insert(0, str(PROJECT_ROOT / "gui" / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "audio_engines" / "gpa_1_5" / "src"))
 
+from multimodalagent.audio.types import Voice  # noqa: E402
 from tts_streaming_engine.engine import GPAStreamingTTSEngine  # noqa: E402
-from multimodalagent.audio.types import Voice                  # noqa: E402
 
 FIXTURES_DIR = HERE / "fixtures"
 
 # (name, voice_id, spoken_prompt). 4 single words + 6 short sentences + 1 long.
 FIXTURES = [
-    ("word_seven",   "default",         "seven"),
-    ("word_banana",  "Buffy_flirty",    "banana"),
-    ("word_purple",  "Buffy_Sarcastic", "purple"),
-    ("word_morning", "default",         "morning"),
-    ("sent_fox",     "default",         "the quick brown fox"),
-    ("sent_hello",   "Buffy_flirty",    "hello how are you"),
+    ("word_seven", "default", "seven"),
+    ("word_banana", "Buffy_flirty", "banana"),
+    ("word_purple", "Buffy_Sarcastic", "purple"),
+    ("word_morning", "default", "morning"),
+    ("sent_fox", "default", "the quick brown fox"),
+    ("sent_hello", "Buffy_flirty", "hello how are you"),
     ("sent_weather", "Buffy_Sarcastic", "i like warm weather"),
-    ("sent_dog",     "default",         "the dog runs fast"),
-    ("sent_door",    "Buffy_flirty",    "please close the door"),
-    ("sent_game",    "Buffy_Sarcastic", "we can win this game"),
-    ("long_walk",    "default",
-     "the weather is nice today. i think we should go for a walk. "
-     "we can stop for coffee on the way. it will be a fun afternoon."),
+    ("sent_dog", "default", "the dog runs fast"),
+    ("sent_door", "Buffy_flirty", "please close the door"),
+    ("sent_game", "Buffy_Sarcastic", "we can win this game"),
+    (
+        "long_walk",
+        "default",
+        "the weather is nice today. i think we should go for a walk. "
+        "we can stop for coffee on the way. it will be a fun afternoon.",
+    ),
 ]
 
 
@@ -79,11 +82,12 @@ def main() -> None:
         sf.write(str(out), audio, sr, subtype="PCM_16")
         words = normalize_words(prompt)
         manifest[name] = {"voice": voice_id, "prompt": prompt, "expected_words": words}
-        print(f"  {name:14s} voice={voice_id:14s} words={len(words):2d}  "
-              f"({audio.size / sr:.2f}s)", flush=True)
+        print(
+            f"  {name:14s} voice={voice_id:14s} words={len(words):2d}  ({audio.size / sr:.2f}s)",
+            flush=True,
+        )
 
-    (FIXTURES_DIR / "manifest.json").write_text(
-        json.dumps(manifest, indent=2), encoding="utf-8")
+    (FIXTURES_DIR / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(f"[fixtures] wrote {len(manifest)} clips + manifest to {FIXTURES_DIR}", flush=True)
 
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Iterator
+from collections.abc import Iterator
 
 import pytest
 import requests
@@ -45,23 +45,25 @@ def _parse_sse(response) -> Iterator[dict]:
     """Yield parsed JSON objects from an SSE text/event-stream response."""
     for line in response.iter_lines(decode_unicode=True):
         if line and line.startswith("data: "):
-            yield json.loads(line[len("data: "):])
+            yield json.loads(line[len("data: ") :])
 
 
-WEATHER_TOOL = [{
-    "type": "function",
-    "function": {
-        "name": "get_weather",
-        "description": "Get the current weather in a given location.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "location": {"type": "string", "description": "City name."},
+WEATHER_TOOL = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather in a given location.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "City name."},
+                },
+                "required": ["location"],
             },
-            "required": ["location"],
         },
-    },
-}]
+    }
+]
 
 
 # --------------------------- response_format -------------------------------
@@ -114,7 +116,7 @@ def test_grammar_constraint(base, make_session):
     """A raw GBNF grammar forces exactly the constrained shape."""
     sid = make_session()
     _inject_chat(base, sid, "Write some text.")
-    gbnf = 'root ::= [0-9] [0-9] [0-9] [0-9] [0-9]'
+    gbnf = "root ::= [0-9] [0-9] [0-9] [0-9] [0-9]"
     r = _generate(base, sid, grammar=gbnf, max_tokens=16)
     assert r.status_code == 200, r.text
     text = r.json()["text"]
@@ -129,7 +131,8 @@ def test_response_format_and_grammar_conflict_400(base, make_session):
     sid = make_session()
     _inject_chat(base, sid, "hello")
     r = _generate(
-        base, sid,
+        base,
+        sid,
         response_format={"type": "json_object"},
         grammar='root ::= "x"',
         max_tokens=4,
@@ -152,11 +155,18 @@ def test_tool_calling_required(base, make_session):
     """tool_choice=required forces a tool call parsed into tool_calls."""
     sid = make_session()
     _inject_chat(
-        base, sid, "What is the weather in Paris?",
-        tools=WEATHER_TOOL, tool_choice="required",
+        base,
+        sid,
+        "What is the weather in Paris?",
+        tools=WEATHER_TOOL,
+        tool_choice="required",
     )
     r = _generate(
-        base, sid, tools=WEATHER_TOOL, tool_choice="required", max_tokens=128,
+        base,
+        sid,
+        tools=WEATHER_TOOL,
+        tool_choice="required",
+        max_tokens=128,
     )
     assert r.status_code == 200, r.text
     body = r.json()
@@ -173,14 +183,23 @@ def test_tool_calling_streaming(base, make_session):
     deltas concatenate to valid JSON."""
     sid = make_session()
     _inject_chat(
-        base, sid, "What is the weather in Tokyo?",
-        tools=WEATHER_TOOL, tool_choice="required",
+        base,
+        sid,
+        "What is the weather in Tokyo?",
+        tools=WEATHER_TOOL,
+        tool_choice="required",
     )
     r = requests.post(
         f"{base}/sessions/{sid}/generate",
-        json={"stream": True, "temperature": 0.0, "max_tokens": 128,
-              "tools": WEATHER_TOOL, "tool_choice": "required"},
-        stream=True, timeout=180,
+        json={
+            "stream": True,
+            "temperature": 0.0,
+            "max_tokens": 128,
+            "tools": WEATHER_TOOL,
+            "tool_choice": "required",
+        },
+        stream=True,
+        timeout=180,
     )
     assert r.status_code == 200, r.text
     assert "text/event-stream" in r.headers.get("content-type", "")
@@ -233,7 +252,9 @@ def test_greedy_determinism_and_fork_parity(base, make_session):
     g_fk = _generate(base, fsid, max_tokens=20)
     assert g_src.status_code == 200 and g_fk.status_code == 200
     assert g_src.json()["tokens"] == g_fk.json()["tokens"], (
-        g_src.json()["text"], g_fk.json()["text"])
+        g_src.json()["text"],
+        g_fk.json()["text"],
+    )
     assert g_src.json()["text"] == g_fk.json()["text"]
 
 

@@ -260,7 +260,9 @@ def test_offloaded_session_generate_returns_409(base, make_session):
     # streaming
     r2 = requests.post(
         f"{base}/sessions/{sid}/generate",
-        json={"stream": True, "max_tokens": 5}, stream=True, timeout=60,
+        json={"stream": True, "max_tokens": 5},
+        stream=True,
+        timeout=60,
     )
     assert r2.status_code == 409
 

@@ -9,9 +9,6 @@ asserted — budgets get pinned in slice 2 once we know steady-state numbers.
 
 from __future__ import annotations
 
-import json
-import time
-
 import pytest
 import requests
 
@@ -117,8 +114,10 @@ def test_generate_returns_text(base, make_session):
     j = r.json()
     assert j["n_tokens"] > 0
     assert isinstance(j["text"], str) and len(j["text"]) > 0
-    print(f"  [generate] {j['n_tokens']} tokens in {j['gen_ms']} ms "
-          f"({j['tokens_per_s']:.1f} tok/s): {j['text']!r}")
+    print(
+        f"  [generate] {j['n_tokens']} tokens in {j['gen_ms']} ms "
+        f"({j['tokens_per_s']:.1f} tok/s): {j['text']!r}"
+    )
 
 
 def test_generate_respects_max_tokens(base, make_session):
@@ -165,12 +164,14 @@ def test_generate_temp0_is_deterministic(base, make_session):
     prompt = [{"role": "user", "content": "List three colors, comma-separated."}]
     a = make_session()
     requests.post(f"{base}/sessions/{a}/inject", json={"messages": prompt}, timeout=60)
-    ga = requests.post(f"{base}/sessions/{a}/generate",
-                       json={"max_tokens": 40, "temperature": 0.0}, timeout=120).json()
+    ga = requests.post(
+        f"{base}/sessions/{a}/generate", json={"max_tokens": 40, "temperature": 0.0}, timeout=120
+    ).json()
     b = make_session()
     requests.post(f"{base}/sessions/{b}/inject", json={"messages": prompt}, timeout=60)
-    gb = requests.post(f"{base}/sessions/{b}/generate",
-                       json={"max_tokens": 40, "temperature": 0.0}, timeout=120).json()
+    gb = requests.post(
+        f"{base}/sessions/{b}/generate", json={"max_tokens": 40, "temperature": 0.0}, timeout=120
+    ).json()
     assert ga["text"] == gb["text"], (ga["text"], gb["text"])
     assert ga["n_tokens"] > 0
 

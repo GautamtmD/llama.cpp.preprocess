@@ -1,7 +1,7 @@
 """Tests for real-time streaming audio injection.
 
-Validates that splitting an audio file into chunks and injecting them 
-incrementally yields the exact same KV cache size and generated output 
+Validates that splitting an audio file into chunks and injecting them
+incrementally yields the exact same KV cache size and generated output
 as injecting the entire file in one shot.
 """
 
@@ -11,6 +11,7 @@ import base64
 import os
 import struct
 import wave
+
 import pytest
 import requests
 
@@ -62,11 +63,11 @@ def test_streaming_vs_oneshot_equivalence(base, make_session, chunk_size):
 
     # 1. ONE-SHOT SESSION
     sid_one = make_session()
-    
+
     # Inject using standard messages format (one-shot)
     with open(os.path.join(FIXTURES_DIR, f"{name}.wav"), "rb") as f:
         wav_b64 = base64.b64encode(f.read()).decode("ascii")
-        
+
     body_one = {
         "messages": [
             {"role": "system", "content": TRANSCRIPTION_SYSTEM_PROMPT},
@@ -94,13 +95,10 @@ def test_streaming_vs_oneshot_equivalence(base, make_session, chunk_size):
     # We construct the prefix manually using standard format or text.
     # Prefix includes: system prompt + user marker + <|audio>
     prefix_text = (
-        f"<|turn>system\n<|think|>\n{TRANSCRIPTION_SYSTEM_PROMPT}<turn|>\n"
-        f"<|turn>user\n<|audio>"
+        f"<|turn>system\n<|think|>\n{TRANSCRIPTION_SYSTEM_PROMPT}<turn|>\n<|turn>user\n<|audio>"
     )
     r_pref = requests.post(
-        f"{base}/sessions/{sid_stream}/inject",
-        json={"text": prefix_text},
-        timeout=60
+        f"{base}/sessions/{sid_stream}/inject", json={"text": prefix_text}, timeout=60
     )
     assert r_pref.status_code == 200, r_pref.text
 
@@ -110,11 +108,9 @@ def test_streaming_vs_oneshot_equivalence(base, make_session, chunk_size):
         # pack as float32
         chunk_bytes = struct.pack(f"<{len(chunk)}f", *chunk)
         chunk_b64 = base64.b64encode(chunk_bytes).decode("ascii")
-        
+
         r_chunk = requests.post(
-            f"{base}/sessions/{sid_stream}/inject",
-            json={"audio": chunk_b64},
-            timeout=60
+            f"{base}/sessions/{sid_stream}/inject", json={"audio": chunk_b64}, timeout=60
         )
         assert r_chunk.status_code == 200, r_chunk.text
         print(f"  [stream] injected chunk, cache size: {r_chunk.json()['cache_size']}")
@@ -122,9 +118,7 @@ def test_streaming_vs_oneshot_equivalence(base, make_session, chunk_size):
     # Step 2c: Inject suffix text (audio end marker + user turn end + assistant start)
     suffix_text = "<audio|><turn|>\n<|turn>model\n"
     r_suff = requests.post(
-        f"{base}/sessions/{sid_stream}/inject",
-        json={"text": suffix_text},
-        timeout=60
+        f"{base}/sessions/{sid_stream}/inject", json={"text": suffix_text}, timeout=60
     )
     assert r_suff.status_code == 200, r_suff.text
     cache_size_stream = r_suff.json()["cache_size"]
@@ -140,6 +134,7 @@ def test_streaming_vs_oneshot_equivalence(base, make_session, chunk_size):
 
     # 3. VERIFY EQUIVALENCE
     import re
+
     def normalize_words(t: str) -> list[str]:
         t = t.lower()
         t = re.sub(r"[^a-z0-9\s]", " ", t)
@@ -157,13 +152,18 @@ def test_streaming_vs_oneshot_equivalence(base, make_session, chunk_size):
     expected = ["please", "close", "the", "door"]
     words_one = normalize_words(text_one)
     words_stream = normalize_words(text_stream)
-    assert is_subsequence(expected, words_one), f"One-shot transcription missing expected words: {text_one}"
-    assert is_subsequence(expected, words_stream), f"Stream transcription missing expected words: {text_stream}"
+    assert is_subsequence(expected, words_one), (
+        f"One-shot transcription missing expected words: {text_one}"
+    )
+    assert is_subsequence(expected, words_stream), (
+        f"Stream transcription missing expected words: {text_stream}"
+    )
 
 
 def test_streaming_latency_benchmark(base, make_session):
-    import time
     import json
+    import time
+
     name = "sent_door"
     samples, sr = read_wav_as_float32(name)
 
@@ -188,7 +188,8 @@ def test_streaming_latency_benchmark(base, make_session):
     r_gen_cold = requests.post(
         f"{base}/sessions/{sid_cold}/generate",
         json={"stream": True, "max_tokens": 10, "temperature": 0.0},
-        stream=True, timeout=120
+        stream=True,
+        timeout=120,
     )
     assert r_gen_cold.status_code == 200
 
@@ -208,10 +209,11 @@ def test_streaming_latency_benchmark(base, make_session):
 
     # Step 2a: Inject prefix
     prefix_text = (
-        f"<|turn>system\n<|think|>\n{TRANSCRIPTION_SYSTEM_PROMPT}<turn|>\n"
-        f"<|turn>user\n<|audio>"
+        f"<|turn>system\n<|think|>\n{TRANSCRIPTION_SYSTEM_PROMPT}<turn|>\n<|turn>user\n<|audio>"
     )
-    r_pref = requests.post(f"{base}/sessions/{sid_warm}/inject", json={"text": prefix_text}, timeout=60)
+    r_pref = requests.post(
+        f"{base}/sessions/{sid_warm}/inject", json={"text": prefix_text}, timeout=60
+    )
     assert r_pref.status_code == 200
 
     # Step 2b: Stream chunks
@@ -220,7 +222,9 @@ def test_streaming_latency_benchmark(base, make_session):
         chunk = samples[i : i + chunk_size]
         chunk_bytes = struct.pack(f"<{len(chunk)}f", *chunk)
         chunk_b64 = base64.b64encode(chunk_bytes).decode("ascii")
-        r_chunk = requests.post(f"{base}/sessions/{sid_warm}/inject", json={"audio": chunk_b64}, timeout=60)
+        r_chunk = requests.post(
+            f"{base}/sessions/{sid_warm}/inject", json={"audio": chunk_b64}, timeout=60
+        )
         assert r_chunk.status_code == 200
 
     # User finishes speaking -> EOS!
@@ -228,14 +232,17 @@ def test_streaming_latency_benchmark(base, make_session):
 
     # Step 2c: Inject suffix
     suffix_text = "<audio|><turn|>\n<|turn>model\n"
-    r_suff = requests.post(f"{base}/sessions/{sid_warm}/inject", json={"text": suffix_text}, timeout=60)
+    r_suff = requests.post(
+        f"{base}/sessions/{sid_warm}/inject", json={"text": suffix_text}, timeout=60
+    )
     assert r_suff.status_code == 200
 
     # Start generation and measure TTFT from t_warm_eos
     r_gen_warm = requests.post(
         f"{base}/sessions/{sid_warm}/generate",
         json={"stream": True, "max_tokens": 10, "temperature": 0.0},
-        stream=True, timeout=120
+        stream=True,
+        timeout=120,
     )
     assert r_gen_warm.status_code == 200
 
@@ -253,8 +260,12 @@ def test_streaming_latency_benchmark(base, make_session):
     # Note: 1.0s is a regression guard based on the hardware constraints of the local
     # RTX 5060 Ti GPU (which decodes at ~120 ms/token for the 12B model prefill),
     # not the target US-1 budget of < 300 ms.
-    assert warm_latency < 1.000, f"Warm latency {warm_latency * 1000:.1f} ms exceeds the 1000 ms budget!"
-    assert warm_latency < cold_latency, "Streaming inject (warm) should be faster than one-shot (cold)!"
+    assert warm_latency < 1.000, (
+        f"Warm latency {warm_latency * 1000:.1f} ms exceeds the 1000 ms budget!"
+    )
+    assert warm_latency < cold_latency, (
+        "Streaming inject (warm) should be faster than one-shot (cold)!"
+    )
 
 
 def test_streaming_payload_validation(base, make_session):
@@ -267,7 +278,9 @@ def test_streaming_payload_validation(base, make_session):
 
     # 2. Test payload size not multiple of sizeof(float)
     bad_bytes_b64 = base64.b64encode(b"123").decode("ascii")
-    r_size = requests.post(f"{base}/sessions/{sid}/inject", json={"audio": bad_bytes_b64}, timeout=10)
+    r_size = requests.post(
+        f"{base}/sessions/{sid}/inject", json={"audio": bad_bytes_b64}, timeout=10
+    )
     assert r_size.status_code == 400
     assert "multiple of 4 bytes" in r_size.json()["error"]
 
@@ -275,7 +288,9 @@ def test_streaming_payload_validation(base, make_session):
     bad_samples = [0.0] * 10
     bad_samples_bytes = struct.pack("<10f", *bad_samples)
     bad_samples_b64 = base64.b64encode(bad_samples_bytes).decode("ascii")
-    r_samples = requests.post(f"{base}/sessions/{sid}/inject", json={"audio": bad_samples_b64}, timeout=10)
+    r_samples = requests.post(
+        f"{base}/sessions/{sid}/inject", json={"audio": bad_samples_b64}, timeout=10
+    )
     assert r_samples.status_code == 400
     assert "multiple of 640" in r_samples.json()["error"]
 
@@ -290,8 +305,8 @@ def test_tts_to_inject_integration(base, make_session):
     if str(gpa_src) not in sys.path:
         sys.path.insert(0, str(gpa_src))
 
-    from tts_streaming_engine.engine import GPAStreamingTTSEngine, resolve_assets_dir
     import numpy as np
+    from tts_streaming_engine.engine import GPAStreamingTTSEngine, resolve_assets_dir
 
     # Initialize the TTS engine
     assets = resolve_assets_dir(project_root)
@@ -313,8 +328,7 @@ def test_tts_to_inject_integration(base, make_session):
     # Stream chunks to the server
     sid = make_session()
     prefix_text = (
-        f"<|turn>system\n<|think|>\n{TRANSCRIPTION_SYSTEM_PROMPT}<turn|>\n"
-        f"<|turn>user\n<|audio>"
+        f"<|turn>system\n<|think|>\n{TRANSCRIPTION_SYSTEM_PROMPT}<turn|>\n<|turn>user\n<|audio>"
     )
     r_pref = requests.post(f"{base}/sessions/{sid}/inject", json={"text": prefix_text}, timeout=60)
     assert r_pref.status_code == 200
@@ -324,7 +338,9 @@ def test_tts_to_inject_integration(base, make_session):
         chunk = samples[i : i + chunk_size]
         chunk_bytes = struct.pack(f"<{len(chunk)}f", *chunk)
         chunk_b64 = base64.b64encode(chunk_bytes).decode("ascii")
-        r_chunk = requests.post(f"{base}/sessions/{sid}/inject", json={"audio": chunk_b64}, timeout=60)
+        r_chunk = requests.post(
+            f"{base}/sessions/{sid}/inject", json={"audio": chunk_b64}, timeout=60
+        )
         assert r_chunk.status_code == 200
 
     # Suffix
@@ -344,6 +360,7 @@ def test_tts_to_inject_integration(base, make_session):
 
     # Validate transcription content contains key words
     import re
+
     def normalize_words(t: str) -> list[str]:
         t = t.lower()
         t = re.sub(r"[^a-z0-9\s]", " ", t)
@@ -355,7 +372,6 @@ def test_tts_to_inject_integration(base, make_session):
 
     expected = ["please", "close", "the", "door"]
     words = normalize_words(transcript)
-    assert is_subsequence(expected, words), f"ASR failed on TTS-generated audio. Output: {transcript}"
-
-
-
+    assert is_subsequence(expected, words), (
+        f"ASR failed on TTS-generated audio. Output: {transcript}"
+    )

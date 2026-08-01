@@ -25,8 +25,12 @@ import requests
 
 pytestmark = [pytest.mark.usefixtures("base", "make_session"), pytest.mark.requires("text")]
 
-LIST_PROMPT = [{"role": "user", "content":
-    "Write a numbered list of twelve facts about the ocean, one per line."}]
+LIST_PROMPT = [
+    {
+        "role": "user",
+        "content": "Write a numbered list of twelve facts about the ocean, one per line.",
+    }
+]
 BIG_TEXT = "The quick brown fox jumps over the lazy dog. " * 30  # a real-sized cache
 
 # --- Performance thresholds (SC #8). Tuned from the first measurement run on
@@ -34,9 +38,9 @@ BIG_TEXT = "The quick brown fox jumps over the lazy dog. " * 30  # a real-sized 
 # These are deliberately generous regression gates (not tight targets): the
 # serialize is lock-free and brief, so we expect near-zero impact. The hard
 # guarantee is the byte-identical correctness assertion below.
-THROUGHPUT_FRACTION = 0.5     # concurrent sustained tok/s must be >= this * baseline
-MAX_GAP_MULTIPLE = 4.0       # no inter-token gap > this * baseline max inter-token gap
-MAX_GAP_FLOOR_MS = 2000.0    # absolute slack for the (brief) GPU->host serialize window
+THROUGHPUT_FRACTION = 0.5  # concurrent sustained tok/s must be >= this * baseline
+MAX_GAP_MULTIPLE = 4.0  # no inter-token gap > this * baseline max inter-token gap
+MAX_GAP_FLOOR_MS = 2000.0  # absolute slack for the (brief) GPU->host serialize window
 
 
 # ------------------------------- helpers ------------------------------------
@@ -81,7 +85,7 @@ def _status(base, sid):
 def _parse_sse(response) -> Iterator[dict]:
     for line in response.iter_lines(decode_unicode=True):
         if line and line.startswith("data: "):
-            yield json.loads(line[len("data: "):])
+            yield json.loads(line[len("data: ") :])
 
 
 def _stream_generate(base, sid, max_tokens=80):
@@ -92,7 +96,8 @@ def _stream_generate(base, sid, max_tokens=80):
     r = requests.post(
         f"{base}/sessions/{sid}/generate",
         json={"stream": True, "max_tokens": max_tokens, "temperature": 0.0},
-        stream=True, timeout=180,
+        stream=True,
+        timeout=180,
     )
     assert r.status_code == 200, r.text
     for ev in _parse_sse(r):
@@ -124,8 +129,10 @@ def test_offload_load_does_not_degrade_concurrent_generation(base, make_session)
     baseline_dur = (times_baseline[-1] - times_baseline[0]) if n_baseline > 1 else 1.0
     toks_per_s_baseline = (n_baseline - 1) / baseline_dur if n_baseline > 1 else 0.0
     maxgap_baseline = max(gaps_baseline) if gaps_baseline else 0.0
-    print(f"  [sc8-baseline] {n_baseline} tok, {toks_per_s_baseline:.1f} tok/s, "
-          f"max inter-token gap {maxgap_baseline:.1f} ms")
+    print(
+        f"  [sc8-baseline] {n_baseline} tok, {toks_per_s_baseline:.1f} tok/s, "
+        f"max inter-token gap {maxgap_baseline:.1f} ms"
+    )
 
     # two sizable-cache sessions to thrash offload/load during A's generation
     b = make_session()
@@ -167,9 +174,11 @@ def test_offload_load_does_not_degrade_concurrent_generation(base, make_session)
     subject_dur = (times_subject[-1] - times_subject[0]) if n_subject > 1 else 1.0
     toks_per_s_subject = (n_subject - 1) / subject_dur if n_subject > 1 else 0.0
     maxgap_subject = max(gaps_subject) if gaps_subject else 0.0
-    print(f"  [sc8-concurrent] {n_subject} tok, {toks_per_s_subject:.1f} tok/s, "
-          f"max inter-token gap {maxgap_subject:.1f} ms "
-          f"(baseline {toks_per_s_baseline:.1f} tok/s / {maxgap_baseline:.1f} ms)")
+    print(
+        f"  [sc8-concurrent] {n_subject} tok, {toks_per_s_subject:.1f} tok/s, "
+        f"max inter-token gap {maxgap_subject:.1f} ms "
+        f"(baseline {toks_per_s_baseline:.1f} tok/s / {maxgap_baseline:.1f} ms)"
+    )
 
     # --- Correctness (hard guarantee): identical greedy output ---
     assert text_subject == text_baseline, (
@@ -242,4 +251,4 @@ def test_offload_forked_session_during_active_generation__shared_kv_sentinel(bas
         f"  baseline : {baseline!r}\n  A        : {text_a!r}"
     )
     assert _status(base, ap).json()["location"] == "ram"
-    print(f"  [sc9-sentinel] offloaded fork mid-generation; source output unchanged")
+    print("  [sc9-sentinel] offloaded fork mid-generation; source output unchanged")

@@ -94,16 +94,14 @@ def _boot(extra_args: list[str], timeout: int = 180) -> str:
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = CUDA_GPU
     cmd = [EXE, "--model", MODEL, "--port", str(port), "--n-gpu-layers", "99", *extra_args]
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env
-    )
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
     _PROCS.append(proc)
 
     deadline = time.time() + timeout
     while time.time() < deadline:
         rc = proc.poll()
         if rc is not None:
-            out = (proc.stdout.read().decode(errors="replace") if proc.stdout else "")
+            out = proc.stdout.read().decode(errors="replace") if proc.stdout else ""
             pytest.fail(f"server exited early rc={rc}\n{out}")
         try:
             if requests.get(f"{url}/health", timeout=2).status_code == 200:
@@ -125,8 +123,12 @@ def _run_expecting_failure(extra_args: list[str], timeout: int = 60) -> subproce
     env["CUDA_VISIBLE_DEVICES"] = CUDA_GPU
     cmd = [EXE, "--model", MODEL, "--port", str(_free_port()), *extra_args]
     return subprocess.run(
-        cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, timeout=timeout,
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout,
     )
 
 
@@ -158,8 +160,7 @@ def _sweep_servers():
 def jinja_url():
     """Server with a Jinja override + kwargs + jinja on (covers override, jinja,
     and kwargs together)."""
-    return _boot(["--chat-template", TPL, "--jinja",
-                  "--chat-template-kwargs", '{"greeting":"HI"}'])
+    return _boot(["--chat-template", TPL, "--jinja", "--chat-template-kwargs", '{"greeting":"HI"}'])
 
 
 @pytest.fixture(scope="module")
@@ -191,10 +192,14 @@ def _inject(base: str, sid: str, body: dict) -> dict:
 def test_override_renders_byte_identical_with_gen_prompt(jinja_url):
     """--chat-template + --jinja + kwargs renders the exact recorded string."""
     sid = _make_session(jinja_url)
-    out = _inject(jinja_url, sid, {
-        "messages": [{"role": "user", "content": "hi"}],
-        "return_prompt": True,
-    })
+    out = _inject(
+        jinja_url,
+        sid,
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "return_prompt": True,
+        },
+    )
     assert out["status"] == 200, out
     assert out["chat_template_applied"] is True
     # greeting kwarg present -> prefix; add_generation_prompt default true -> GEN suffix
@@ -204,11 +209,15 @@ def test_override_renders_byte_identical_with_gen_prompt(jinja_url):
 def test_override_renders_byte_identical_without_gen_prompt(jinja_url):
     """add_generation_prompt=false drops the GEN suffix (template honors it)."""
     sid = _make_session(jinja_url)
-    out = _inject(jinja_url, sid, {
-        "messages": [{"role": "user", "content": "hi"}],
-        "add_generation_prompt": False,
-        "return_prompt": True,
-    })
+    out = _inject(
+        jinja_url,
+        sid,
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "add_generation_prompt": False,
+            "return_prompt": True,
+        },
+    )
     assert out["status"] == 200, out
     assert out["prompt"] == "HI|user:hi;"
 
@@ -216,10 +225,14 @@ def test_override_renders_byte_identical_without_gen_prompt(jinja_url):
 def test_kwargs_value_appears_in_prompt(jinja_url):
     """The --chat-template-kwargs value reaches the Jinja context."""
     sid = _make_session(jinja_url)
-    out = _inject(jinja_url, sid, {
-        "messages": [{"role": "user", "content": "x"}],
-        "return_prompt": True,
-    })
+    out = _inject(
+        jinja_url,
+        sid,
+        {
+            "messages": [{"role": "user", "content": "x"}],
+            "return_prompt": True,
+        },
+    )
     assert out["prompt"].startswith("HI|"), out["prompt"]
 
 
@@ -227,10 +240,14 @@ def test_rendered_prompt_is_actually_tokenized(jinja_url):
     """The rendered prompt is real text that was injected into the KV cache
     (tokens_injected > 0, cache advances) — i.e. rendering feeds prefill."""
     sid = _make_session(jinja_url)
-    out = _inject(jinja_url, sid, {
-        "messages": [{"role": "user", "content": "hello world"}],
-        "return_prompt": True,
-    })
+    out = _inject(
+        jinja_url,
+        sid,
+        {
+            "messages": [{"role": "user", "content": "hello world"}],
+            "return_prompt": True,
+        },
+    )
     assert out["status"] == 200, out
     assert out["tokens_injected"] > 0
     assert out["cache_size"] == out["tokens_injected"]
@@ -243,10 +260,14 @@ def test_rendered_prompt_is_actually_tokenized(jinja_url):
 def test_system_prompt_prepended(sysprompt_url):
     """--system-prompt is prepended as a system message before the user's."""
     sid = _make_session(sysprompt_url)
-    out = _inject(sysprompt_url, sid, {
-        "messages": [{"role": "user", "content": "hi"}],
-        "return_prompt": True,
-    })
+    out = _inject(
+        sysprompt_url,
+        sid,
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "return_prompt": True,
+        },
+    )
     assert out["status"] == 200, out
     # no kwargs -> no greeting prefix; system message first; then user; then GEN
     assert out["prompt"] == "system:SYS;user:hi;GEN"
@@ -257,8 +278,11 @@ def test_system_prompt_prepended(sysprompt_url):
 # --------------------------------------------------------------------------- #
 def test_disabled_rejects_messages(disabled_url):
     sid = _make_session(disabled_url)
-    r = requests.post(f"{disabled_url}/sessions/{sid}/inject",
-                      json={"messages": [{"role": "user", "content": "hi"}]}, timeout=30)
+    r = requests.post(
+        f"{disabled_url}/sessions/{sid}/inject",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+        timeout=30,
+    )
     assert r.status_code == 400, r.text
     assert "disabled" in r.json()["error"].lower()
 
