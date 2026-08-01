@@ -25,6 +25,7 @@ add_subdirectory(
 )
 
 add_executable(multimodal-server
+    src/inference_scheduler.cpp
     src/main.cpp
 )
 

@@ -182,6 +182,41 @@ def make_session(base):
             pass
 
 
+@pytest.fixture(autouse=True)
+def _cleanup_sessions_created_by_test(base):
+    """Delete fork/load-created sessions that helpers did not register.
+
+    The pooled server has deliberate finite capacity, so a leaked fork from one
+    test must not exhaust a later test. Sessions present before the test are left
+    alone (important when a manually managed server is under diagnosis).
+    """
+    if SELF_BOOT:
+        yield
+        return
+
+    def session_ids() -> set[str]:
+        try:
+            response = requests.get(f"{base}/sessions/usage", timeout=10)
+            if response.status_code != 200:
+                return set()
+            usage = response.json()
+            return {
+                item["session_id"]
+                for bucket in ("vram", "ram")
+                for item in usage.get(bucket, {}).get("sessions", [])
+            }
+        except requests.exceptions.RequestException:
+            return set()
+
+    before = session_ids()
+    yield
+    for sid in session_ids() - before:
+        try:
+            requests.delete(f"{base}/sessions/{sid}", timeout=10)
+        except requests.exceptions.RequestException:
+            pass
+
+
 # --------------------------------------------------------------------------- #
 # Capability-aware test selection (driven by the model config via /info)
 # --------------------------------------------------------------------------- #
