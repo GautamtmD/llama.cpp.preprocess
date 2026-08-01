@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "execution_policy.h"
 #include "nlohmann/json.hpp"
 
 #include <cstdint>

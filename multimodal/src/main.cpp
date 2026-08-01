@@ -153,6 +153,7 @@ struct ServerConfig {
     int  n_gpu_layers  = 99;
     int  ctx_size      = 4096;
     int  n_batch       = 2048;
+    bool allow_cpu     = false;  // GPU model offload is required unless explicitly opted out
 
     // Chat-template handling (mirrors llama-server / common/arg.cpp). We reuse
     // common/'s templating; these just feed it the same inputs llama-server does.
@@ -819,6 +820,7 @@ int main(int argc, char ** argv) {
         else if (a == "--n-gpu-layers" || a == "-ngl") cfg.n_gpu_layers = std::atoi(next().c_str());
         else if (a == "--ctx-size" || a == "-c") cfg.ctx_size = std::atoi(next().c_str());
         else if (a == "--n-batch")      cfg.n_batch = std::atoi(next().c_str());
+        else if (a == "--allow-cpu")     cfg.allow_cpu = true;
         else if (a == "--chat-template")      cfg.chat_template = next();
         else if (a == "--chat-template-file") cfg.chat_template = read_file_contents(next());
         else if (a == "--jinja")              cfg.use_jinja = true;
@@ -854,6 +856,7 @@ int main(int argc, char ** argv) {
                 "  -ngl,--n-gpu-layers N     GPU layers (default 99)\n"
                 "  -c, --ctx-size N          context per session (default 4096)\n"
                 "      --n-batch N           batch size (default 2048)\n"
+                "      --allow-cpu           explicitly permit CPU-only execution (default: GPU required)\n"
                 "      --chat-template TPL   Jinja chat template override (else model default)\n"
                 "      --chat-template-file F  read Jinja chat template override from a file\n"
                 "      --jinja / --no-jinja  use the Jinja template engine (default: enabled)\n"
@@ -889,12 +892,43 @@ int main(int argc, char ** argv) {
     ggml_backend_load_all();
     llama_backend_init();
 
+    int gpu_devices = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        const auto type = ggml_backend_dev_type(ggml_backend_dev_get(i));
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            ++gpu_devices;
+        }
+    }
+    if (!cfg.allow_cpu && (gpu_devices == 0 || cfg.n_gpu_layers == 0)) {
+        std::cerr << "error: " << gpu_execution_error("multimodal-server") << "\n";
+        llama_backend_free();
+        return 3;
+    }
+
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = cfg.n_gpu_layers;
     std::cerr << "loading model: " << cfg.model_path << " ...\n";
     AppState app;
     app.model = llama_model_load_from_file(cfg.model_path.c_str(), mp);
-    if (!app.model) { std::cerr << "error: failed to load model\n"; return 1; }
+    if (!app.model) {
+        std::cerr << "error: failed to load model\n";
+        if (!cfg.allow_cpu) std::cerr << "error: " << gpu_execution_error("multimodal-server") << "\n";
+        llama_backend_free();
+        return 1;
+    }
+    const int gpu_model_layers = (gpu_devices > 0 && cfg.n_gpu_layers != 0)
+        ? (cfg.n_gpu_layers < 0
+            ? llama_model_n_layer(app.model) + 1
+            : std::min(cfg.n_gpu_layers, llama_model_n_layer(app.model) + 1))
+        : 0;
+    if (!gpu_execution_allowed(cfg.allow_cpu, gpu_model_layers)) {
+        std::cerr << "error: " << gpu_execution_error("multimodal-server") << "\n";
+        llama_model_free(app.model);
+        llama_backend_free();
+        return 3;
+    }
+    std::cerr << "execution: " << gpu_model_layers << " model layer(s) assigned to GPU"
+              << (cfg.allow_cpu ? " (--allow-cpu enabled)" : "") << ".\n";
     app.model_cfg = load_config_for_model(cfg.model_path, cfg.config_path, app.model);
     app.vocab = llama_model_get_vocab(app.model);
     app.chat_templates = common_chat_templates_init(app.model, /* override */ cfg.chat_template);

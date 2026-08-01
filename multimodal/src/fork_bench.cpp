@@ -36,6 +36,7 @@
 #include <string>
 #include <vector>
 
+#include "execution_policy.h"
 #include "llama.h"
 
 static double now_s() {
@@ -79,6 +80,7 @@ int main(int argc, char ** argv) {
     int n_batch = 2048;
     std::vector<int> token_counts = {128, 1024, 2048};
     int trials = 3;
+    bool allow_cpu = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -91,8 +93,10 @@ int main(int argc, char ** argv) {
             token_counts.clear();
             while (i + 1 < argc && argv[i + 1][0] != '-') token_counts.push_back(atoi(argv[++i]));
         } else if (a == "--trials") trials = atoi(next().c_str());
+        else if (a == "--allow-cpu") allow_cpu = true;
         else if (a == "-h" || a == "--help") {
-            std::printf("multimodal-fork-bench --model PATH [-ngl N] [-c N] [--tokens N ...] [--trials N]\n");
+            std::printf("multimodal-fork-bench --model PATH [-ngl N] [-c N] [--tokens N ...] [--trials N] [--allow-cpu]\n"
+                        "  --allow-cpu  explicitly permit CPU-only execution (default: GPU required)\n");
             return 0;
         }
     }
@@ -104,11 +108,40 @@ int main(int argc, char ** argv) {
     ggml_backend_load_all();
     llama_backend_init();
 
+    int gpu_devices = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        const auto type = ggml_backend_dev_type(ggml_backend_dev_get(i));
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            ++gpu_devices;
+        }
+    }
+    if (!allow_cpu && (gpu_devices == 0 || ngl == 0)) {
+        std::fprintf(stderr, "error: %s\n", gpu_execution_error("benchmark").c_str());
+        llama_backend_free();
+        return 3;
+    }
+
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = ngl;
     std::fprintf(stderr, "loading model: %s ...\n", model_path.c_str());
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);
-    if (!model) { std::fprintf(stderr, "error: model load failed\n"); return 1; }
+    if (!model) {
+        std::fprintf(stderr, "error: model load failed\n");
+        if (!allow_cpu) std::fprintf(stderr, "error: %s\n", gpu_execution_error("benchmark").c_str());
+        llama_backend_free();
+        return 1;
+    }
+    const int gpu_model_layers = (gpu_devices > 0 && ngl != 0)
+        ? (ngl < 0 ? llama_model_n_layer(model) + 1 : std::min(ngl, llama_model_n_layer(model) + 1))
+        : 0;
+    if (!gpu_execution_allowed(allow_cpu, gpu_model_layers)) {
+        std::fprintf(stderr, "error: %s\n", gpu_execution_error("benchmark").c_str());
+        llama_model_free(model);
+        llama_backend_free();
+        return 3;
+    }
+    std::fprintf(stderr, "execution: %d model layer(s) assigned to GPU%s.\n",
+                 gpu_model_layers, allow_cpu ? " (--allow-cpu enabled)" : "");
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     auto make_ctx = [&]() {

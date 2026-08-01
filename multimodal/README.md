@@ -57,10 +57,15 @@ bash engine/multimodal/scripts/fetch_cuda_dlls.sh
 # from C:/Programming/llamacpp into engine/multimodal/build/bin/Release/
 ```
 
-Then run with `--n-gpu-layers 99`. Validated empirically: 38× speedup, 11/11
-tests still pass, output is coherent. ABI compat is verified by the suite —
-if the upstream ggml commit drifts, this will start crashing and we'll need
-to rebuild ggml-cuda from source (install VS 2022 BuildTools).
+Then run with `--n-gpu-layers 99`. GPU execution is fail-closed: the server and
+performance benchmarks exit nonzero if no model layer is assigned to a GPU.
+Pass `--allow-cpu` only for an intentional CPU-only run. The error names that
+opt-in so a CPU fallback cannot be mistaken for a GPU benchmark.
+
+Validated empirically: 38× speedup, 11/11 tests still pass, output is coherent.
+The startup guard also catches an ABI-incompatible `ggml-cuda.dll` that fails to
+register a GPU device. Use a backend built for the pinned ggml ABI; if the fork
+drifts, rebuild ggml-cuda from source with a CUDA-supported host compiler.
 
 ## Run
 
@@ -69,6 +74,8 @@ engine/multimodal/build/bin/Release/multimodal-server.exe \
   --model "/c/ML Models/Gemma4 12b/gemma-4-12b-it-qat-q4_0.gguf" \
   --port 8080 --n-gpu-layers 99
 ```
+
+For deliberate CPU diagnosis only, add `--allow-cpu --n-gpu-layers 0`.
 
 Endpoints are documented in the parent repo's `docs/ipc-protocol.md`. Tests:
 

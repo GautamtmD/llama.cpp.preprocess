@@ -61,6 +61,7 @@ add_executable(multimodal-fork-bench
     src/fork_bench.cpp
 )
 target_include_directories(multimodal-fork-bench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
 )
 target_link_libraries(multimodal-fork-bench PRIVATE llama)

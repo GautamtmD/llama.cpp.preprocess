@@ -120,6 +120,22 @@ static void test_sse_event() {
     CHECK(payload.find("\"id\"") != std::string::npos);
 }
 
+static void test_gpu_execution_policy() {
+    CHECK(gpu_execution_allowed(/*allow_cpu*/ false, /*gpu_model_layers*/ 1));
+    CHECK(gpu_execution_allowed(/*allow_cpu*/ true,  /*gpu_model_layers*/ 0));
+    CHECK(!gpu_execution_allowed(/*allow_cpu*/ false, /*gpu_model_layers*/ 0));
+
+    const std::string server_error = gpu_execution_error("multimodal-server");
+    CHECK(server_error.find("GPU load was not successful") != std::string::npos);
+    CHECK(server_error.find("multimodal-server cannot run") != std::string::npos);
+    CHECK(server_error.find("--allow-cpu") != std::string::npos);
+
+    const std::string bench_error = gpu_execution_error("benchmark");
+    CHECK(bench_error.find("GPU load was not successful") != std::string::npos);
+    CHECK(bench_error.find("benchmark cannot run") != std::string::npos);
+    CHECK(bench_error.find("--allow-cpu") != std::string::npos);
+}
+
 static void test_model_config() {
     // Default constructor
     ModelConfig c1;
@@ -163,6 +179,7 @@ int main() {
     test_parse_session_id_num();
     test_error_body();
     test_sse_event();
+    test_gpu_execution_policy();
     test_model_config();
 
     if (g_failures) {

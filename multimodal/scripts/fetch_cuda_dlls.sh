@@ -13,29 +13,52 @@
 # ABI compatibility is verified by the test suite (11/11 pass) + coherent output.
 #
 # Usage:  bash audio.../nope -- see engine/multimodal/scripts/fetch_cuda_dlls.sh
-#   bash engine/multimodal/scripts/fetch_cuda_dlls.sh [REFERENCE_DIR] [EXE_DIR]
+#   bash engine/multimodal/scripts/fetch_cuda_dlls.sh [REFERENCE_DIR] [EXE_DIR] [CUDA_DLL]
 #
-#   REFERENCE_DIR  dir with a working ggml-cuda.dll + CUDA runtime DLLs
-#                  (default: C:/Programming/llamacpp)
+#   REFERENCE_DIR  dir with CUDA runtime DLLs (default: C:/Programming/llamacpp)
 #   EXE_DIR        where to drop the DLLs (default: the built exe dir)
+#   CUDA_DLL       ABI-compatible ggml-cuda.dll; defaults to REFERENCE_DIR's copy
+#                  (override when the reference runtime has a different ggml ABI)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REF="${1:-/c/Programming/llamacpp}"
-EXE="${2:-$HERE/../../build/bin/Release}"
+EXE="${2:-$HERE/../build/bin/Release}"
+CUDA_DLL="${3:-$REF/ggml-cuda.dll}"
 
-DLLS=(ggml-cuda.dll cudart64_13.dll cublas64_13.dll cublasLt64_13.dll)
+if [[ ! -f "$EXE/multimodal-server.exe" ]]; then
+  echo "ERROR: multimodal-server.exe not found in destination: $EXE" >&2
+  echo "       Build first with: bash scripts/build_engine.sh" >&2
+  exit 1
+fi
+
+DLLS=(cudart64_13.dll cublas64_13.dll cublasLt64_13.dll)
 
 echo "copying CUDA backend DLLs:"
-echo "  from: $REF"
-echo "  to:   $EXE"
+echo "  runtime source: $REF"
+echo "  CUDA backend:   $CUDA_DLL"
+echo "  destination:    $EXE"
 mkdir -p "$EXE"
+if [[ ! -f "$CUDA_DLL" ]]; then
+  echo "  MISSING: $CUDA_DLL" >&2
+  exit 1
+fi
+cp "$CUDA_DLL" "$EXE/ggml-cuda.dll"
+if ! cmp -s "$CUDA_DLL" "$EXE/ggml-cuda.dll"; then
+  echo "  ERROR: failed to verify copied DLL: $EXE/ggml-cuda.dll" >&2
+  exit 1
+fi
+echo "  copied and verified ggml-cuda.dll"
 for d in "${DLLS[@]}"; do
   if [[ ! -f "$REF/$d" ]]; then
     echo "  MISSING: $REF/$d" >&2
     exit 1
   fi
   cp "$REF/$d" "$EXE/$d"
-  echo "  copied $d"
+  if [[ ! -f "$EXE/$d" ]] || ! cmp -s "$REF/$d" "$EXE/$d"; then
+    echo "  ERROR: failed to verify copied DLL: $EXE/$d" >&2
+    exit 1
+  fi
+  echo "  copied and verified $d"
 done
-echo "done. 'multimodal-server --n-gpu-layers 99' will now offload to GPU."
+echo "done. GPU offload will be verified by multimodal-server at startup."
