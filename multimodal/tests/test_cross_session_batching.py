@@ -7,6 +7,7 @@ merely running concurrently.
 
 from __future__ import annotations
 
+import json
 import math
 import statistics
 import threading
@@ -172,6 +173,77 @@ def test_six_jobs_share_decode_and_match_greedy_baseline(base, make_session):
             f"{batched_step_ms:.3f}ms/step ratio={ratio:.3f}; aggregate={aggregate_tps:.2f}tok/s"
         )
         assert ratio <= BATCHED_STEP_RATIO
+    finally:
+        for sid in sessions:
+            _delete(base, sid)
+
+
+def test_cancel_one_of_six_leaves_other_jobs_byte_identical(base, make_session):
+    source = make_session()
+    _inject(
+        base,
+        source,
+        "Continue this deterministic sequence with many short tokens: 1 2 3 4 5. ",
+    )
+
+    control = _fork(base, source)["session_id"]
+    baseline = _generate(base, control)
+    _delete(base, control)
+
+    sessions = [_fork(base, source)["session_id"] for _ in range(N_SEQUENCES)]
+    cancelled_sid = sessions[0]
+    barrier = threading.Barrier(N_SEQUENCES)
+    second_cancelled_token = threading.Event()
+    cancelled_events: list[dict] = []
+    telemetry_before = _batching(base)
+
+    def run(sid: str) -> dict | None:
+        barrier.wait(timeout=30)
+        if sid != cancelled_sid:
+            return _generate(base, sid)
+        response = requests.post(
+            f"{base}/sessions/{sid}/generate",
+            json={"stream": True, "max_tokens": 128, "temperature": 0.0, "ignore_eos": True},
+            stream=True,
+            timeout=60,
+        )
+        assert response.status_code == 200, response.text
+        token_count = 0
+        for line in response.iter_lines(chunk_size=1, decode_unicode=True):
+            if not line or not line.startswith("data: "):
+                continue
+            event = json.loads(line[len("data: ") :])
+            cancelled_events.append(event)
+            if event.get("type") == "token":
+                token_count += 1
+                if token_count == 2:
+                    second_cancelled_token.set()
+        return None
+
+    try:
+        with ThreadPoolExecutor(max_workers=N_SEQUENCES) as executor:
+            futures = [executor.submit(run, sid) for sid in sessions]
+            assert second_cancelled_token.wait(30), "six-way stream did not produce two tokens"
+            cancel = _post(base, f"/sessions/{cancelled_sid}/cancel")
+            assert cancel.status_code == 200, cancel.text
+            assert cancel.json()["cancelled"] is True
+            results = [future.result(timeout=30) for future in futures]
+
+        telemetry_after = _batching(base)
+        assert _hist_delta(telemetry_before, telemetry_after, N_SEQUENCES) >= 1
+        done = [event for event in cancelled_events if event.get("type") == "done"]
+        assert len(done) == 1, cancelled_events
+
+        for result in results[1:]:
+            assert result is not None
+            assert result["text"] == baseline["text"]
+            assert result["tokens"] == baseline["tokens"]
+            assert result["cache_size"] == baseline["cache_size"]
+
+        reused = _generate(base, cancelled_sid)
+        assert reused["text"] == baseline["text"]
+        assert reused["tokens"] == baseline["tokens"]
+        assert reused["cache_size"] == baseline["cache_size"]
     finally:
         for sid in sessions:
             _delete(base, sid)

@@ -45,6 +45,26 @@ void InferenceScheduler::enqueue_command(std::function<void()> command) {
     cv_.notify_one();
 }
 
+void InferenceScheduler::enqueue_deferred_command(std::function<void()> command) {
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (stopping_) {
+            throw std::runtime_error("inference scheduler is stopping");
+        }
+        deferred_commands_.push_back(std::move(command));
+    }
+    cv_.notify_one();
+}
+
+void InferenceScheduler::begin_generation() {
+    active_generations_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void InferenceScheduler::end_generation() {
+    const int previous = active_generations_.fetch_sub(1, std::memory_order_acq_rel);
+    if (previous == 1) cv_.notify_one();
+}
+
 void InferenceScheduler::invalidate_logits() {
     for (auto & [_, row] : logits_rows_) {
         row = -1;
@@ -149,14 +169,17 @@ void InferenceScheduler::worker_loop() {
         std::vector<std::shared_ptr<StepRequest>> requests;
         {
             std::unique_lock<std::mutex> lock(mu_);
-            cv_.wait(lock, [this] { return stopping_ || !commands_.empty() || !steps_.empty(); });
-            if (stopping_ && commands_.empty() && steps_.empty()) {
+            cv_.wait(lock, [this] {
+                return stopping_ || !commands_.empty() || !steps_.empty() ||
+                       (!deferred_commands_.empty() && active_generations_.load() == 0);
+            });
+            if (stopping_ && commands_.empty() && deferred_commands_.empty() && steps_.empty()) {
                 return;
             }
             if (!commands_.empty()) {
                 command = std::move(commands_.front());
                 commands_.pop_front();
-            } else {
+            } else if (!steps_.empty()) {
                 const auto deadline = std::chrono::steady_clock::now() + batching_window_;
                 cv_.wait_until(lock, deadline, [this] { return stopping_ || !commands_.empty(); });
                 if (!commands_.empty()) {
@@ -175,6 +198,10 @@ void InferenceScheduler::worker_loop() {
                         }
                     }
                 }
+            } else if (!deferred_commands_.empty() &&
+                       (stopping_ || active_generations_.load() == 0)) {
+                command = std::move(deferred_commands_.front());
+                deferred_commands_.pop_front();
             }
         }
         if (command) {

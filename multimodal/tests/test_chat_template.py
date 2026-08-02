@@ -31,8 +31,10 @@ from __future__ import annotations
 import os
 import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
+from typing import BinaryIO
 
 import pytest
 import requests
@@ -65,6 +67,7 @@ TPL_BROKEN = "{% for m in messages %}{{ m.content {% endfor %}"
 pytestmark = pytest.mark.usefixtures("_kill_servers_atexit")
 
 _PROCS: list[subprocess.Popen] = []
+_PROC_LOGS: dict[subprocess.Popen, BinaryIO] = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -78,7 +81,20 @@ def _free_port() -> int:
     return port
 
 
-def _boot(extra_args: list[str], timeout: int = 180) -> str:
+def _stop_servers() -> None:
+    for proc in _PROCS:
+        try:
+            proc.kill()
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+        log = _PROC_LOGS.pop(proc, None)
+        if log is not None:
+            log.close()
+    _PROCS.clear()
+
+
+def _boot(extra_args: list[str], timeout: int = 45) -> str:
     """Boot a multimodal-server with extra CLI args; return its base URL.
 
     Raises if the server exits early or never becomes healthy. The process is
@@ -89,19 +105,26 @@ def _boot(extra_args: list[str], timeout: int = 180) -> str:
     if not os.path.exists(MODEL):
         pytest.skip(f"model not found at {MODEL} (set MULTIMODAL_MODEL)")
 
+    # A capacity-8 pool nearly fills the benchmark GPU. Configuration groups
+    # run sequentially, so retire the previous group's server before loading the
+    # next instead of overlapping multiple fixed pools.
+    _stop_servers()
     port = _free_port()
     url = f"http://127.0.0.1:{port}"
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = CUDA_GPU
     cmd = [EXE, "--model", MODEL, "--port", str(port), "--n-gpu-layers", "99", *extra_args]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+    log = tempfile.TemporaryFile(mode="w+b")
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
     _PROCS.append(proc)
+    _PROC_LOGS[proc] = log
 
     deadline = time.time() + timeout
     while time.time() < deadline:
         rc = proc.poll()
         if rc is not None:
-            out = proc.stdout.read().decode(errors="replace") if proc.stdout else ""
+            log.seek(0)
+            out = log.read().decode(errors="replace")
             pytest.fail(f"server exited early rc={rc}\n{out}")
         try:
             if requests.get(f"{url}/health", timeout=2).status_code == 200:
@@ -142,15 +165,7 @@ def _kill_servers_atexit():
 @pytest.fixture(scope="session", autouse=True)
 def _sweep_servers():
     yield
-    for p in _PROCS:
-        try:
-            p.kill()
-        except Exception:
-            pass
-        try:
-            p.wait(timeout=10)
-        except Exception:
-            pass
+    _stop_servers()
 
 
 # --------------------------------------------------------------------------- #

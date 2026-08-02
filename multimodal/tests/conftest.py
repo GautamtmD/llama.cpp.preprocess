@@ -41,8 +41,10 @@ import atexit
 import os
 import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
+from typing import BinaryIO
 
 import pytest
 import requests
@@ -63,6 +65,7 @@ CUDA_GPU = os.environ.get("MULTIMODAL_CUDA_VISIBLE_DEVICES", "1")
 SELF_BOOT = os.environ.get("MULTIMODAL_SELF_BOOT", "") == "1"
 
 _PROCS: list[subprocess.Popen] = []
+_PROC_LOGS: dict[subprocess.Popen, BinaryIO] = {}
 
 
 def _server_up(url: str = BASE) -> bool:
@@ -80,7 +83,7 @@ def _free_port() -> int:
     return port
 
 
-def _wait_health(url: str, timeout: float = 600.0) -> bool:
+def _wait_health(url: str, timeout: float = 45.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if _server_up(url):
@@ -108,8 +111,12 @@ def _kill_procs() -> None:
         except Exception:
             try:
                 p.kill()
+                p.wait(timeout=10)
             except Exception:
                 pass
+        log = _PROC_LOGS.pop(p, None)
+        if log is not None:
+            log.close()
 
 
 atexit.register(_kill_procs)
@@ -141,13 +148,25 @@ def _ensure_server():
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = CUDA_GPU
     print(f"[conftest] self-booting multimodal-server on port {port}: {MODEL}")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+    # Never leave server stdout in an undrained PIPE: verbose model/projector
+    # startup can fill the Windows pipe after allocating VRAM and deadlock before
+    # /health. A temporary file is unbounded for practical test logs and remains
+    # available for startup diagnostics.
+    log = tempfile.TemporaryFile(mode="w+b")
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
     _PROCS.append(proc)
+    _PROC_LOGS[proc] = log
     url = f"http://127.0.0.1:{port}"
     if not _wait_health(url):
-        # surface server stderr to aid debugging
         try:
-            out = proc.stdout.read().decode("utf-8", "replace") if proc.stdout else ""
+            proc.terminate()
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+            proc.wait(timeout=10)
+        try:
+            log.seek(0)
+            out = log.read().decode("utf-8", "replace")
         except Exception:
             out = ""
         pytest.exit(

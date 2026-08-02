@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "sampling.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -44,26 +45,30 @@ public:
     InferenceScheduler(const InferenceScheduler &) = delete;
     InferenceScheduler & operator=(const InferenceScheduler &) = delete;
 
+    // Opaque context commands conservatively invalidate logits because llama
+    // state APIs may overwrite the output buffer even when they do not decode.
     template <typename Fn>
     auto invoke(Fn && fn) -> decltype(fn(static_cast<llama_context *>(nullptr))) {
-        using Result = decltype(fn(static_cast<llama_context *>(nullptr)));
-        auto promise = std::make_shared<std::promise<Result>>();
-        auto future = promise->get_future();
-        enqueue_command([this, promise, fn = std::forward<Fn>(fn)]() mutable {
-            try {
-                if constexpr (std::is_void_v<Result>) {
-                    fn(ctx_);
-                    promise->set_value();
-                } else {
-                    promise->set_value(fn(ctx_));
-                }
-                invalidate_logits();
-            } catch (...) {
-                promise->set_exception(std::current_exception());
-            }
-        });
-        return future.get();
+        return invoke_impl<true, false>(std::forward<Fn>(fn));
     }
+
+    template <typename Fn>
+    auto invoke_invalidating_logits(Fn && fn)
+        -> decltype(fn(static_cast<llama_context *>(nullptr))) {
+        return invoke_impl<true, false>(std::forward<Fn>(fn));
+    }
+
+    // State restore can mutate unified-memory bookkeeping and is expensive.
+    // Queue it until active generation jobs finish; state serialization/removal
+    // remains allowed so offloading a shared sibling is still exercised live.
+    template <typename Fn>
+    auto invoke_when_no_generation(Fn && fn)
+        -> decltype(fn(static_cast<llama_context *>(nullptr))) {
+        return invoke_impl<true, true>(std::forward<Fn>(fn));
+    }
+
+    void begin_generation();
+    void end_generation();
 
     int allocate_sequence();
     void release_sequence(llama_seq_id seq_id);
@@ -80,6 +85,34 @@ public:
     size_t logical_allocated_bytes();
 
 private:
+    template <bool InvalidateLogits, bool DeferForGeneration, typename Fn>
+    auto invoke_impl(Fn && fn) -> decltype(fn(static_cast<llama_context *>(nullptr))) {
+        using Result = decltype(fn(static_cast<llama_context *>(nullptr)));
+        auto promise = std::make_shared<std::promise<Result>>();
+        auto future = promise->get_future();
+        auto command = [this, promise, fn = std::forward<Fn>(fn)]() mutable {
+            try {
+                if constexpr (std::is_void_v<Result>) {
+                    fn(ctx_);
+                    if constexpr (InvalidateLogits) invalidate_logits();
+                    promise->set_value();
+                } else {
+                    auto result = fn(ctx_);
+                    if constexpr (InvalidateLogits) invalidate_logits();
+                    promise->set_value(std::move(result));
+                }
+            } catch (...) {
+                promise->set_exception(std::current_exception());
+            }
+        };
+        if constexpr (DeferForGeneration) {
+            enqueue_deferred_command(std::move(command));
+        } else {
+            enqueue_command(std::move(command));
+        }
+        return future.get();
+    }
+
     struct StepRequest {
         llama_seq_id seq_id;
         common_sampler * sampler;
@@ -88,6 +121,7 @@ private:
     };
 
     void enqueue_command(std::function<void()> command);
+    void enqueue_deferred_command(std::function<void()> command);
     void worker_loop();
     void process_steps(std::vector<std::shared_ptr<StepRequest>> requests);
     bool decode_batch(llama_batch & batch, uint32_t distinct_sequences, std::string & error);
@@ -106,7 +140,9 @@ private:
     std::condition_variable cv_;
     bool stopping_ = false;
     std::deque<std::function<void()>> commands_;
+    std::deque<std::function<void()>> deferred_commands_;
     std::deque<std::shared_ptr<StepRequest>> steps_;
+    std::atomic<int> active_generations_{0};
 
     // Worker-thread-owned state.
     std::set<llama_seq_id> free_sequences_;

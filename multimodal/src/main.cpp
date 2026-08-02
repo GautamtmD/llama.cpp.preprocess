@@ -485,6 +485,16 @@ struct BusyGuard {
     ~BusyGuard() { if (active) clear_session_busy(app, session); }
 };
 
+struct SchedulerGenerationGuard {
+    InferenceScheduler & scheduler;
+    explicit SchedulerGenerationGuard(InferenceScheduler & scheduler) : scheduler(scheduler) {
+        scheduler.begin_generation();
+    }
+    SchedulerGenerationGuard(const SchedulerGenerationGuard &) = delete;
+    SchedulerGenerationGuard & operator=(const SchedulerGenerationGuard &) = delete;
+    ~SchedulerGenerationGuard() { scheduler.end_generation(); }
+};
+
 // Shared generation loop, now built on llama.cpp's `common_sampler` (ADR 0005).
 //
 // `on_event` receives full SSE-event JSON objects. When non-null (streaming),
@@ -503,6 +513,7 @@ GenResult run_generation(
     llama_token rewind_token = LLAMA_TOKEN_NULL
 ) {
     GenResult r;
+    SchedulerGenerationGuard scheduler_generation{*app.scheduler};
     const llama_pos pmax = app.scheduler->invoke([seq_id](llama_context * ctx) {
         return llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id);
     });
@@ -741,11 +752,17 @@ static mtmd_bitmap * bitmap_from_media_bytes(mtmd_context * mtmd_ctx,
 }
 
 // Run the mtmd tokenize + per-chunk eval path: turns the marker-containing text
-// + bitmaps into chunks and decodes each into the session's KV cache.
-// Returns false on error. Does NOT free the bitmaps (caller owns).
-static bool mtmd_inject(mtmd_context * mtmd_ctx, const llama_vocab * /*vocab*/,
-                        llama_context * ctx, llama_seq_id seq_id, const std::string & text,
-                        const std::vector<mtmd_bitmap *> & bitmaps) {
+// + bitmaps into chunks and decodes each into the session's KV cache. Preserve
+// the final discrete token when the rendered prompt ends in text: the pooled
+// scheduler needs it to recreate sequence-specific boundary logits.
+struct MtmdInjectResult {
+    bool ok = false;
+    llama_token last_token = LLAMA_TOKEN_NULL;
+};
+
+static MtmdInjectResult mtmd_inject(mtmd_context * mtmd_ctx, llama_context * ctx,
+                                    llama_seq_id seq_id, const std::string & text,
+                                    const std::vector<mtmd_bitmap *> & bitmaps) {
     mtmd_input_text input_text;
     input_text.text          = text.c_str();
     input_text.add_special   = true;
@@ -760,10 +777,19 @@ static bool mtmd_inject(mtmd_context * mtmd_ctx, const llama_vocab * /*vocab*/,
                                bptrs.data(), bptrs.size());
     if (rc != 0) {
         mtmd_input_chunks_free(chunks);
-        return false;
+        return {};
     }
 
     const size_t n_chunks = mtmd_input_chunks_size(chunks);
+    llama_token last_token = LLAMA_TOKEN_NULL;
+    if (n_chunks > 0) {
+        const mtmd_input_chunk * final_chunk = mtmd_input_chunks_get(chunks, n_chunks - 1);
+        if (mtmd_input_chunk_get_type(final_chunk) == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            size_t n_tokens = 0;
+            const llama_token * tokens = mtmd_input_chunk_get_tokens_text(final_chunk, &n_tokens);
+            if (tokens && n_tokens > 0) last_token = tokens[n_tokens - 1];
+        }
+    }
     llama_pos n_past = 0;
     // start from the current cache position (so multi-turn inject composes)
     llama_pos cur_max = llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id);
@@ -780,7 +806,7 @@ static bool mtmd_inject(mtmd_context * mtmd_ctx, const llama_vocab * /*vocab*/,
         n_past = new_n_past;
     }
     mtmd_input_chunks_free(chunks);
-    return ok;
+    return {ok, ok ? last_token : LLAMA_TOKEN_NULL};
 }
 
 int main(int argc, char ** argv) {
@@ -1235,13 +1261,13 @@ int main(int argc, char ** argv) {
                 // plain text tokenize+decode below.
                 if (used_multimodal) {
                     double t0 = now_s();
-                    bool ok = app.scheduler->invoke([&](llama_context * ctx) {
-                        const bool result = mtmd_inject(app.mtmd_ctx, app.vocab, ctx, seq_id, text, bitmaps);
+                    MtmdInjectResult inject_result = app.scheduler->invoke_invalidating_logits([&](llama_context * ctx) {
+                        const auto result = mtmd_inject(app.mtmd_ctx, ctx, seq_id, text, bitmaps);
                         for (auto * bitmap : bitmaps) mtmd_bitmap_free(bitmap);
                         return result;
                     });
                     const double dt = now_s() - t0;
-                    if (!ok) {
+                    if (!inject_result.ok) {
                         res.status = 500;
                         res.set_content(error_body("mtmd tokenize/decode failed", 500).dump(), "application/json");
                         return;
@@ -1258,10 +1284,9 @@ int main(int argc, char ** argv) {
                         {"n_media", bitmaps.size()},
                     };
                     if (return_prompt) body["prompt"] = text;
-                    // last inject ended in an image/audio embedding chunk: no
-                    // discrete last token, so clear any stale value (a fork must
-                    // not re-decode a wrong token at a media cell — see ADR 0004).
-                    set_last_token(app, sid_num, LLAMA_TOKEN_NULL);
+                    // Text-ending rendered prompts are generation-ready. A
+                    // media-ending prompt retains ADR 0004's explicit caveat.
+                    set_last_token(app, sid_num, inject_result.last_token);
                     res.set_content(body.dump(), "application/json");
                     return;
                 }
@@ -1300,7 +1325,7 @@ int main(int argc, char ** argv) {
                     return;
                 }
 
-                bool ok = app.scheduler->invoke([&](llama_context * ctx) {
+                bool ok = app.scheduler->invoke_invalidating_logits([&](llama_context * ctx) {
                     const float * samples = reinterpret_cast<const float *>(bytes.data());
                     mtmd_bitmap * bmp = mtmd_bitmap_init_from_audio(n_samples, samples);
                     if (!bmp) return false;
@@ -1398,7 +1423,7 @@ int main(int argc, char ** argv) {
             return;
         }
         const double t0 = now_s();
-        const bool decoded = app.scheduler->invoke([&](llama_context * ctx) {
+        const bool decoded = app.scheduler->invoke_invalidating_logits([&](llama_context * ctx) {
             llama_batch batch = llama_batch_init((int32_t) toks.size(), 0, 1);
             for (int i = 0; i < (int) toks.size(); ++i) {
                 batch.token[i] = toks[i];
@@ -1708,7 +1733,7 @@ int main(int argc, char ** argv) {
         if (!mark_session_busy(app, sid_num, res)) return;
         BusyGuard busy{app, sid_num, true};
         const double t0 = now_s();
-        OffloadedState state = app.scheduler->invoke([seq = live->seq_id, last = live->last_token](llama_context * ctx) {
+        OffloadedState state = app.scheduler->invoke_invalidating_logits([seq = live->seq_id, last = live->last_token](llama_context * ctx) {
             OffloadedState result;
             result.state_bytes = llama_state_seq_get_size(ctx, seq);
             result.state.resize(result.state_bytes);
@@ -1762,7 +1787,7 @@ int main(int argc, char ** argv) {
         }
         const double t0 = now_s();
         try {
-            app.scheduler->invoke([&](llama_context * ctx) {
+            app.scheduler->invoke_when_no_generation([&](llama_context * ctx) {
                 llama_state_seq_set_data(ctx, state.state.data(), state.state_bytes, seq_id);
             });
         } catch (...) {

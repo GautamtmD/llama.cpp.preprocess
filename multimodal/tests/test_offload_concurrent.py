@@ -119,9 +119,13 @@ def test_offload_load_does_not_degrade_concurrent_generation(base, make_session)
     """While session A generates greedily, repeatedly offload+load two OTHER
     sessions (B, C) holding real-sized caches. A's output must be byte-identical
     to a solo run, and its throughput/latency must stay within the gates above."""
-    # baseline: identical starting cache, run SOLO (no offload/load happening).
-    control = make_session()
-    _inject_chat(base, control)
+    # Decode the prompt once, then fork byte-identical KV prefixes for the solo
+    # control and concurrent subject. Independently prefilling the same prompt
+    # into different pooled GPU sequences can differ numerically and is not a
+    # valid byte-parity oracle for offload isolation.
+    source = make_session()
+    _inject_chat(base, source)
+    control = _fork(base, source)["session_id"]
     text_baseline, times_baseline = _stream_generate(base, control, max_tokens=80)
     assert text_baseline, "baseline produced no text"
     n_baseline = len(times_baseline)
@@ -140,8 +144,7 @@ def test_offload_load_does_not_degrade_concurrent_generation(base, make_session)
     c = make_session()
     _inject_text(base, c, BIG_TEXT)
 
-    subject = make_session()
-    _inject_chat(base, subject)  # identical starting cache to control
+    subject = _fork(base, source)["session_id"]
 
     done = threading.Event()
 
@@ -218,9 +221,8 @@ def test_offload_forked_session_during_active_generation__shared_kv_sentinel(bas
     a = make_session()
     _inject_chat(base, a)
     ap = _fork(base, a)["session_id"]
+    control = _fork(base, a)["session_id"]
 
-    control = make_session()
-    _inject_chat(base, control)  # identical starting cache to A
     baseline, _ = _stream_generate(base, control, max_tokens=80)
     assert baseline
 

@@ -35,10 +35,9 @@ Test:
 ---
 
 ### EUS-2: Fork a session's KV cache into a new, independent session
-Forking a session snapshots whatever its KV cache currently holds (after a text
-inject, an audio inject, or a generate) into a **new session** that owns an
-independent copy. The source session is untouched; the forked session generates
-independently from the snapshot.
+Forking snapshots a session into a **new external session** backed by another
+sequence in the pooled context. `llama_memory_seq_cp` aliases the immutable
+prefix; source and fork own independent sequence state and divergent suffixes.
 
 Input / trigger:
 - Active session with some cached content; `POST /sessions/{id}/fork`.
@@ -59,19 +58,11 @@ Expected:
 - Unknown source session -> 404.
 
 Latency / performance budget:
-- Fork copy of a session with ≤ 2048 cached tokens: **≤ 1.0 s** steady-state
-  on RTX 5060 Ti, Gemma 4 12B (measured ~480 ms for a tiny session, ~700 ms at
-  ~200 tokens). Breakdown: new-context creation ~200 ms + the redecode ~290 ms
-  (that redecode is the **first decode in the new dst context**, so it pays that
-  context's one-time first-decode cost — graph build + buffer alloc; it is NOT
-  CUDA-graph capture, which `GGML_CUDA_DISABLE_GRAPHS` does not reduce and which
-  destroys generation throughput) + `get/set_data` growing with N. A startup
-  fork warm-up removes the one-time global-JIT cold-start (first fork ~480 ms,
-  not ~870 ms). All of this is eliminated by slice 5 (`llama_memory_seq_cp` in a
-  pooled context: no new context, no redecode → ~0). See
-  [`docs/decisions/0004-fork-copy-semantics.md`](../../../docs/decisions/0004-fork-copy-semantics.md).
-- VRAM: **≤ ~400 MiB per fork** (the forked session's KV state; measured ~350
-  MiB, plateaus with the model's SWA cache). Slice 5 drops this to ~0.
+- Warm same-pool fork: p95 **< 5 ms** over at least 50 samples. Measured
+  p95 0.38–0.57 ms on RTX 5060 Ti / Gemma 4 12B QAT q4_0.
+- Incremental logical KV: **< 10 MiB/fork, < 60 MiB for six** excluding the
+  fixed pool. Measured six-fork logical delta: 0 MiB. The one-time pool footprint
+  was about 8.34 GiB and is reported separately.
 
 Test:
 - tests/test_fork.py (correctness + latency against the live server)
@@ -135,17 +126,18 @@ Expected:
 - Shared-prefix sessions do NOT duplicate BASE KV — only the divergent suffix KV
   per fork.
 
-Latency / performance budget (initial targets — verify when implemented):
+Latency / performance budget (implemented and measured):
 - Fork (`seq_cp`) in a pooled context: **< 5 ms, < 10 MiB** (~0 in practice; vs
   EUS-2 A').
 - Batched decode of N=6 sessions: per-token wall-clock latency **≤ ~1.5× the
-  single-session baseline** (target — verify; the engagement pipeline needs ~6
-  forks/turn inside US-1's 500 ms / US-2's 3 s budgets).
+  single-session baseline**. Measured warmed runs: N=1 35–37 ms/step; N=6
+  38–41 ms/step; ratio 1.07–1.09; aggregate 147–157 tok/s. Telemetry proves at
+  least 32 decode calls carried all six sequence IDs.
 
 Test:
-- Planned with slice 5: add a measured pooled-context test for N-session output
-  isolation, `seq_cp` cost, and batched-vs-sequential throughput. No current test
-  claims this unimplemented behavior.
+- `tests/test_cross_session_batching.py` (single pool, fork latency/memory,
+  six-way decode proof and parity, sampler/grammar isolation, capacity reuse,
+  same-session 409, cancellation race, and shared-prefix lifecycle)
 
 > [ADR 0004](../../../docs/decisions/0004-fork-copy-semantics.md) mandates
 > migrating fork to B (`seq_cp`) here; this unblocks the engagement pipeline's
@@ -208,8 +200,9 @@ Input / trigger:
   `GET /sessions/{id}`, `GET /sessions/usage`.
 
 Expected:
-- **Offload** moves a resident session to RAM; afterwards its VRAM footprint
-  (via `/usage`) is ~0 and `GET /sessions/{id}` reports `location:"ram"`. Returns
+- **Offload** moves a resident sequence to RAM; afterwards its logical KV cells
+  and pool slot are released and `GET /sessions/{id}` reports `location:"ram"`.
+  The pool's process-wide preallocated GPU buffers do not shrink. Returns
   `{session_id, location:"ram", cache_size, state_bytes, offload_ms}`. Idempotent
   (`offload_ms:0` on an already-RAM session).
 - **Load** restores a RAM session to VRAM; the session then reproduces its exact
@@ -217,33 +210,27 @@ Expected:
   correctness — the KV/SSM state survived unchanged). Returns
   `{session_id, location:"vram", cache_size, state_bytes, load_ms}`. Idempotent.
 - **GET /sessions/{id}** returns `{session_id, location, cache_size, state_bytes}`.
-- **GET /sessions/usage** returns `{vram:{n_sessions,total_state_bytes,sessions:[{session_id,state_bytes}]},
-  ram:{...}}`.
+- **GET /sessions/usage** returns the existing `vram`/`ram` buckets plus a
+  `pool` object separating capacity, active/free slots, total/per-sequence
+  context, fixed `preallocated_bytes`, and estimated `logical_allocated_bytes`.
 - **Offloaded sessions cannot be silently used (409, no auto-load):**
   `inject`/`generate`/`fork` against a RAM session return **409**
   ("session is offloaded; POST /sessions/{id}/load first"); `delete` works on a
   RAM session (frees the RAM buffer); `cancel` is a no-op `{cancelled:false}`.
   Offloading a session with an active generation returns 409 (use-after-free
   guard). Unknown session → 404 for all new ops.
-- `state_bytes` is the per-sequence serializable state (`llama_state_seq_get_size`,
-  seq 0) — KV + SSM/Mamba recurrent state for hybrid models; symmetric across
+- `state_bytes` is target-sequence serializable state (`llama_state_seq_get_size`)
+  — KV + SSM/Mamba recurrent state for hybrid models; symmetric across
   offload/load so `/usage` is meaningful in both states.
-- **Must not assume exclusive KV ownership** (forward-compat with EUS-4 shared KV):
-  offloading/loading one session must not corrupt, evict, or stall a cache another
-  live session depends on. Proven on the strongest sharing the current fork
-  supports (ADR 0004 A' deep-copy) + a shared-KV sentinel test for the slice-5
-  future.
+- **Shared-prefix safe:** offloading/loading one sequence must not corrupt or
+  evict cells a live sibling owns. Source-first and fork-first release plus
+  offload-during-sibling-generation are tested against real shared KV.
 
 Latency / performance budget:
-- **The bar is inference impact, not offload/load speed.** Offload/load of session
-  X must not stall or significantly slow generation on another session Y: the
-  GPU→host serialize on X is performed **outside** the global sessions mutex
-  (the decode loop holds no such lock during `llama_decode`). Required test: a
-  sustained streaming `/generate` on A establishes a baseline (tok/s, per-token
-  latency); offload/load on other sessions during A's generation keeps A's
-  sustained tok/s within a chosen fraction of baseline, bounds any single-token
-  stall, and leaves A's greedy output **byte-identical** to a solo run. Threshold
-  set from measurement (see worklog `2026-07-11-kv-cache-offload.md`).
+- **The bar is inference impact, not offload/load speed.** Serialization/removal
+  runs on the single owner; restore waits until active generation completes.
+  Repeated stress must retain ≥0.5× baseline throughput, bounded token gaps, and
+  byte-identical output. Measured 24.8–25.7 tok/s versus 28.3–30.3 tok/s baseline.
 - Offload/load wall-clock latency is **reported** (in `offload_ms`/`load_ms`) but
   is **not** a gate.
 
