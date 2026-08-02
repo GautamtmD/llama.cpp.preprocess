@@ -150,8 +150,8 @@ Test:
   current-boundary replay, repeated cancellation/output isolation, atomic
   delete/snapshot races, truthful
   ownership/GPU telemetry, and shared-prefix lifecycle)
-- `tests/test_context_limits.py` (small-context generation and multimodal
-  preflight/retry invariants)
+- `tests/test_context_limits.py` (small-context generation partial-success and
+  boundary parity plus atomic multimodal preflight/retry invariants)
 
 > [ADR 0004](../../../docs/decisions/0004-fork-copy-semantics.md) mandates
 > migrating fork to B (`seq_cp`) here; this unblocks the engagement pipeline's

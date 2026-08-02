@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import socket
 import struct
@@ -106,6 +107,95 @@ def _cache_size(base: str, sid: str) -> int:
 
 def _inject_text(base: str, sid: str, text: str) -> requests.Response:
     return requests.post(f"{base}/sessions/{sid}/inject", json={"text": text}, timeout=30)
+
+
+def test_context_full_after_one_token_returns_partial_success(tiny_server):
+    created = requests.post(f"{tiny_server}/sessions", timeout=30)
+    assert created.status_code == 200, created.text
+    sid = created.json()["session_id"]
+    forked_sid = None
+    try:
+        first = _inject_text(tiny_server, sid, "x")
+        assert first.status_code == 200, first.text
+        while _cache_size(tiny_server, sid) < CTX_SIZE - 1:
+            before = _cache_size(tiny_server, sid)
+            injected = _inject_text(tiny_server, sid, " x")
+            assert injected.status_code == 200, injected.text
+            assert injected.json()["cache_size"] == before + 1
+        assert _cache_size(tiny_server, sid) == CTX_SIZE - 1
+
+        generated = requests.post(
+            f"{tiny_server}/sessions/{sid}/generate",
+            json={"max_tokens": 2, "temperature": 0.0, "ignore_eos": True},
+            timeout=30,
+        )
+        assert generated.status_code == 200, (
+            "generation committed a token but reported a rejected request: "
+            f"{generated.text}; cache_size={_cache_size(tiny_server, sid)}"
+        )
+        result = generated.json()
+        assert result["finish_reason"] == "context_full"
+        assert result["n_tokens"] == 1
+        assert len(result["tokens"]) == 1
+        assert result["cache_size"] == CTX_SIZE
+
+        source_status = requests.get(f"{tiny_server}/sessions/{sid}", timeout=30)
+        assert source_status.status_code == 200, source_status.text
+        assert source_status.json()["boundary_token"] == result["tokens"][-1]
+
+        forked = requests.post(f"{tiny_server}/sessions/{sid}/fork", timeout=30)
+        assert forked.status_code == 200, forked.text
+        forked_sid = forked.json()["session_id"]
+        fork_status = requests.get(f"{tiny_server}/sessions/{forked_sid}", timeout=30)
+        assert fork_status.status_code == 200, fork_status.text
+        assert fork_status.json()["boundary_token"] == result["tokens"][-1]
+    finally:
+        if forked_sid is not None:
+            requests.delete(f"{tiny_server}/sessions/{forked_sid}", timeout=30)
+        requests.delete(f"{tiny_server}/sessions/{sid}", timeout=30)
+
+
+def test_streaming_context_full_reports_partial_success(tiny_server):
+    created = requests.post(f"{tiny_server}/sessions", timeout=30)
+    assert created.status_code == 200, created.text
+    sid = created.json()["session_id"]
+    try:
+        first = _inject_text(tiny_server, sid, "x")
+        assert first.status_code == 200, first.text
+        while _cache_size(tiny_server, sid) < CTX_SIZE - 1:
+            injected = _inject_text(tiny_server, sid, " x")
+            assert injected.status_code == 200, injected.text
+
+        streamed = requests.post(
+            f"{tiny_server}/sessions/{sid}/generate",
+            json={
+                "stream": True,
+                "max_tokens": 2,
+                "temperature": 0.0,
+                "ignore_eos": True,
+            },
+            stream=True,
+            timeout=30,
+        )
+        assert streamed.status_code == 200, streamed.text
+        events = [
+            json.loads(line[len("data: ") :])
+            for line in streamed.iter_lines(decode_unicode=True)
+            if line and line.startswith("data: ")
+        ]
+        tokens = [event for event in events if event.get("type") == "token"]
+        done = [event for event in events if event.get("type") == "done"]
+        assert len(tokens) == 1
+        assert len(done) == 1
+        assert done[0]["finish_reason"] == "context_full"
+        assert done[0]["n_tokens"] == 1
+        assert done[0]["cache_size"] == CTX_SIZE
+
+        status = requests.get(f"{tiny_server}/sessions/{sid}", timeout=30)
+        assert status.status_code == 200, status.text
+        assert status.json()["boundary_token"] == tokens[0]["id"]
+    finally:
+        requests.delete(f"{tiny_server}/sessions/{sid}", timeout=30)
 
 
 def test_generation_and_multimodal_injection_never_exceed_per_sequence_limit(tiny_server):

@@ -1686,7 +1686,9 @@ int main(int argc, char ** argv) {
         if (!stream) {
             // Non-streaming: whole response as JSON (incl. tool_calls if any).
             GenResult r = run_generation(app, seq_id, gp, nullptr, generation.get(), pre_generation_last);
-            if (!r.error.empty()) {
+            const bool partial_context_full =
+                r.error == "session context full" && !r.ids.empty();
+            if (!r.error.empty() && !partial_context_full) {
                 res.status = r.error == "session context full" ? 409 : 500;
                 res.set_content(error_body(r.error, res.status).dump(), "application/json");
                 return;
@@ -1707,6 +1709,7 @@ int main(int argc, char ** argv) {
                 {"cache_size", r.cache_size},
             };
             if (!r.tool_calls.empty()) body["tool_calls"] = r.tool_calls;
+            if (partial_context_full) body["finish_reason"] = "context_full";
             res.set_content(body.dump(), "application/json");
             return;
         }
@@ -1741,6 +1744,9 @@ int main(int argc, char ** argv) {
                     {"cache_size", r.cache_size},
                 };
                 if (!r.tool_calls.empty()) done_body["tool_calls"] = r.tool_calls;
+                if (r.error == "session context full" && !r.ids.empty()) {
+                    done_body["finish_reason"] = "context_full";
+                }
                 std::string done = sse_event(done_body);
                 ds.write(done.data(), done.size());
                 ds.done();
