@@ -514,7 +514,7 @@ GenResult run_generation(
 ) {
     GenResult r;
     SchedulerGenerationGuard scheduler_generation{*app.scheduler};
-    const llama_pos pmax = app.scheduler->invoke([seq_id](llama_context * ctx) {
+    const llama_pos pmax = app.scheduler->invoke_preserving_logits([seq_id](llama_context * ctx) {
         return llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id);
     });
     const llama_pos p_start = pmax < 0 ? 1 : pmax + 1;
@@ -716,7 +716,7 @@ GenResult run_generation(
         r.cancelled = generation->finish(seq_id, p_start, rewind_token, r.cancelled, r.rewind_s);
     }
 
-    r.cache_size = app.scheduler->invoke([seq_id](llama_context * ctx) {
+    r.cache_size = app.scheduler->invoke_preserving_logits([seq_id](llama_context * ctx) {
         return llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) + 1;
     });
     r.gen_s = now_s() - t0;
@@ -1261,6 +1261,7 @@ int main(int argc, char ** argv) {
                 // plain text tokenize+decode below.
                 if (used_multimodal) {
                     double t0 = now_s();
+                    app.scheduler->prepare_sequence_mutation(seq_id);
                     MtmdInjectResult inject_result = app.scheduler->invoke_invalidating_logits([&](llama_context * ctx) {
                         const auto result = mtmd_inject(app.mtmd_ctx, ctx, seq_id, text, bitmaps);
                         for (auto * bitmap : bitmaps) mtmd_bitmap_free(bitmap);
@@ -1325,6 +1326,7 @@ int main(int argc, char ** argv) {
                     return;
                 }
 
+                app.scheduler->prepare_sequence_mutation(seq_id);
                 bool ok = app.scheduler->invoke_invalidating_logits([&](llama_context * ctx) {
                     const float * samples = reinterpret_cast<const float *>(bytes.data());
                     mtmd_bitmap * bmp = mtmd_bitmap_init_from_audio(n_samples, samples);
@@ -1423,6 +1425,7 @@ int main(int argc, char ** argv) {
             return;
         }
         const double t0 = now_s();
+        app.scheduler->prepare_sequence_mutation(seq_id);
         const bool decoded = app.scheduler->invoke_invalidating_logits([&](llama_context * ctx) {
             llama_batch batch = llama_batch_init((int32_t) toks.size(), 0, 1);
             for (int i = 0; i < (int) toks.size(); ++i) {

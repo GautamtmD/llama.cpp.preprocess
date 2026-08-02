@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <tuple>
 
 InferenceScheduler::InferenceScheduler(
     llama_context * ctx, const llama_vocab * vocab, int max_sequences,
@@ -98,6 +99,20 @@ void InferenceScheduler::release_sequence(llama_seq_id seq_id) {
     });
 }
 
+void InferenceScheduler::prepare_sequence_mutation(llama_seq_id seq_id) {
+    invoke([this, seq_id](llama_context *) {
+        if (!active_sequences_.count(seq_id)) {
+            throw std::runtime_error("cannot mutate inactive sequence");
+        }
+        // Split exact-state identity before an external inject changes KV. If a
+        // sibling generates before the inject command arrives, this can only
+        // miss a safe coalescing opportunity; it can never merge unlike states.
+        sequence_families_[seq_id] = next_family_++;
+        logits_rows_[seq_id] = -1;
+        boundary_tokens_[seq_id] = LLAMA_TOKEN_NULL;
+    });
+}
+
 std::optional<llama_seq_id> InferenceScheduler::fork_sequence(
     llama_seq_id source, llama_token boundary_token) {
     return invoke([this, source, boundary_token](llama_context * ctx) -> std::optional<llama_seq_id> {
@@ -144,23 +159,29 @@ std::future<SchedulerStepResult> InferenceScheduler::step(
 }
 
 void InferenceScheduler::rewind(
-    llama_seq_id seq_id, llama_pos generation_start, llama_token /*boundary_token*/) {
-    invoke([this, seq_id, generation_start](llama_context * ctx) {
+    llama_seq_id seq_id, llama_pos generation_start, llama_token boundary_token) {
+    invoke_preserving_logits([this, seq_id, generation_start, boundary_token](llama_context * ctx) {
         llama_memory_seq_rm(llama_get_memory(ctx), seq_id, generation_start, -1);
+        // Rewind restores a prior state but the scheduler does not retain that
+        // historical identity. Assign a fresh conservative identity.
+        sequence_families_[seq_id] = next_family_++;
+        boundary_tokens_[seq_id] = boundary_token;
         logits_rows_[seq_id] = -1;
     });
 }
 
 SchedulerDiagnostics InferenceScheduler::diagnostics() {
-    return invoke([this](llama_context *) { return diagnostics_; });
+    return invoke_preserving_logits([this](llama_context *) { return diagnostics_; });
 }
 
 int InferenceScheduler::active_sequences() {
-    return invoke([this](llama_context *) { return static_cast<int>(active_sequences_.size()); });
+    return invoke_preserving_logits(
+        [this](llama_context *) { return static_cast<int>(active_sequences_.size()); });
 }
 
 size_t InferenceScheduler::logical_allocated_bytes() {
-    return invoke([this](llama_context *) { return logical_cells_ * bytes_per_cell_; });
+    return invoke_preserving_logits(
+        [this](llama_context *) { return logical_cells_ * bytes_per_cell_; });
 }
 
 void InferenceScheduler::worker_loop() {
@@ -329,18 +350,26 @@ void InferenceScheduler::process_steps(std::vector<std::shared_ptr<StepRequest>>
     }
 
     llama_batch batch = llama_batch_init(static_cast<int32_t>(sampled.size()), 0, max_sequences_);
-    std::map<std::pair<llama_pos, llama_token>, int> shared_rows;
+    using StateKey = std::tuple<uint64_t, llama_pos, llama_token>;
+    std::map<StateKey, int> shared_rows;
+    std::map<int, uint64_t> next_row_families;
     std::vector<std::pair<llama_seq_id, int>> decoded_sequence_rows;
     for (const auto & item : sampled) {
         if (item.eog) continue;
         const llama_pos position =
             llama_memory_seq_pos_max(llama_get_memory(ctx_), item.request->seq_id) + 1;
-        const auto key = std::make_pair(position, item.token);
+        // Equal position/token is safe to coalesce only when scheduler lineage
+        // proves the complete logical KV state is identical. Family identity is
+        // shared solely by fork or a previous coalesced transition, and is split
+        // before inject, rewind, restore, or a different sampled transition.
+        const StateKey key{
+            sequence_families_.at(item.request->seq_id), position, item.token};
         auto row_it = shared_rows.find(key);
         int row;
         if (row_it == shared_rows.end()) {
             row = batch.n_tokens++;
-            shared_rows[key] = row;
+            shared_rows.emplace(key, row);
+            next_row_families[row] = next_family_++;
             batch.token[row] = item.token;
             batch.pos[row] = position;
             batch.n_seq_id[row] = 0;
@@ -363,6 +392,7 @@ void InferenceScheduler::process_steps(std::vector<std::shared_ptr<StepRequest>>
         }
         for (const auto & [sequence, row] : decoded_sequence_rows) {
             logits_rows_[sequence] = row;
+            sequence_families_[sequence] = next_row_families.at(row);
         }
         logical_cells_ += batch.n_tokens;
     }

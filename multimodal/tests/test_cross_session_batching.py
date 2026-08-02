@@ -178,6 +178,49 @@ def test_six_jobs_share_decode_and_match_greedy_baseline(base, make_session):
             _delete(base, sid)
 
 
+def test_divergent_histories_never_merge_equal_position_token_rows(base, make_session):
+    """Equal `(position, token)` is insufficient proof that KV ancestry matches.
+
+    The one-token grammar forces all jobs to sample the same token at the same
+    position after different one-token histories. Besides one boundary-logit
+    initialization row per sequence, the scheduler must decode one generated row
+    per sequence—not one row carrying unrelated sequence IDs.
+    """
+    sessions = [make_session() for _ in range(N_SEQUENCES)]
+    injects = [
+        _inject(base, sid, marker)
+        for sid, marker in zip(sessions, ("A", "B", "C", "D", "E", "F"), strict=True)
+    ]
+    assert len({result["cache_size"] for result in injects}) == 1
+    assert len({result["tokens_injected"] for result in injects}) == 1
+
+    barrier = threading.Barrier(N_SEQUENCES)
+    telemetry_before = _batching(base)
+
+    def run(sid: str) -> dict:
+        barrier.wait(timeout=30)
+        return _generate(base, sid, max_tokens=1, grammar='root ::= "X"')
+
+    with ThreadPoolExecutor(max_workers=N_SEQUENCES) as executor:
+        results = list(executor.map(run, sessions))
+
+    assert all(result["n_tokens"] == 1 for result in results)
+    assert len({tuple(result["tokens"]) for result in results}) == 1
+    telemetry_after = _batching(base)
+    co_scheduled_widths = [
+        width
+        for width in range(2, N_SEQUENCES + 1)
+        if _hist_delta(telemetry_before, telemetry_after, width) >= 2
+    ]
+    assert co_scheduled_widths, (telemetry_before, telemetry_after)
+    decoded_delta = telemetry_after["decoded_tokens"] - telemetry_before["decoded_tokens"]
+    expected_rows = N_SEQUENCES + sum(result["n_tokens"] for result in results)
+    assert decoded_delta == expected_rows, (
+        "unrelated sequences were merged into one decode row solely because "
+        f"position/token matched: expected {expected_rows} rows, observed {decoded_delta}"
+    )
+
+
 def test_cancel_one_of_six_leaves_other_jobs_byte_identical(base, make_session):
     source = make_session()
     _inject(

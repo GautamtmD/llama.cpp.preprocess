@@ -53,6 +53,12 @@ public:
     }
 
     template <typename Fn>
+    auto invoke_preserving_logits(Fn && fn)
+        -> decltype(fn(static_cast<llama_context *>(nullptr))) {
+        return invoke_impl<false, false>(std::forward<Fn>(fn));
+    }
+
+    template <typename Fn>
     auto invoke_invalidating_logits(Fn && fn)
         -> decltype(fn(static_cast<llama_context *>(nullptr))) {
         return invoke_impl<true, false>(std::forward<Fn>(fn));
@@ -72,6 +78,7 @@ public:
 
     int allocate_sequence();
     void release_sequence(llama_seq_id seq_id);
+    void prepare_sequence_mutation(llama_seq_id seq_id);
     std::optional<llama_seq_id> fork_sequence(llama_seq_id source, llama_token boundary_token);
 
     std::future<SchedulerStepResult> step(llama_seq_id seq_id, common_sampler * sampler,
@@ -148,6 +155,8 @@ private:
     std::set<llama_seq_id> free_sequences_;
     std::set<llama_seq_id> active_sequences_;
     std::map<llama_seq_id, int> logits_rows_;
+    // Exact logical-KV-state lineage used to prove row-coalescing safety. IDs
+    // are shared only by fork/safe coalesced transitions and split on mutation.
     std::map<llama_seq_id, uint64_t> sequence_families_;
     std::map<llama_seq_id, llama_token> boundary_tokens_;
     std::set<uint64_t> detached_families_;
