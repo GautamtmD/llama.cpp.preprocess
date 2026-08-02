@@ -120,9 +120,11 @@ Input / trigger:
 - N active sessions/forks with pending generations.
 
 Expected:
-- All N decode in one batched pass; each session sees correct, independent output
-  (sequence isolation — a batched run reproduces each session's standalone
-  greedy output).
+- All N decode in one batched pass; after one bounded cohort-settling window,
+  every cadence waits for each active job to step or finish/cancel. Each session
+  sees correct, independent output. Unconstrained greedy transitions are
+  canonical by exact lineage/EOS policy/generation step, so batched, cancelled,
+  and standalone replays remain byte-identical across GPU batch shapes.
 - Forking within the pooled context uses `llama_memory_seq_cp`: ~0 ms + ~0
   incremental resident GPU memory beyond the fixed pool (vs EUS-2's A':
   ~0.5–0.7 s + ~350 MiB).
@@ -141,8 +143,9 @@ Test:
 - `tests/test_cross_session_batching.py` (single pool, fork latency/memory,
   six-way decode proof and parity, sampler/grammar isolation, capacity reuse,
   same-session 409, cancellation race, divergent-history row isolation,
-  transactional failed initialization, truthful ownership/GPU telemetry, and
-  shared-prefix lifecycle)
+  transactional failed initialization, current-boundary replay, repeated
+  cancellation/output isolation, atomic delete/snapshot races, truthful
+  ownership/GPU telemetry, and shared-prefix lifecycle)
 - `tests/test_context_limits.py` (small-context generation and multimodal
   preflight/retry invariants)
 

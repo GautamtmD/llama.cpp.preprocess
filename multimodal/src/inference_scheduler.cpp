@@ -58,12 +58,25 @@ void InferenceScheduler::enqueue_deferred_command(std::function<void()> command)
 }
 
 void InferenceScheduler::begin_generation() {
-    active_generations_.fetch_add(1, std::memory_order_acq_rel);
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (active_generations_++ == 0) generation_cohort_started_ = false;
+    }
+    cv_.notify_one();
 }
 
 void InferenceScheduler::end_generation() {
-    const int previous = active_generations_.fetch_sub(1, std::memory_order_acq_rel);
-    if (previous == 1) cv_.notify_one();
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (active_generations_ <= 0) {
+            throw std::logic_error("generation accounting underflow");
+        }
+        --active_generations_;
+        if (active_generations_ == 0) generation_cohort_started_ = false;
+    }
+    // A pending cadence may now be complete because one job finished or
+    // observed cancellation instead of submitting another step.
+    cv_.notify_one();
 }
 
 void InferenceScheduler::invalidate_logits() {
@@ -99,18 +112,64 @@ void InferenceScheduler::release_sequence(llama_seq_id seq_id) {
     });
 }
 
-void InferenceScheduler::prepare_sequence_mutation(llama_seq_id seq_id) {
-    invoke([this, seq_id](llama_context *) {
+uint64_t InferenceScheduler::prepare_sequence_mutation(llama_seq_id seq_id) {
+    return invoke([this, seq_id](llama_context *) {
         if (!active_sequences_.count(seq_id)) {
             throw std::runtime_error("cannot mutate inactive sequence");
         }
+        const uint64_t parent_family = sequence_families_[seq_id];
         // Split exact-state identity before an external inject changes KV. If a
         // sibling generates before the inject command arrives, this can only
         // miss a safe coalescing opportunity; it can never merge unlike states.
         sequence_families_[seq_id] = next_family_++;
         logits_rows_[seq_id] = -1;
         boundary_tokens_[seq_id] = LLAMA_TOKEN_NULL;
+        return parent_family;
     });
+}
+
+void InferenceScheduler::complete_text_mutation(
+    llama_seq_id seq_id, uint64_t parent_family, llama_pos start_position,
+    const std::vector<llama_token> & tokens) {
+    invoke_preserving_logits([this, seq_id, parent_family, start_position, tokens](
+                                 llama_context *) {
+        if (!active_sequences_.count(seq_id)) {
+            throw std::runtime_error("cannot complete mutation for inactive sequence");
+        }
+        uint64_t family = parent_family;
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            const auto key = std::tuple{
+                family, start_position + static_cast<llama_pos>(i), tokens[i]};
+            auto [transition, inserted] = transition_families_.emplace(key, next_family_);
+            if (inserted) ++next_family_;
+            family = transition->second;
+        }
+        sequence_families_[seq_id] = family;
+        if (!tokens.empty()) boundary_tokens_[seq_id] = tokens.back();
+        logits_rows_[seq_id] = -1;
+    });
+}
+
+void InferenceScheduler::complete_opaque_mutation(
+    llama_seq_id seq_id, llama_token boundary_token) {
+    invoke_preserving_logits([this, seq_id, boundary_token](llama_context *) {
+        if (!active_sequences_.count(seq_id)) {
+            throw std::runtime_error("cannot complete mutation for inactive sequence");
+        }
+        boundary_tokens_[seq_id] = boundary_token;
+        logits_rows_[seq_id] = -1;
+    });
+}
+
+void InferenceScheduler::abort_sequence_mutation(
+    llama_seq_id seq_id, uint64_t parent_family, llama_token boundary_token) {
+    invoke_preserving_logits(
+        [this, seq_id, parent_family, boundary_token](llama_context *) {
+            if (!active_sequences_.count(seq_id)) return;
+            sequence_families_[seq_id] = parent_family;
+            boundary_tokens_[seq_id] = boundary_token;
+            logits_rows_[seq_id] = -1;
+        });
 }
 
 std::optional<llama_seq_id> InferenceScheduler::fork_sequence(
@@ -127,11 +186,13 @@ std::optional<llama_seq_id> InferenceScheduler::fork_sequence(
         active_sequences_.insert(destination);
         logits_rows_[destination] = -1;
         uint64_t fork_family = sequence_families_[source];
-        if (detached_families_.count(fork_family) || boundary_tokens_[source] != boundary_token) {
+        if (boundary_tokens_[source] != boundary_token) {
             fork_family = next_family_++;
             sequence_families_[source] = fork_family;
-            detached_families_.erase(fork_family);
         }
+        // Detachment is physical logits ownership, not a logical-state change.
+        // Reusing the exact family preserves canonical greedy transitions.
+        detached_families_.erase(fork_family);
         sequence_families_[destination] = fork_family;
         boundary_tokens_[source] = boundary_token;
         boundary_tokens_[destination] = boundary_token;
@@ -199,12 +260,26 @@ bool InferenceScheduler::probe_sequence_capabilities(std::string & error) {
     });
 }
 
+SchedulerGenerationCheckpoint InferenceScheduler::generation_checkpoint(llama_seq_id seq_id) {
+    return invoke_preserving_logits([this, seq_id](llama_context * ctx) {
+        if (!active_sequences_.count(seq_id)) {
+            throw std::runtime_error("cannot checkpoint inactive sequence");
+        }
+        return SchedulerGenerationCheckpoint{
+            llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id),
+            sequence_families_.at(seq_id)};
+    });
+}
+
 std::future<SchedulerStepResult> InferenceScheduler::step(
-    llama_seq_id seq_id, common_sampler * sampler, llama_token boundary_token) {
+    llama_seq_id seq_id, common_sampler * sampler, llama_token boundary_token,
+    uint8_t canonical_greedy_policy, uint32_t generation_step) {
     auto request = std::make_shared<StepRequest>();
     request->seq_id = seq_id;
     request->sampler = sampler;
     request->boundary_token = boundary_token;
+    request->canonical_greedy_policy = canonical_greedy_policy;
+    request->generation_step = generation_step;
     auto future = request->promise.get_future();
     {
         std::lock_guard<std::mutex> lock(mu_);
@@ -219,19 +294,45 @@ std::future<SchedulerStepResult> InferenceScheduler::step(
 }
 
 void InferenceScheduler::rewind(
-    llama_seq_id seq_id, llama_pos generation_start, llama_token boundary_token) {
-    invoke_preserving_logits([this, seq_id, generation_start, boundary_token](llama_context * ctx) {
-        llama_memory_seq_rm(llama_get_memory(ctx), seq_id, generation_start, -1);
-        // Rewind restores a prior state but the scheduler does not retain that
-        // historical identity. Assign a fresh conservative identity.
-        sequence_families_[seq_id] = next_family_++;
-        boundary_tokens_[seq_id] = boundary_token;
-        logits_rows_[seq_id] = -1;
-    });
+    llama_seq_id seq_id, llama_pos generation_start, llama_token boundary_token,
+    uint64_t generation_start_family) {
+    invoke_preserving_logits(
+        [this, seq_id, generation_start, boundary_token,
+         generation_start_family](llama_context * ctx) {
+            llama_memory_t memory = llama_get_memory(ctx);
+            auto representative = std::find_if(
+                sequence_families_.begin(), sequence_families_.end(),
+                [seq_id, generation_start_family](const auto & entry) {
+                    return entry.first != seq_id && entry.second == generation_start_family;
+                });
+            if (representative != sequence_families_.end()) {
+                // Re-alias the exact checkpoint owner instead of depending on
+                // shared-cell suffix removal to reconstruct historical layout.
+                llama_memory_seq_rm(memory, seq_id, -1, -1);
+                llama_memory_seq_cp(memory, representative->first, seq_id, 0, -1);
+            } else {
+                llama_memory_seq_rm(memory, seq_id, generation_start, -1);
+            }
+            // The checkpoint retains exact pre-generation lineage. Rejoining it
+            // lets a cancelled sequence recreate the same canonical boundary
+            // row as untouched family members instead of a batch-shape-dependent
+            // singleton row.
+            sequence_families_[seq_id] = generation_start_family;
+            detached_families_.erase(generation_start_family);
+            boundary_tokens_[seq_id] = boundary_token;
+            logits_rows_[seq_id] = -1;
+        });
 }
 
 SchedulerDiagnostics InferenceScheduler::diagnostics() {
     return invoke_preserving_logits([this](llama_context *) { return diagnostics_; });
+}
+
+llama_token InferenceScheduler::boundary_token(llama_seq_id seq_id) {
+    return invoke_preserving_logits([this, seq_id](llama_context *) {
+        auto boundary = boundary_tokens_.find(seq_id);
+        return boundary == boundary_tokens_.end() ? LLAMA_TOKEN_NULL : boundary->second;
+    });
 }
 
 int InferenceScheduler::active_sequences() {
@@ -260,7 +361,7 @@ void InferenceScheduler::worker_loop() {
             std::unique_lock<std::mutex> lock(mu_);
             cv_.wait(lock, [this] {
                 return stopping_ || !commands_.empty() || !steps_.empty() ||
-                       (!deferred_commands_.empty() && active_generations_.load() == 0);
+                       (!deferred_commands_.empty() && active_generations_ == 0);
             });
             if (stopping_ && commands_.empty() && deferred_commands_.empty() && steps_.empty()) {
                 return;
@@ -269,8 +370,20 @@ void InferenceScheduler::worker_loop() {
                 command = std::move(commands_.front());
                 commands_.pop_front();
             } else if (!steps_.empty()) {
-                const auto deadline = std::chrono::steady_clock::now() + batching_window_;
-                cv_.wait_until(lock, deadline, [this] { return stopping_ || !commands_.empty(); });
+                if (!generation_cohort_started_) {
+                    const auto deadline = std::chrono::steady_clock::now() + batching_window_;
+                    cv_.wait_until(
+                        lock, deadline, [this] { return stopping_ || !commands_.empty(); });
+                }
+                if (commands_.empty()) {
+                    // Once a generation cohort is visible, never drain a partial
+                    // cadence. A job that stops/cancels decrements the target and
+                    // wakes this wait; a continuing job supplies exactly one step.
+                    cv_.wait(lock, [this] {
+                        return stopping_ || !commands_.empty() ||
+                               steps_.size() >= static_cast<size_t>(active_generations_);
+                    });
+                }
                 if (!commands_.empty()) {
                     command = std::move(commands_.front());
                     commands_.pop_front();
@@ -286,9 +399,10 @@ void InferenceScheduler::worker_loop() {
                                 {LLAMA_TOKEN_NULL, false, 0, "duplicate pending sequence step"});
                         }
                     }
+                    generation_cohort_started_ = active_generations_ > 0;
                 }
             } else if (!deferred_commands_.empty() &&
-                       (stopping_ || active_generations_.load() == 0)) {
+                       (stopping_ || active_generations_ == 0)) {
                 command = std::move(deferred_commands_.front());
                 deferred_commands_.pop_front();
             }
@@ -324,6 +438,7 @@ bool InferenceScheduler::initialize_logits(
         llama_seq_id seq_id;
         llama_pos position;
         llama_token token;
+        uint64_t family;
         bool remove_boundary;
     };
 
@@ -349,7 +464,9 @@ bool InferenceScheduler::initialize_logits(
             error = "sequence ends in media embeddings; inject text before generation";
             return false;
         }
-        plans.push_back({request->seq_id, position, token, remove_boundary});
+        plans.push_back({
+            request->seq_id, position, token,
+            sequence_families_.at(request->seq_id), remove_boundary});
     }
 
     std::vector<const InitializationPlan *> removed;
@@ -392,13 +509,20 @@ bool InferenceScheduler::initialize_logits(
     llama_batch batch = llama_batch_init(static_cast<int32_t>(plans.size()), 0, max_sequences_);
     std::vector<std::pair<llama_seq_id, int>> sequence_rows;
     sequence_rows.reserve(plans.size());
+    using InitializationKey = std::tuple<uint64_t, llama_pos, llama_token>;
+    std::map<InitializationKey, int> shared_rows;
     for (const auto & plan : plans) {
-        const int row = batch.n_tokens++;
-        batch.token[row] = plan.token;
-        batch.pos[row] = plan.position;
-        batch.n_seq_id[row] = 1;
-        batch.seq_id[row][0] = plan.seq_id;
-        batch.logits[row] = 1;
+        const InitializationKey key{plan.family, plan.position, plan.token};
+        auto [row_it, inserted] = shared_rows.emplace(key, batch.n_tokens);
+        const int row = row_it->second;
+        if (inserted) {
+            ++batch.n_tokens;
+            batch.token[row] = plan.token;
+            batch.pos[row] = plan.position;
+            batch.n_seq_id[row] = 0;
+            batch.logits[row] = 1;
+        }
+        batch.seq_id[row][batch.n_seq_id[row]++] = plan.seq_id;
         sequence_rows.push_back({plan.seq_id, row});
     }
 
@@ -446,6 +570,8 @@ void InferenceScheduler::process_steps(std::vector<std::shared_ptr<StepRequest>>
             sibling->seq_id = sequence;
             sibling->sampler = nullptr;
             sibling->boundary_token = boundary_tokens_[sequence];
+            sibling->canonical_greedy_policy = 0;
+            sibling->generation_step = 0;
             initialization.push_back(std::move(sibling));
         }
         if (!initialize_logits(initialization, error)) {
@@ -470,7 +596,22 @@ void InferenceScheduler::process_steps(std::vector<std::shared_ptr<StepRequest>>
             request->promise.set_value({LLAMA_TOKEN_NULL, false, 0, "missing sequence logits"});
             continue;
         }
-        const llama_token token = common_sampler_sample(request->sampler, ctx_, row);
+        llama_token token = LLAMA_TOKEN_NULL;
+        const auto canonical_key = std::tuple{
+            sequence_families_.at(request->seq_id), request->canonical_greedy_policy,
+            request->generation_step};
+        auto canonical = canonical_greedy_tokens_.end();
+        if (request->canonical_greedy_policy != 0) {
+            canonical = canonical_greedy_tokens_.find(canonical_key);
+        }
+        if (canonical != canonical_greedy_tokens_.end()) {
+            token = canonical->second;
+        } else {
+            token = common_sampler_sample(request->sampler, ctx_, row);
+            if (request->canonical_greedy_policy != 0) {
+                canonical_greedy_tokens_[canonical_key] = token;
+            }
+        }
         sampled.push_back({request, token, llama_vocab_is_eog(vocab_, token)});
     }
 
@@ -494,7 +635,10 @@ void InferenceScheduler::process_steps(std::vector<std::shared_ptr<StepRequest>>
         if (row_it == shared_rows.end()) {
             row = batch.n_tokens++;
             shared_rows.emplace(key, row);
-            next_row_families[row] = next_family_++;
+            auto [transition, transition_inserted] = transition_families_.emplace(
+                key, next_family_);
+            if (transition_inserted) ++next_family_;
+            next_row_families[row] = transition->second;
             batch.token[row] = item.token;
             batch.pos[row] = position;
             batch.n_seq_id[row] = 0;
@@ -518,6 +662,7 @@ void InferenceScheduler::process_steps(std::vector<std::shared_ptr<StepRequest>>
         for (const auto & [sequence, row] : decoded_sequence_rows) {
             logits_rows_[sequence] = row;
             sequence_families_[sequence] = next_row_families.at(row);
+            boundary_tokens_[sequence] = batch.token[row];
         }
     }
     llama_batch_free(batch);

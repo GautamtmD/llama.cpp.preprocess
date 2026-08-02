@@ -122,6 +122,9 @@ def _start_blocking_generation(base, sid):
 
     thread = threading.Thread(target=generate, daemon=True)
     thread.start()
+    # Let the mutating request acquire its atomic busy reservation before the
+    # status probe takes a short-lived read reservation.
+    time.sleep(0.05)
     _wait_busy(base, sid)
     return thread, outcome
 

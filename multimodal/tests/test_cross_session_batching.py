@@ -343,7 +343,73 @@ def test_failed_media_logits_initialization_does_not_truncate_valid_sessions(bas
     assert exercised_shared_batch, "could not co-schedule valid and media-ending initialization"
 
 
-def test_cancel_one_of_six_leaves_other_jobs_byte_identical(base, make_session):
+def test_completed_coalesced_siblings_keep_current_boundary_when_one_resumes(base, make_session):
+    source = make_session()
+    _inject(
+        base,
+        source,
+        "Continue this exact deterministic sequence: 1 2 3 4 5 6 7 8 9. ",
+    )
+    siblings = [_fork(base, source)["session_id"] for _ in range(3)]
+    barrier = threading.Barrier(3)
+    telemetry_before = _batching(base)
+
+    def generate_initial(sid: str) -> dict:
+        barrier.wait(timeout=30)
+        return _generate(base, sid, max_tokens=8)
+
+    control = None
+    try:
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            initial = list(executor.map(generate_initial, siblings))
+        assert initial[0]["tokens"] == initial[1]["tokens"] == initial[2]["tokens"]
+        telemetry_after = _batching(base)
+        assert _hist_delta(telemetry_before, telemetry_after, 3) >= 8
+
+        control = _fork(base, siblings[0])["session_id"]
+        invalidator = make_session()
+        _inject(base, invalidator, "Invalidate unrelated pooled logits. ")
+
+        idle_before = {
+            sid: requests.get(f"{base}/sessions/{sid}", timeout=30).json()["cache_size"]
+            for sid in (siblings[1], control)
+        }
+        _generate(base, siblings[0], max_tokens=1)
+        idle_status = {
+            sid: requests.get(f"{base}/sessions/{sid}", timeout=30).json()
+            for sid in (siblings[1], control)
+        }
+        idle_after = {sid: status["cache_size"] for sid, status in idle_status.items()}
+        assert idle_after == idle_before
+        for status in idle_status.values():
+            assert status["boundary_token"] == initial[0]["tokens"][-1]
+
+        suffix = " Continue from the exact cached sequence. "
+        _inject(base, siblings[1], suffix)
+        _inject(base, control, suffix)
+        comparison_barrier = threading.Barrier(2)
+
+        def generate_comparison(sid: str) -> dict:
+            comparison_barrier.wait(timeout=30)
+            return _generate(base, sid, max_tokens=16)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            observed_future = executor.submit(generate_comparison, siblings[1])
+            expected_future = executor.submit(generate_comparison, control)
+            observed = observed_future.result(timeout=30)
+            expected = expected_future.result(timeout=30)
+        assert observed["tokens"] == expected["tokens"]
+        assert observed["text"] == expected["text"]
+        assert observed["cache_size"] == expected["cache_size"]
+    finally:
+        for sid in siblings:
+            _delete(base, sid)
+        if control is not None:
+            _delete(base, control)
+
+
+@pytest.mark.parametrize("_attempt", range(3))
+def test_cancel_one_of_six_leaves_other_jobs_byte_identical(base, make_session, _attempt):
     source = make_session()
     _inject(
         base,
@@ -463,6 +529,75 @@ def test_capacity_exhaustion_and_slot_reuse(base):
     finally:
         for sid in created:
             _delete(base, sid)
+
+
+@pytest.mark.parametrize("_attempt", range(12))
+def test_delete_vs_fork_returns_only_linearizable_responses(base, make_session, _attempt):
+    sid = make_session()
+    injected = _inject(base, sid, "Atomic fork reservation sentinel. ")
+    barrier = threading.Barrier(2)
+
+    def fork_now() -> requests.Response:
+        barrier.wait(timeout=30)
+        return _post(base, f"/sessions/{sid}/fork")
+
+    def delete_now() -> requests.Response:
+        barrier.wait(timeout=30)
+        return requests.delete(f"{base}/sessions/{sid}", timeout=30)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        fork_future = executor.submit(fork_now)
+        delete_future = executor.submit(delete_now)
+        forked = fork_future.result(timeout=30)
+        deleted = delete_future.result(timeout=30)
+
+    assert forked.status_code in {200, 404}, forked.text
+    assert deleted.status_code in {200, 409}, deleted.text
+    if forked.status_code == 200:
+        body = forked.json()
+        assert body["cache_size"] == injected["cache_size"]
+        _delete(base, body["session_id"])
+    else:
+        assert forked.json()["error"]
+    if deleted.status_code == 409:
+        assert forked.status_code == 200
+
+
+@pytest.mark.parametrize("operation", ["status", "load"])
+@pytest.mark.parametrize("_attempt", range(12))
+def test_delete_vs_live_snapshot_never_reads_released_sequence(
+    base, make_session, operation, _attempt
+):
+    sid = make_session()
+    injected = _inject(base, sid, "Atomic live snapshot sentinel. ")
+    barrier = threading.Barrier(2)
+
+    def inspect_now() -> requests.Response:
+        barrier.wait(timeout=30)
+        if operation == "status":
+            return requests.get(f"{base}/sessions/{sid}", timeout=30)
+        return _post(base, f"/sessions/{sid}/load")
+
+    def delete_now() -> requests.Response:
+        barrier.wait(timeout=30)
+        return requests.delete(f"{base}/sessions/{sid}", timeout=30)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        inspect_future = executor.submit(inspect_now)
+        delete_future = executor.submit(delete_now)
+        inspected = inspect_future.result(timeout=30)
+        deleted = delete_future.result(timeout=30)
+
+    assert inspected.status_code in {200, 404}, inspected.text
+    assert deleted.status_code in {200, 409}, deleted.text
+    if inspected.status_code == 200:
+        body = inspected.json()
+        assert body["session_id"] == sid
+        assert body["cache_size"] == injected["cache_size"]
+    else:
+        assert inspected.json()["error"]
+    if deleted.status_code == 409:
+        assert inspected.status_code == 200
 
 
 def test_same_session_conflict_is_409(base, make_session):

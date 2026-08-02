@@ -187,6 +187,8 @@ struct LiveSession {
     llama_seq_id seq_id = -1;
     llama_token last_token = LLAMA_TOKEN_NULL;
     bool busy = false;
+    uint32_t readers = 0;
+    bool releasing = false;
 };
 
 // One model and one explicitly sized pooled context. External sessions map to
@@ -214,6 +216,7 @@ struct AppState {
     size_t model_gpu_bytes = 0;
     std::unique_ptr<InferenceScheduler> scheduler;
     std::mutex mu;
+    std::condition_variable sessions_cv;
     std::map<int64_t, LiveSession> sessions;
     // Sessions parked in host RAM (KV offloaded from VRAM). A session id is in
     // exactly one of `sessions` (live, VRAM) or `offloaded_sessions` (RAM).
@@ -234,12 +237,13 @@ struct GenerationRegistration {
     }
 
     bool finish(llama_seq_id seq_id, llama_pos p_start, llama_token last_token,
-                bool disconnected, double & rewind_s) {
+                uint64_t generation_start_family, bool disconnected, double & rewind_s) {
         std::lock_guard<std::mutex> lk(app.generations_mu);
         const bool must_rewind = disconnected || cancelled->load(std::memory_order_relaxed);
         if (must_rewind) {
             const double rewind_start = now_s();
-            app.scheduler->rewind(seq_id, p_start, last_token);
+            app.scheduler->rewind(
+                seq_id, p_start, last_token, generation_start_family);
             rewind_s = now_s() - rewind_start;
         }
         const auto it = app.active_generations.find(sid);
@@ -406,16 +410,6 @@ stop_match flush_stream_buffer(std::string & buf, const std::vector<std::string>
     return {false};
 }
 
-// Find a session by id under the lock. Returns nullptr if absent. Does NOT hold
-// the lock on return (each session's context is single-threaded; the caller
-// drives generation without the global lock).
-std::optional<LiveSession> lookup_session(AppState & app, int64_t n) {
-    std::lock_guard<std::mutex> lk(app.mu);
-    auto it = (n > 0) ? app.sessions.find(n) : app.sessions.end();
-    if (it == app.sessions.end()) return std::nullopt;
-    return it->second;
-}
-
 int64_t register_session(AppState & app, llama_seq_id seq_id,
                          llama_token last_token = LLAMA_TOKEN_NULL) {
     const int64_t n = app.next_id.fetch_add(1);
@@ -430,50 +424,53 @@ void set_last_token(AppState & app, int64_t n, llama_token token) {
     if (it != app.sessions.end()) it->second.last_token = token;
 }
 
-llama_token get_last_token(AppState & app, int64_t n) {
-    auto session = lookup_session(app, n);
-    return session ? session->last_token : LLAMA_TOKEN_NULL;
-}
-
-bool is_offloaded(AppState & app, int64_t n) {
+std::optional<LiveSession> reserve_live_session(
+    AppState & app, int64_t sid_num, httplib::Response & res,
+    bool will_release_sequence = false) {
     std::lock_guard<std::mutex> lk(app.mu);
-    return app.offloaded_sessions.count(n) > 0;
-}
-
-std::optional<LiveSession> require_live_session(AppState & app, int64_t sid_num,
-                                                httplib::Response & res) {
-    auto session = lookup_session(app, sid_num);
-    if (!session) {
-        if (is_offloaded(app, sid_num)) {
+    auto live = (sid_num > 0) ? app.sessions.find(sid_num) : app.sessions.end();
+    if (live == app.sessions.end()) {
+        if (app.offloaded_sessions.count(sid_num) > 0) {
             res.status = 409;
-            res.set_content(error_body("session is offloaded; POST /sessions/{id}/load first", 409).dump(),
-                            "application/json");
+            res.set_content(error_body(
+                "session is offloaded; POST /sessions/{id}/load first", 409).dump(),
+                "application/json");
         } else {
             res.status = 404;
             res.set_content(error_body("unknown session", 404).dump(), "application/json");
         }
+        return std::nullopt;
     }
-    return session;
-}
-
-bool mark_session_busy(AppState & app, int64_t n, httplib::Response & res) {
-    std::lock_guard<std::mutex> lk(app.mu);
-    auto it = app.sessions.find(n);
-    if (it == app.sessions.end()) return false;
-    if (it->second.busy) {
+    if (live->second.busy || live->second.readers > 0) {
         res.status = 409;
         res.set_content(error_body("session already has an active operation", 409).dump(),
                         "application/json");
-        return false;
+        return std::nullopt;
     }
-    it->second.busy = true;
-    return true;
+    live->second.busy = true;
+    live->second.releasing = will_release_sequence;
+    return live->second;
 }
 
 void clear_session_busy(AppState & app, int64_t n) {
-    std::lock_guard<std::mutex> lk(app.mu);
-    auto it = app.sessions.find(n);
-    if (it != app.sessions.end()) it->second.busy = false;
+    {
+        std::lock_guard<std::mutex> lk(app.mu);
+        auto it = app.sessions.find(n);
+        if (it != app.sessions.end()) {
+            it->second.busy = false;
+            it->second.releasing = false;
+        }
+    }
+    app.sessions_cv.notify_all();
+}
+
+void release_live_reader(AppState & app, int64_t n) {
+    {
+        std::lock_guard<std::mutex> lk(app.mu);
+        auto it = app.sessions.find(n);
+        if (it != app.sessions.end() && it->second.readers > 0) --it->second.readers;
+    }
+    app.sessions_cv.notify_all();
 }
 
 struct BusyGuard {
@@ -485,6 +482,34 @@ struct BusyGuard {
     BusyGuard(const BusyGuard &) = delete;
     BusyGuard & operator=(const BusyGuard &) = delete;
     ~BusyGuard() { if (active) clear_session_busy(app, session); }
+};
+
+struct LiveReadGuard {
+    AppState & app;
+    int64_t session;
+    LiveReadGuard(AppState & app, int64_t session) : app(app), session(session) {}
+    LiveReadGuard(const LiveReadGuard &) = delete;
+    LiveReadGuard & operator=(const LiveReadGuard &) = delete;
+    ~LiveReadGuard() { release_live_reader(app, session); }
+};
+
+struct LiveReadersGuard {
+    AppState & app;
+    std::vector<int64_t> sessions;
+    LiveReadersGuard(AppState & app, std::vector<int64_t> sessions)
+        : app(app), sessions(std::move(sessions)) {}
+    LiveReadersGuard(const LiveReadersGuard &) = delete;
+    LiveReadersGuard & operator=(const LiveReadersGuard &) = delete;
+    ~LiveReadersGuard() {
+        {
+            std::lock_guard<std::mutex> lk(app.mu);
+            for (int64_t session : sessions) {
+                auto it = app.sessions.find(session);
+                if (it != app.sessions.end() && it->second.readers > 0) --it->second.readers;
+            }
+        }
+        app.sessions_cv.notify_all();
+    }
 };
 
 struct SchedulerGenerationGuard {
@@ -516,9 +541,9 @@ GenResult run_generation(
 ) {
     GenResult r;
     SchedulerGenerationGuard scheduler_generation{*app.scheduler};
-    const llama_pos pmax = app.scheduler->invoke_preserving_logits([seq_id](llama_context * ctx) {
-        return llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id);
-    });
+    const SchedulerGenerationCheckpoint checkpoint =
+        app.scheduler->generation_checkpoint(seq_id);
+    const llama_pos pmax = checkpoint.position;
     const llama_pos p_start = pmax < 0 ? 1 : pmax + 1;
     r.cache_size = pmax < 0 ? 0 : pmax + 1;
     llama_token boundary_token = rewind_token;
@@ -591,6 +616,12 @@ GenResult run_generation(
     }
 
     common_sampler * smpl = common_sampler_init(app.model, sparams);
+    const bool canonical_greedy =
+        p.temp <= 0.0f && p.grammar.empty() && !p.response_format.is_object() &&
+        (!p.tools.is_array() || p.tools.empty()) &&
+        (!p.sampling.is_object() || p.sampling.empty());
+    const uint8_t canonical_greedy_policy =
+        canonical_greedy ? (p.ignore_eos ? 2 : 1) : 0;
     const int n_ctx = app.n_ctx_per_session;
     const double t0 = now_s();
     bool keep_going = true;
@@ -635,7 +666,9 @@ GenResult run_generation(
                 r.error = "session context full";
                 break;
             }
-            auto step_result = app.scheduler->step(seq_id, smpl, boundary_token).get();
+            auto step_result = app.scheduler->step(
+                seq_id, smpl, boundary_token, canonical_greedy_policy,
+                static_cast<uint32_t>(step)).get();
             if (!step_result.error.empty()) { r.error = step_result.error; break; }
             if (step_result.eog) break;
             llama_token id = step_result.token;
@@ -683,7 +716,9 @@ GenResult run_generation(
                 r.error = "session context full";
                 break;
             }
-            auto step_result = app.scheduler->step(seq_id, smpl, boundary_token).get();
+            auto step_result = app.scheduler->step(
+                seq_id, smpl, boundary_token, canonical_greedy_policy,
+                static_cast<uint32_t>(step)).get();
             if (!step_result.error.empty()) { r.error = step_result.error; break; }
             if (step_result.eog) break;
             llama_token id = step_result.token;
@@ -724,7 +759,8 @@ GenResult run_generation(
     }
 
     if (generation) {
-        r.cancelled = generation->finish(seq_id, p_start, rewind_token, r.cancelled, r.rewind_s);
+        r.cancelled = generation->finish(
+            seq_id, p_start, rewind_token, checkpoint.family, r.cancelled, r.rewind_s);
     }
 
     r.cache_size = app.scheduler->invoke_preserving_logits([seq_id](llama_context * ctx) {
@@ -1057,7 +1093,7 @@ int main(int argc, char ** argv) {
         app.scheduler->release_sequence(*warm_fork);
     }
     app.scheduler->release_sequence(warm_seq);
-    app.scheduler->invoke([](llama_context * ctx) { llama_synchronize(ctx); });
+    app.scheduler->invoke_preserving_logits([](llama_context * ctx) { llama_synchronize(ctx); });
     const size_t gpu_free_after_pool = gpu_free_bytes();
     app.pool_footprint_bytes = gpu_free_before_pool > gpu_free_after_pool
         ? gpu_free_before_pool - gpu_free_after_pool : 0;
@@ -1132,9 +1168,8 @@ int main(int argc, char ** argv) {
     svr.Post(R"(/sessions/[^/]+/fork)", [&](const httplib::Request &req, httplib::Response &res) {
         std::string sid = extract_session_id(req.path, "fork");
         const int64_t sid_num = parse_session_id_num(sid);
-        auto src = require_live_session(app, sid_num, res);
+        auto src = reserve_live_session(app, sid_num, res);
         if (!src) return;
-        if (!mark_session_busy(app, sid_num, res)) return;
         BusyGuard busy{app, sid_num, true};
 
         const double t0 = now_s();
@@ -1147,7 +1182,7 @@ int main(int argc, char ** argv) {
         const double dt = now_s() - t0;
 
         const int64_t new_n = register_session(app, *destination, src->last_token);
-        const int dst_size = app.scheduler->invoke([seq = *destination](llama_context * ctx) {
+        const int dst_size = app.scheduler->invoke_preserving_logits([seq = *destination](llama_context * ctx) {
             return llama_memory_seq_pos_max(llama_get_memory(ctx), seq) + 1;
         });
         json body = {
@@ -1164,9 +1199,8 @@ int main(int argc, char ** argv) {
     svr.Post(R"(/sessions/[^/]+/inject)", [&](const httplib::Request &req, httplib::Response &res) {
         std::string sid = extract_session_id(req.path, "inject");
         const int64_t sid_num = parse_session_id_num(sid);
-        auto session = require_live_session(app, sid_num, res);
+        auto session = reserve_live_session(app, sid_num, res);
         if (!session) return;
-        if (!mark_session_busy(app, sid_num, res)) return;
         BusyGuard busy{app, sid_num, true};
         const llama_seq_id seq_id = session->seq_id;
         std::string text;
@@ -1222,7 +1256,7 @@ int main(int argc, char ** argv) {
                                 b64 = b64.substr(comma + 1);
                             }
                             std::string bytes = base64_decode(b64);
-                            mtmd_bitmap * bmp = app.scheduler->invoke([&](llama_context *) {
+                            mtmd_bitmap * bmp = app.scheduler->invoke_preserving_logits([&](llama_context *) {
                                 return bitmap_from_media_bytes(app.mtmd_ctx, bytes);
                             });
                             if (!bmp) {
@@ -1251,7 +1285,7 @@ int main(int argc, char ** argv) {
                                 b64 = b64.substr(comma + 1);
                             }
                             std::string bytes = base64_decode(b64);
-                            mtmd_bitmap * bmp = app.scheduler->invoke([&](llama_context *) {
+                            mtmd_bitmap * bmp = app.scheduler->invoke_preserving_logits([&](llama_context *) {
                                 return bitmap_from_media_bytes(app.mtmd_ctx, bytes);
                             });
                             if (!bmp) {
@@ -1298,7 +1332,8 @@ int main(int argc, char ** argv) {
                 // plain text tokenize+decode below.
                 if (used_multimodal) {
                     double t0 = now_s();
-                    app.scheduler->prepare_sequence_mutation(seq_id);
+                    const uint64_t mutation_parent =
+                        app.scheduler->prepare_sequence_mutation(seq_id);
                     MtmdInjectResult inject_result = app.scheduler->invoke_invalidating_logits([&](llama_context * ctx) {
                         const auto result = mtmd_inject(
                             app.mtmd_ctx, ctx, seq_id, text, bitmaps, app.n_ctx_per_session);
@@ -1307,13 +1342,17 @@ int main(int argc, char ** argv) {
                     });
                     const double dt = now_s() - t0;
                     if (inject_result.status != InjectStatus::ok) {
+                        app.scheduler->abort_sequence_mutation(
+                            seq_id, mutation_parent, session->last_token);
                         res.status = inject_result.status == InjectStatus::context_full ? 409 : 500;
                         const std::string message = res.status == 409
                             ? "session context full" : "mtmd tokenize/decode failed";
                         res.set_content(error_body(message, res.status).dump(), "application/json");
                         return;
                     }
-                    const int new_size = app.scheduler->invoke([seq_id](llama_context * ctx) {
+                    app.scheduler->complete_opaque_mutation(
+                        seq_id, inject_result.last_token);
+                    const int new_size = app.scheduler->invoke_preserving_logits([seq_id](llama_context * ctx) {
                         return llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) + 1;
                     });
                     json body = {
@@ -1366,7 +1405,8 @@ int main(int argc, char ** argv) {
                     return;
                 }
 
-                app.scheduler->prepare_sequence_mutation(seq_id);
+                const uint64_t mutation_parent =
+                    app.scheduler->prepare_sequence_mutation(seq_id);
                 InjectStatus status = app.scheduler->invoke_invalidating_logits([&](llama_context * ctx) {
                     const float * samples = reinterpret_cast<const float *>(bytes.data());
                     mtmd_bitmap * bmp = mtmd_bitmap_init_from_audio(n_samples, samples);
@@ -1426,6 +1466,8 @@ int main(int argc, char ** argv) {
                 });
 
                 if (status != InjectStatus::ok) {
+                    app.scheduler->abort_sequence_mutation(
+                        seq_id, mutation_parent, session->last_token);
                     res.status = status == InjectStatus::context_full ? 409 : 500;
                     const std::string message = res.status == 409
                         ? "session context full" : "failed to decode streaming audio chunk";
@@ -1433,7 +1475,8 @@ int main(int argc, char ** argv) {
                     return;
                 }
 
-                const int new_size = app.scheduler->invoke([seq_id](llama_context * ctx) {
+                app.scheduler->complete_opaque_mutation(seq_id, LLAMA_TOKEN_NULL);
+                const int new_size = app.scheduler->invoke_preserving_logits([seq_id](llama_context * ctx) {
                     return llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) + 1;
                 });
                 json body = {
@@ -1464,7 +1507,7 @@ int main(int argc, char ** argv) {
             res.set_content(error_body("'text' or 'messages' is required", 400).dump(), "application/json");
             return;
         }
-        const int used = app.scheduler->invoke([seq_id](llama_context * ctx) {
+        const int used = app.scheduler->invoke_preserving_logits([seq_id](llama_context * ctx) {
             return llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) + 1;
         });
         const bool is_first = used == 0;
@@ -1489,7 +1532,8 @@ int main(int argc, char ** argv) {
             return;
         }
         const double t0 = now_s();
-        app.scheduler->prepare_sequence_mutation(seq_id);
+        const uint64_t mutation_parent =
+            app.scheduler->prepare_sequence_mutation(seq_id);
         const bool decoded = app.scheduler->invoke_invalidating_logits([&](llama_context * ctx) {
             llama_batch batch = llama_batch_init((int32_t) toks.size(), 0, 1);
             for (int i = 0; i < (int) toks.size(); ++i) {
@@ -1508,13 +1552,16 @@ int main(int argc, char ** argv) {
             return result;
         });
         if (!decoded) {
+            app.scheduler->abort_sequence_mutation(
+                seq_id, mutation_parent, session->last_token);
             res.status = 500;
             res.set_content(error_body("llama_decode failed", 500).dump(), "application/json");
             return;
         }
         const double dt = now_s() - t0;
+        app.scheduler->complete_text_mutation(seq_id, mutation_parent, used, toks);
         if (!toks.empty()) set_last_token(app, sid_num, toks.back());  // for fork logits refresh
-        const int new_size = app.scheduler->invoke([seq_id](llama_context * ctx) {
+        const int new_size = app.scheduler->invoke_preserving_logits([seq_id](llama_context * ctx) {
             return llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) + 1;
         });
         json body = {
@@ -1532,8 +1579,15 @@ int main(int argc, char ** argv) {
     svr.Post(R"(/sessions/[^/]+/cancel)", [&](const httplib::Request &req, httplib::Response &res) {
         const std::string sid = extract_session_id(req.path, "cancel");
         const int64_t sid_num = parse_session_id_num(sid);
-        if (!lookup_session(app, sid_num)) {
-            if (is_offloaded(app, sid_num)) {
+        bool live_exists = false;
+        bool offloaded_exists = false;
+        {
+            std::lock_guard<std::mutex> lk(app.mu);
+            live_exists = app.sessions.count(sid_num) > 0;
+            offloaded_exists = app.offloaded_sessions.count(sid_num) > 0;
+        }
+        if (!live_exists) {
+            if (offloaded_exists) {
                 // No active generation on a parked (RAM) session; cancel is a no-op.
                 res.set_content(json{{"session_id", sid}, {"cancelled", false}}.dump(), "application/json");
                 return;
@@ -1558,8 +1612,9 @@ int main(int argc, char ** argv) {
     svr.Post(R"(/sessions/[^/]+/generate)", [&](const httplib::Request &req, httplib::Response &res) {
         std::string sid = extract_session_id(req.path, "generate");
         const int64_t sid_num = parse_session_id_num(sid);
-        auto session = require_live_session(app, sid_num, res);
+        auto session = reserve_live_session(app, sid_num, res);
         if (!session) return;
+        auto busy = std::make_shared<BusyGuard>(app, sid_num);
         GenParams gp;
         bool stream = false;
         try {
@@ -1610,8 +1665,6 @@ int main(int argc, char ** argv) {
                 return;
             }
         }
-        if (!mark_session_busy(app, sid_num, res)) return;
-        auto busy = std::make_shared<BusyGuard>(app, sid_num);
         const llama_seq_id seq_id = session->seq_id;
         if (gp.max_tokens > 0) {
             const int current_size = app.scheduler->invoke_preserving_logits(
@@ -1700,17 +1753,28 @@ int main(int argc, char ** argv) {
     // shadowed by the {id} regex (cpp-httplib matches in registration order).
     svr.Get("/sessions/usage", [&](const httplib::Request &, httplib::Response &res) {
         std::vector<std::pair<int64_t, llama_seq_id>> live;
+        std::vector<int64_t> live_reader_ids;
         json ram_sessions = json::array();
         size_t ram_total = 0;
         {
-            std::lock_guard<std::mutex> lk(app.mu);
-            for (const auto & [n, session] : app.sessions) live.push_back({n, session.seq_id});
+            std::unique_lock<std::mutex> lk(app.mu);
+            app.sessions_cv.wait(lk, [&] {
+                return std::none_of(
+                    app.sessions.begin(), app.sessions.end(),
+                    [](const auto & entry) { return entry.second.releasing; });
+            });
+            for (auto & [n, session] : app.sessions) {
+                ++session.readers;
+                live.push_back({n, session.seq_id});
+                live_reader_ids.push_back(n);
+            }
             for (const auto & [n, state] : app.offloaded_sessions) {
                 ram_sessions.push_back({{"session_id", make_session_id(n)}, {"state_bytes", state.state_bytes}});
                 ram_total += state.state_bytes;
             }
         }
-        auto live_sizes = app.scheduler->invoke([live](llama_context * ctx) {
+        LiveReadersGuard live_readers{app, std::move(live_reader_ids)};
+        auto live_sizes = app.scheduler->invoke_preserving_logits([live](llama_context * ctx) {
             std::vector<size_t> sizes;
             sizes.reserve(live.size());
             for (const auto & [_, seq] : live) sizes.push_back(llama_state_seq_get_size(ctx, seq));
@@ -1724,7 +1788,7 @@ int main(int argc, char ** argv) {
             vram_total += live_sizes[i];
         }
         const int active = app.scheduler->active_sequences();
-        const uint32_t total_ctx = app.scheduler->invoke([](llama_context * ctx) {
+        const uint32_t total_ctx = app.scheduler->invoke_preserving_logits([](llama_context * ctx) {
             return llama_n_ctx(ctx);
         });
         const SchedulerLogicalUsage logical = app.scheduler->logical_usage();
@@ -1772,30 +1836,48 @@ int main(int argc, char ** argv) {
             return;
         }
         const int64_t sid_num = parse_session_id_num(req.path.substr(prefix.size()));
-        auto live = lookup_session(app, sid_num);
+        std::optional<LiveSession> live;
+        std::optional<json> parked;
+        {
+            std::lock_guard<std::mutex> lk(app.mu);
+            auto live_it = app.sessions.find(sid_num);
+            if (live_it != app.sessions.end()) {
+                if (live_it->second.releasing) {
+                    res.status = 409;
+                    res.set_content(error_body("session already has an active operation", 409).dump(),
+                                    "application/json");
+                    return;
+                }
+                ++live_it->second.readers;
+                live = live_it->second;
+            } else {
+                auto parked_it = app.offloaded_sessions.find(sid_num);
+                if (parked_it != app.offloaded_sessions.end()) {
+                    parked = json{{"session_id", make_session_id(sid_num)}, {"location", "ram"},
+                                  {"cache_size", parked_it->second.cache_size},
+                                  {"state_bytes", parked_it->second.state_bytes},
+                                  {"busy", parked_it->second.loading}};
+                }
+            }
+        }
         if (live) {
-            const auto status = app.scheduler->invoke([seq = live->seq_id](llama_context * ctx) {
-                return std::pair<int, size_t>{
-                    llama_memory_seq_pos_max(llama_get_memory(ctx), seq) + 1,
-                    llama_state_seq_get_size(ctx, seq)};
-            });
+            LiveReadGuard reader{app, sid_num};
+            const auto status = app.scheduler->invoke_preserving_logits(
+                [seq = live->seq_id](llama_context * ctx) {
+                    return std::pair<int, size_t>{
+                        llama_memory_seq_pos_max(llama_get_memory(ctx), seq) + 1,
+                        llama_state_seq_get_size(ctx, seq)};
+                });
+            const llama_token boundary = app.scheduler->boundary_token(live->seq_id);
             res.set_content(json{{"session_id", make_session_id(sid_num)}, {"location", "vram"},
                                  {"cache_size", status.first}, {"state_bytes", status.second},
-                                 {"busy", live->busy}}.dump(),
+                                 {"boundary_token", boundary}, {"busy", live->busy}}.dump(),
                             "application/json");
             return;
         }
-        {
-            std::lock_guard<std::mutex> lk(app.mu);
-            auto parked = app.offloaded_sessions.find(sid_num);
-            if (parked != app.offloaded_sessions.end()) {
-                res.set_content(json{{"session_id", make_session_id(sid_num)}, {"location", "ram"},
-                                     {"cache_size", parked->second.cache_size},
-                                     {"state_bytes", parked->second.state_bytes},
-                                     {"busy", parked->second.loading}}.dump(),
-                                "application/json");
-                return;
-            }
+        if (parked) {
+            res.set_content(parked->dump(), "application/json");
+            return;
         }
         res.status = 404;
         res.set_content(error_body("unknown session", 404).dump(), "application/json");
@@ -1823,9 +1905,8 @@ int main(int argc, char ** argv) {
                 return;
             }
         }
-        auto live = require_live_session(app, sid_num, res);
+        auto live = reserve_live_session(app, sid_num, res, /*will_release_sequence*/ true);
         if (!live) return;
-        if (!mark_session_busy(app, sid_num, res)) return;
         BusyGuard busy{app, sid_num, true};
         const double t0 = now_s();
         OffloadedState state = app.scheduler->invoke_invalidating_logits([seq = live->seq_id, last = live->last_token](llama_context * ctx) {
@@ -1852,40 +1933,49 @@ int main(int argc, char ** argv) {
     svr.Post(R"(/sessions/[^/]+/load)", [&](const httplib::Request &req, httplib::Response &res) {
         const std::string sid = extract_session_id(req.path, "load");
         const int64_t sid_num = parse_session_id_num(sid);
-        if (auto live = lookup_session(app, sid_num)) {
-            if (live->busy) {
-                res.status = 409;
-                res.set_content(error_body("session already has an active operation", 409).dump(),
-                                "application/json");
-                return;
+        std::optional<LiveSession> live;
+        OffloadedState state;
+        {
+            std::lock_guard<std::mutex> lk(app.mu);
+            auto live_it = app.sessions.find(sid_num);
+            if (live_it != app.sessions.end()) {
+                if (live_it->second.busy || live_it->second.readers > 0) {
+                    res.status = 409;
+                    res.set_content(error_body("session already has an active operation", 409).dump(),
+                                    "application/json");
+                    return;
+                }
+                ++live_it->second.readers;
+                live = live_it->second;
+            } else {
+                auto parked = app.offloaded_sessions.find(sid_num);
+                if (parked == app.offloaded_sessions.end()) {
+                    res.status = 404;
+                    res.set_content(error_body("unknown session", 404).dump(), "application/json");
+                    return;
+                }
+                if (parked->second.loading) {
+                    res.status = 409;
+                    res.set_content(error_body("session already has an active operation", 409).dump(),
+                                    "application/json");
+                    return;
+                }
+                parked->second.loading = true;
+                state = parked->second;
             }
-            const auto status = app.scheduler->invoke([seq = live->seq_id](llama_context * ctx) {
-                return std::pair<int, size_t>{
-                    llama_memory_seq_pos_max(llama_get_memory(ctx), seq) + 1,
-                    llama_state_seq_get_size(ctx, seq)};
-            });
+        }
+        if (live) {
+            LiveReadGuard reader{app, sid_num};
+            const auto status = app.scheduler->invoke_preserving_logits(
+                [seq = live->seq_id](llama_context * ctx) {
+                    return std::pair<int, size_t>{
+                        llama_memory_seq_pos_max(llama_get_memory(ctx), seq) + 1,
+                        llama_state_seq_get_size(ctx, seq)};
+                });
             res.set_content(json{{"session_id", sid}, {"location", "vram"},
                                  {"cache_size", status.first}, {"state_bytes", status.second},
                                  {"load_ms", 0}}.dump(), "application/json");
             return;
-        }
-        OffloadedState state;
-        {
-            std::lock_guard<std::mutex> lk(app.mu);
-            auto parked = app.offloaded_sessions.find(sid_num);
-            if (parked == app.offloaded_sessions.end()) {
-                res.status = 404;
-                res.set_content(error_body("unknown session", 404).dump(), "application/json");
-                return;
-            }
-            if (parked->second.loading) {
-                res.status = 409;
-                res.set_content(error_body("session already has an active operation", 409).dump(),
-                                "application/json");
-                return;
-            }
-            parked->second.loading = true;
-            state = parked->second;
         }
         auto clear_loading_reservation = [&] {
             std::lock_guard<std::mutex> lk(app.mu);
@@ -1937,7 +2027,7 @@ int main(int argc, char ** argv) {
             std::lock_guard<std::mutex> lk(app.mu);
             auto live = app.sessions.find(sid_num);
             if (live != app.sessions.end()) {
-                if (live->second.busy) {
+                if (live->second.busy || live->second.readers > 0) {
                     res.status = 409;
                     res.set_content(error_body("session already has an active operation", 409).dump(),
                                     "application/json");
