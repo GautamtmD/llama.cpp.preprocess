@@ -94,6 +94,10 @@ def test_pool_is_single_explicitly_sized_context(base, make_session):
         assert pool["ctx_size_per_sequence"] > 0
         assert pool["ctx_size_total"] >= pool["ctx_size_per_sequence"] * pool["capacity"]
         assert pool["preallocated_bytes"] > 0
+        assert pool["model_gpu_bytes"] > 0
+        assert pool["gpu_free_bytes"] >= 0
+        assert pool["logical_owned_cells"] >= 0
+        assert pool["sequence_capabilities_probed"] is True
     finally:
         for sid in forks:
             _delete(base, sid)
@@ -113,18 +117,50 @@ def test_fork_p95_and_shared_prefix_memory(base, make_session):
     )
     assert p95 < FORK_P95_MS
 
+    source_status = requests.get(f"{base}/sessions/{source}", timeout=60).json()
     before = _usage(base)["pool"]
     forks = [_fork(base, source)["session_id"] for _ in range(N_SEQUENCES)]
     try:
         after = _usage(base)["pool"]
-        delta = after["logical_allocated_bytes"] - before["logical_allocated_bytes"]
-        print(f"  [eus4-prefix] six-fork logical delta={delta / (1024 * 1024):.3f} MiB")
-        assert delta < 60 * 1024 * 1024
-        assert delta / N_SEQUENCES < 10 * 1024 * 1024
+        owned_delta = after["logical_owned_cells"] - before["logical_owned_cells"]
+        assert owned_delta == source_status["cache_size"] * N_SEQUENCES
+
+        gpu_delta = max(0, before["gpu_free_bytes"] - after["gpu_free_bytes"])
+        print(f"  [eus4-prefix] six-fork actual GPU delta={gpu_delta / (1024 * 1024):.3f} MiB")
+        assert gpu_delta < 60 * 1024 * 1024
+        assert gpu_delta / N_SEQUENCES < 10 * 1024 * 1024
         assert after["preallocated_bytes"] == before["preallocated_bytes"]
     finally:
         for sid in forks:
             _delete(base, sid)
+
+    released = _usage(base)["pool"]
+    assert released["logical_owned_cells"] == before["logical_owned_cells"]
+
+
+def test_logical_ownership_tracks_inject_generate_and_offload(base, make_session):
+    sid = make_session()
+    initial = _usage(base)["pool"]
+    assert initial["logical_owned_cells"] >= 0
+
+    injected = _inject(base, sid, "Logical ownership lifecycle sentinel. ")
+    after_inject = _usage(base)["pool"]
+    assert (
+        after_inject["logical_owned_cells"] - initial["logical_owned_cells"]
+        == injected["cache_size"]
+    )
+
+    generated = _generate(base, sid, max_tokens=4)
+    after_generate = _usage(base)["pool"]
+    assert (
+        after_generate["logical_owned_cells"] - after_inject["logical_owned_cells"]
+        == generated["n_tokens"]
+    )
+
+    offload = _post(base, f"/sessions/{sid}/offload")
+    assert offload.status_code == 200, offload.text
+    after_offload = _usage(base)["pool"]
+    assert after_offload["logical_owned_cells"] == initial["logical_owned_cells"]
 
 
 def test_six_jobs_share_decode_and_match_greedy_baseline(base, make_session):

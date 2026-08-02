@@ -139,6 +139,66 @@ std::optional<llama_seq_id> InferenceScheduler::fork_sequence(
     });
 }
 
+bool InferenceScheduler::probe_sequence_capabilities(std::string & error) {
+    return invoke([this, &error](llama_context * ctx) {
+        if (llama_n_seq_max(ctx) < 2) {
+            error = "pooled sequence capability probe requires two internal probe IDs";
+            return false;
+        }
+
+        constexpr llama_seq_id source = 0;
+        constexpr llama_seq_id destination = 1;
+        llama_memory_t memory = llama_get_memory(ctx);
+        auto cleanup = [&] {
+            llama_memory_seq_rm(memory, source, -1, -1);
+            llama_memory_seq_rm(memory, destination, -1, -1);
+            invalidate_logits();
+        };
+        cleanup();
+
+        llama_token token = llama_vocab_bos(vocab_);
+        if (token == LLAMA_TOKEN_NULL) token = 0;
+        llama_batch batch = llama_batch_init(2, 0, max_sequences_);
+        for (int i = 0; i < 2; ++i) {
+            batch.token[i] = token;
+            batch.pos[i] = i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = source;
+            batch.logits[i] = i == 1;
+        }
+        batch.n_tokens = 2;
+        const int decode_result = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        if (decode_result != 0) {
+            cleanup();
+            error = "pooled sequence probe decode failed";
+            return false;
+        }
+
+        llama_memory_seq_cp(memory, source, destination, 0, -1);
+        if (llama_memory_seq_pos_max(memory, destination) != 1) {
+            cleanup();
+            error = "model memory does not support pooled sequence copy";
+            return false;
+        }
+        if (!llama_memory_seq_rm(memory, destination, 1, 2)) {
+            cleanup();
+            error = "model memory does not support pooled partial suffix removal";
+            return false;
+        }
+        if (llama_memory_seq_pos_max(memory, destination) != 0 ||
+            llama_memory_seq_pos_max(memory, source) != 1) {
+            cleanup();
+            error = "pooled suffix removal did not preserve independent sequence ownership";
+            return false;
+        }
+
+        cleanup();
+        sequence_capabilities_probed_ = true;
+        return true;
+    });
+}
+
 std::future<SchedulerStepResult> InferenceScheduler::step(
     llama_seq_id seq_id, common_sampler * sampler, llama_token boundary_token) {
     auto request = std::make_shared<StepRequest>();
@@ -179,9 +239,17 @@ int InferenceScheduler::active_sequences() {
         [this](llama_context *) { return static_cast<int>(active_sequences_.size()); });
 }
 
-size_t InferenceScheduler::logical_allocated_bytes() {
-    return invoke_preserving_logits(
-        [this](llama_context *) { return logical_cells_ * bytes_per_cell_; });
+SchedulerLogicalUsage InferenceScheduler::logical_usage() {
+    return invoke_preserving_logits([this](llama_context * ctx) {
+        SchedulerLogicalUsage usage;
+        llama_memory_t memory = llama_get_memory(ctx);
+        for (llama_seq_id sequence : active_sequences_) {
+            const llama_pos maximum = llama_memory_seq_pos_max(memory, sequence);
+            if (maximum >= 0) usage.owned_cells += static_cast<uint64_t>(maximum) + 1;
+        }
+        usage.estimated_bytes = static_cast<size_t>(usage.owned_cells) * bytes_per_cell_;
+        return usage;
+    });
 }
 
 void InferenceScheduler::worker_loop() {
@@ -451,7 +519,6 @@ void InferenceScheduler::process_steps(std::vector<std::shared_ptr<StepRequest>>
             logits_rows_[sequence] = row;
             sequence_families_[sequence] = next_row_families.at(row);
         }
-        logical_cells_ += batch.n_tokens;
     }
     llama_batch_free(batch);
 

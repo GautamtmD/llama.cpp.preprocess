@@ -82,6 +82,50 @@ def _status(base, sid):
     return requests.get(f"{base}/sessions/{sid}", timeout=60)
 
 
+def _usage(base):
+    response = requests.get(f"{base}/sessions/usage", timeout=60)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _cancel(base, sid):
+    return requests.post(f"{base}/sessions/{sid}/cancel", timeout=60)
+
+
+def _delete(base, sid):
+    return requests.delete(f"{base}/sessions/{sid}", timeout=60)
+
+
+def _wait_busy(base, sid, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = _status(base, sid)
+        if response.status_code == 200 and response.json().get("busy"):
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"session {sid} did not become busy")
+
+
+def _start_blocking_generation(base, sid):
+    outcome = {}
+
+    def generate():
+        outcome["response"] = requests.post(
+            f"{base}/sessions/{sid}/generate",
+            json={
+                "max_tokens": 256,
+                "temperature": 0.0,
+                "ignore_eos": True,
+            },
+            timeout=120,
+        )
+
+    thread = threading.Thread(target=generate, daemon=True)
+    thread.start()
+    _wait_busy(base, sid)
+    return thread, outcome
+
+
 def _parse_sse(response) -> Iterator[dict]:
     for line in response.iter_lines(decode_unicode=True):
         if line and line.startswith("data: "):
@@ -110,6 +154,86 @@ def _stream_generate(base, sid, max_tokens=80):
 def _inter_token_gaps_ms(token_times):
     """Inter-token gaps in ms, EXCLUDING time-to-first-token (isolates steady-state)."""
     return [(token_times[i] - token_times[i - 1]) * 1000.0 for i in range(2, len(token_times))]
+
+
+# ------------------------- load reservation races ---------------------------
+
+
+@pytest.mark.parametrize("_attempt", range(3))
+def test_concurrent_loads_allocate_exactly_one_sequence(base, make_session, _attempt):
+    subject = make_session()
+    blocker = make_session()
+    _inject_text(base, subject, BIG_TEXT)
+    _inject_text(base, blocker, "Keep generating until cancelled. ")
+    assert _offload(base, subject).status_code == 200
+
+    generation, _ = _start_blocking_generation(base, blocker)
+    active_before = _usage(base)["pool"]["active_sequences"]
+    barrier = threading.Barrier(2)
+
+    def load_once():
+        barrier.wait(timeout=30)
+        return _load(base, subject)
+
+    responses = []
+    try:
+        threads = [threading.Thread(target=lambda: responses.append(load_once())) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        time.sleep(0.2)
+        assert _cancel(base, blocker).status_code == 200
+        generation.join(30)
+        assert not generation.is_alive()
+        for thread in threads:
+            thread.join(30)
+            assert not thread.is_alive()
+
+        assert sorted(response.status_code for response in responses) == [200, 409]
+        assert _status(base, subject).json()["location"] == "vram"
+        assert _usage(base)["pool"]["active_sequences"] == active_before + 1
+    finally:
+        if generation.is_alive():
+            _cancel(base, blocker)
+            generation.join(30)
+
+
+@pytest.mark.parametrize("_attempt", range(3))
+def test_delete_cannot_resurrect_session_reserved_for_load(base, make_session, _attempt):
+    subject = make_session()
+    blocker = make_session()
+    _inject_text(base, subject, BIG_TEXT)
+    _inject_text(base, blocker, "Keep generating until cancelled. ")
+    assert _offload(base, subject).status_code == 200
+
+    generation, _ = _start_blocking_generation(base, blocker)
+    load_response = {}
+
+    def load_subject():
+        load_response["response"] = _load(base, subject)
+
+    active_before_load = _usage(base)["pool"]["active_sequences"]
+    loader = threading.Thread(target=load_subject, daemon=True)
+    loader.start()
+    try:
+        deadline = time.monotonic() + 10
+        while _usage(base)["pool"]["active_sequences"] == active_before_load:
+            assert time.monotonic() < deadline, "load never reserved a sequence"
+            time.sleep(0.01)
+
+        deleted = _delete(base, subject)
+        assert deleted.status_code == 409, deleted.text
+        assert _cancel(base, blocker).status_code == 200
+        generation.join(30)
+        loader.join(30)
+        assert not generation.is_alive()
+        assert not loader.is_alive()
+        assert load_response["response"].status_code == 200
+        assert _status(base, subject).json()["location"] == "vram"
+    finally:
+        if generation.is_alive():
+            _cancel(base, blocker)
+            generation.join(30)
+        loader.join(30)
 
 
 # ------------------------------- SC #8 --------------------------------------

@@ -121,9 +121,11 @@ static void test_sse_event() {
 }
 
 static void test_gpu_execution_policy() {
-    CHECK(gpu_execution_allowed(/*allow_cpu*/ false, /*gpu_model_layers*/ 1));
-    CHECK(gpu_execution_allowed(/*allow_cpu*/ true,  /*gpu_model_layers*/ 0));
-    CHECK(!gpu_execution_allowed(/*allow_cpu*/ false, /*gpu_model_layers*/ 0));
+    CHECK_EQ(gpu_allocation_delta(/*free_before*/ 1000, /*free_after*/ 400), 600u);
+    CHECK_EQ(gpu_allocation_delta(/*free_before*/ 400, /*free_after*/ 1000), 0u);
+    CHECK(gpu_execution_allowed(/*allow_cpu*/ false, /*actual_gpu_model_bytes*/ 1));
+    CHECK(gpu_execution_allowed(/*allow_cpu*/ true,  /*actual_gpu_model_bytes*/ 0));
+    CHECK(!gpu_execution_allowed(/*allow_cpu*/ false, /*actual_gpu_model_bytes*/ 0));
 
     const std::string server_error = gpu_execution_error("multimodal-server");
     CHECK(server_error.find("GPU load was not successful") != std::string::npos);

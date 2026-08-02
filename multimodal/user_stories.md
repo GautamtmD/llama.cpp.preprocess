@@ -60,9 +60,11 @@ Expected:
 Latency / performance budget:
 - Warm same-pool fork: p95 **< 5 ms** over at least 50 samples. Measured
   p95 0.38–0.57 ms on RTX 5060 Ti / Gemma 4 12B QAT q4_0.
-- Incremental logical KV: **< 10 MiB/fork, < 60 MiB for six** excluding the
-  fixed pool. Measured six-fork logical delta: 0 MiB. The one-time pool footprint
-  was about 8.34 GiB and is reported separately.
+- Incremental resident GPU memory: **< 10 MiB/fork, < 60 MiB for six** excluding
+  the fixed pool. Measured six-fork GPU-free delta: 0 MiB. The one-time pool
+  footprint was about 8.34 GiB and is reported separately. Logical ownership
+  intentionally increases by the copied prefix per owner and is not a physical
+  memory measurement.
 
 Test:
 - tests/test_fork.py (correctness + latency against the live server)
@@ -121,8 +123,9 @@ Expected:
 - All N decode in one batched pass; each session sees correct, independent output
   (sequence isolation — a batched run reproduces each session's standalone
   greedy output).
-- Forking within the pooled context uses `llama_memory_seq_cp`: ~0 ms + ~0 VRAM
-  (vs EUS-2's A': ~0.5–0.7 s + ~350 MiB).
+- Forking within the pooled context uses `llama_memory_seq_cp`: ~0 ms + ~0
+  incremental resident GPU memory beyond the fixed pool (vs EUS-2's A':
+  ~0.5–0.7 s + ~350 MiB).
 - Shared-prefix sessions do NOT duplicate BASE KV — only the divergent suffix KV
   per fork.
 
@@ -138,7 +141,10 @@ Test:
 - `tests/test_cross_session_batching.py` (single pool, fork latency/memory,
   six-way decode proof and parity, sampler/grammar isolation, capacity reuse,
   same-session 409, cancellation race, divergent-history row isolation,
-  transactional failed initialization, and shared-prefix lifecycle)
+  transactional failed initialization, truthful ownership/GPU telemetry, and
+  shared-prefix lifecycle)
+- `tests/test_context_limits.py` (small-context generation and multimodal
+  preflight/retry invariants)
 
 > [ADR 0004](../../../docs/decisions/0004-fork-copy-semantics.md) mandates
 > migrating fork to B (`seq_cp`) here; this unblocks the engagement pipeline's
@@ -190,8 +196,9 @@ measured regression gates; their thresholds are unchanged here.
 ---
 
 ### EUS-6: KV-cache offload — swap a session's state between VRAM and host RAM
-Move a session's swappable state out of VRAM into host RAM (release its VRAM
-without destroying it) and bring it back unchanged. This is US-9's VRAM-pressure
+Move a session's swappable state out of the pool's live logical ownership into
+host RAM (release its KV ownership and slot without shrinking the preallocated
+pool) and bring it back unchanged. This is US-9's capacity-pressure
 valve: a preempted task can be parked (RAM) and later resumed (load) or discarded
 (delete), so a pruning task can reclaim VRAM. Disk serialization is separate
 (backlog) and out of scope.
@@ -206,14 +213,18 @@ Expected:
   The pool's process-wide preallocated GPU buffers do not shrink. Returns
   `{session_id, location:"ram", cache_size, state_bytes, offload_ms}`. Idempotent
   (`offload_ms:0` on an already-RAM session).
-- **Load** restores a RAM session to VRAM; the session then reproduces its exact
+- **Load** atomically reserves a RAM session before slot allocation and restore;
+  concurrent load/delete/offload returns 409, preventing duplicate sequence-slot
+  leaks and deleted-ID resurrection. The restored session reproduces its exact
   pre-offload greedy (`temperature`≤0) output on `/generate` (round-trip
   correctness — the KV/SSM state survived unchanged). Returns
   `{session_id, location:"vram", cache_size, state_bytes, load_ms}`. Idempotent.
 - **GET /sessions/{id}** returns `{session_id, location, cache_size, state_bytes}`.
 - **GET /sessions/usage** returns the existing `vram`/`ram` buckets plus a
   `pool` object separating capacity, active/free slots, total/per-sequence
-  context, fixed `preallocated_bytes`, and estimated `logical_allocated_bytes`.
+  context, fixed `preallocated_bytes`, measured `model_gpu_bytes`, current
+  `gpu_free_bytes`, exact `logical_owned_cells`, estimated
+  `logical_allocated_bytes`, and successful startup-probe status.
 - **Offloaded sessions cannot be silently used (409, no auto-load):**
   `inject`/`generate`/`fork` against a RAM session return **409**
   ("session is offloaded; POST /sessions/{id}/load first"); `delete` works on a
@@ -237,7 +248,8 @@ Latency / performance budget:
 
 Test:
 - tests/test_offload.py (functional + round-trip + KV-sharing correctness)
-- tests/test_offload_concurrent.py (SC #8 inference-impact gate + shared-KV sentinel)
+- tests/test_offload_concurrent.py (atomic load/delete races, SC #8
+  inference-impact gate, and shared-KV sentinel)
 
 > Enables [US-9](../../../user_stories.md) (preemption & redundancy pruning).
 > Design survives [EUS-4](../../../docs/decisions/0004-fork-copy-semantics.md)

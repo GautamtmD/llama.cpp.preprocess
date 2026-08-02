@@ -180,6 +180,7 @@ struct OffloadedState {
     llama_token          last_token = LLAMA_TOKEN_NULL; // for logits refresh on load
     int                  cache_size = 0;              // tokens at offload time
     size_t               state_bytes = 0;             // == state.size(); symmetric offload/load
+    bool                 loading = false;             // RAM -> loading -> VRAM reservation
 };
 
 struct LiveSession {
@@ -210,6 +211,7 @@ struct AppState {
     ModelConfig                          model_cfg;
     int max_sequences = 8;
     size_t pool_footprint_bytes = 0;
+    size_t model_gpu_bytes = 0;
     std::unique_ptr<InferenceScheduler> scheduler;
     std::mutex mu;
     std::map<int64_t, LiveSession> sessions;
@@ -518,6 +520,7 @@ GenResult run_generation(
         return llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id);
     });
     const llama_pos p_start = pmax < 0 ? 1 : pmax + 1;
+    r.cache_size = pmax < 0 ? 0 : pmax + 1;
     llama_token boundary_token = rewind_token;
 
     common_params_sampling sparams = build_sampling_params(app, p);
@@ -627,12 +630,16 @@ GenResult run_generation(
                 r.cancelled = true;
                 break;
             }
+            const int cells_needed = r.cache_size == 0 ? 2 : 1;
+            if (r.cache_size + cells_needed > n_ctx) {
+                r.error = "session context full";
+                break;
+            }
             auto step_result = app.scheduler->step(seq_id, smpl, boundary_token).get();
             if (!step_result.error.empty()) { r.error = step_result.error; break; }
             if (step_result.eog) break;
             llama_token id = step_result.token;
             r.cache_size = step_result.cache_size;
-            if (r.cache_size > n_ctx) { r.error = "session context full"; break; }
             std::string piece = common_token_to_piece(app.vocab, id, true);
             common_sampler_accept(smpl, id, true);
             boundary_token = id;
@@ -671,12 +678,16 @@ GenResult run_generation(
                 r.cancelled = true;
                 break;
             }
+            const int cells_needed = r.cache_size == 0 ? 2 : 1;
+            if (r.cache_size + cells_needed > n_ctx) {
+                r.error = "session context full";
+                break;
+            }
             auto step_result = app.scheduler->step(seq_id, smpl, boundary_token).get();
             if (!step_result.error.empty()) { r.error = step_result.error; break; }
             if (step_result.eog) break;
             llama_token id = step_result.token;
             r.cache_size = step_result.cache_size;
-            if (r.cache_size > n_ctx) { r.error = "session context full"; break; }
             std::string piece = common_token_to_piece(app.vocab, id, true);
             common_sampler_accept(smpl, id, true);
             boundary_token = id;
@@ -755,14 +766,21 @@ static mtmd_bitmap * bitmap_from_media_bytes(mtmd_context * mtmd_ctx,
 // + bitmaps into chunks and decodes each into the session's KV cache. Preserve
 // the final discrete token when the rendered prompt ends in text: the pooled
 // scheduler needs it to recreate sequence-specific boundary logits.
+enum class InjectStatus {
+    ok,
+    context_full,
+    decode_failed,
+};
+
 struct MtmdInjectResult {
-    bool ok = false;
+    InjectStatus status = InjectStatus::decode_failed;
     llama_token last_token = LLAMA_TOKEN_NULL;
 };
 
 static MtmdInjectResult mtmd_inject(mtmd_context * mtmd_ctx, llama_context * ctx,
                                     llama_seq_id seq_id, const std::string & text,
-                                    const std::vector<mtmd_bitmap *> & bitmaps) {
+                                    const std::vector<mtmd_bitmap *> & bitmaps,
+                                    llama_pos context_limit) {
     mtmd_input_text input_text;
     input_text.text          = text.c_str();
     input_text.add_special   = true;
@@ -792,8 +810,14 @@ static MtmdInjectResult mtmd_inject(mtmd_context * mtmd_ctx, llama_context * ctx
     }
     llama_pos n_past = 0;
     // start from the current cache position (so multi-turn inject composes)
-    llama_pos cur_max = llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id);
+    llama_memory_t memory = llama_get_memory(ctx);
+    llama_pos cur_max = llama_memory_seq_pos_max(memory, seq_id);
     if (cur_max >= 0) n_past = cur_max + 1;
+    if (n_past + mtmd_helper_get_n_pos(chunks) > context_limit) {
+        mtmd_input_chunks_free(chunks);
+        return {InjectStatus::context_full, LLAMA_TOKEN_NULL};
+    }
+    const llama_pos original_n_past = n_past;
 
     bool ok = true;
     for (size_t i = 0; i < n_chunks; ++i) {
@@ -806,7 +830,11 @@ static MtmdInjectResult mtmd_inject(mtmd_context * mtmd_ctx, llama_context * ctx
         n_past = new_n_past;
     }
     mtmd_input_chunks_free(chunks);
-    return {ok, ok ? last_token : LLAMA_TOKEN_NULL};
+    if (!ok) {
+        llama_memory_seq_rm(memory, seq_id, original_n_past, -1);
+        return {InjectStatus::decode_failed, LLAMA_TOKEN_NULL};
+    }
+    return {InjectStatus::ok, last_token};
 }
 
 int main(int argc, char ** argv) {
@@ -917,6 +945,7 @@ int main(int argc, char ** argv) {
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = cfg.n_gpu_layers;
     std::cerr << "loading model: " << cfg.model_path << " ...\n";
+    const size_t gpu_free_before_model = gpu_free_bytes();
     AppState app;
     app.model = llama_model_load_from_file(cfg.model_path.c_str(), mp);
     if (!app.model) {
@@ -925,18 +954,15 @@ int main(int argc, char ** argv) {
         llama_backend_free();
         return 1;
     }
-    const int gpu_model_layers = (gpu_devices > 0 && cfg.n_gpu_layers != 0)
-        ? (cfg.n_gpu_layers < 0
-            ? llama_model_n_layer(app.model) + 1
-            : std::min(cfg.n_gpu_layers, llama_model_n_layer(app.model) + 1))
-        : 0;
-    if (!gpu_execution_allowed(cfg.allow_cpu, gpu_model_layers)) {
+    const size_t gpu_free_after_model = gpu_free_bytes();
+    app.model_gpu_bytes = gpu_allocation_delta(gpu_free_before_model, gpu_free_after_model);
+    if (!gpu_execution_allowed(cfg.allow_cpu, app.model_gpu_bytes)) {
         std::cerr << "error: " << gpu_execution_error("multimodal-server") << "\n";
         llama_model_free(app.model);
         llama_backend_free();
         return 3;
     }
-    std::cerr << "execution: " << gpu_model_layers << " model layer(s) assigned to GPU"
+    std::cerr << "execution: actual GPU model allocation=" << app.model_gpu_bytes << " bytes"
               << (cfg.allow_cpu ? " (--allow-cpu enabled)" : "") << ".\n";
     app.model_cfg = load_config_for_model(cfg.model_path, cfg.config_path, app.model);
     app.vocab = llama_model_get_vocab(app.model);
@@ -982,7 +1008,9 @@ int main(int argc, char ** argv) {
     llama_context_params pooled_params = llama_context_default_params();
     pooled_params.n_ctx = static_cast<uint32_t>(cfg.ctx_size * cfg.max_sequences);
     pooled_params.n_batch = std::min<int>(cfg.n_batch, pooled_params.n_ctx);
-    pooled_params.n_seq_max = cfg.max_sequences;
+    // Keep two internal IDs available for the disposable startup copy/removal
+    // probe even when public live capacity is configured as one.
+    pooled_params.n_seq_max = std::max(cfg.max_sequences, 2);
     pooled_params.kv_unified = true;  // required for tokens coupled to multiple fork sequences
     pooled_params.no_perf = true;
     llama_context * pooled_ctx = llama_init_from_model(app.model, pooled_params);
@@ -998,6 +1026,15 @@ int main(int argc, char ** argv) {
     }
     app.scheduler = std::make_unique<InferenceScheduler>(
         pooled_ctx, app.vocab, cfg.max_sequences);
+    std::string probe_error;
+    if (!app.scheduler->probe_sequence_capabilities(probe_error)) {
+        std::cerr << "error: pooled sequence compatibility probe failed: " << probe_error << "\n";
+        app.scheduler.reset();
+        if (app.mtmd_ctx) mtmd_free(app.mtmd_ctx);
+        llama_model_free(app.model);
+        llama_backend_free();
+        return 1;
+    }
     std::cerr << "pool: capacity=" << cfg.max_sequences
               << " per_sequence_ctx=" << cfg.ctx_size
               << " total_ctx=" << llama_n_ctx(pooled_ctx)
@@ -1263,14 +1300,17 @@ int main(int argc, char ** argv) {
                     double t0 = now_s();
                     app.scheduler->prepare_sequence_mutation(seq_id);
                     MtmdInjectResult inject_result = app.scheduler->invoke_invalidating_logits([&](llama_context * ctx) {
-                        const auto result = mtmd_inject(app.mtmd_ctx, ctx, seq_id, text, bitmaps);
+                        const auto result = mtmd_inject(
+                            app.mtmd_ctx, ctx, seq_id, text, bitmaps, app.n_ctx_per_session);
                         for (auto * bitmap : bitmaps) mtmd_bitmap_free(bitmap);
                         return result;
                     });
                     const double dt = now_s() - t0;
-                    if (!inject_result.ok) {
-                        res.status = 500;
-                        res.set_content(error_body("mtmd tokenize/decode failed", 500).dump(), "application/json");
+                    if (inject_result.status != InjectStatus::ok) {
+                        res.status = inject_result.status == InjectStatus::context_full ? 409 : 500;
+                        const std::string message = res.status == 409
+                            ? "session context full" : "mtmd tokenize/decode failed";
+                        res.set_content(error_body(message, res.status).dump(), "application/json");
                         return;
                     }
                     const int new_size = app.scheduler->invoke([seq_id](llama_context * ctx) {
@@ -1327,10 +1367,10 @@ int main(int argc, char ** argv) {
                 }
 
                 app.scheduler->prepare_sequence_mutation(seq_id);
-                bool ok = app.scheduler->invoke_invalidating_logits([&](llama_context * ctx) {
+                InjectStatus status = app.scheduler->invoke_invalidating_logits([&](llama_context * ctx) {
                     const float * samples = reinterpret_cast<const float *>(bytes.data());
                     mtmd_bitmap * bmp = mtmd_bitmap_init_from_audio(n_samples, samples);
-                    if (!bmp) return false;
+                    if (!bmp) return InjectStatus::decode_failed;
                     std::string dummy_prompt = mtmd_default_marker();
                     mtmd_input_text input_text;
                     input_text.text = dummy_prompt.c_str();
@@ -1339,16 +1379,30 @@ int main(int argc, char ** argv) {
                     mtmd_input_chunks * chunks = mtmd_input_chunks_init();
                     const mtmd_bitmap * bptrs[1] = {bmp};
                     const int32_t rc = mtmd_tokenize(app.mtmd_ctx, chunks, &input_text, bptrs, 1);
-                    bool decoded = rc == 0;
+                    llama_memory_t memory = llama_get_memory(ctx);
+                    const llama_pos cur_max = llama_memory_seq_pos_max(memory, seq_id);
+                    const llama_pos original_n_past = cur_max < 0 ? 0 : cur_max + 1;
+                    llama_pos required = 0;
                     bool has_audio = false;
-                    if (decoded) {
+                    if (rc == 0) {
                         const size_t n_chunks = mtmd_input_chunks_size(chunks);
                         for (size_t i = 0; i < n_chunks; ++i) {
                             const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, i);
                             if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_AUDIO) continue;
                             has_audio = true;
-                            const llama_pos cur_max = llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id);
-                            const llama_pos n_past = cur_max < 0 ? 0 : cur_max + 1;
+                            required += mtmd_input_chunk_get_n_pos(chunk);
+                        }
+                    }
+
+                    InjectStatus result = InjectStatus::decode_failed;
+                    if (rc == 0 && has_audio &&
+                        original_n_past + required <= app.n_ctx_per_session) {
+                        bool decoded = true;
+                        llama_pos n_past = original_n_past;
+                        const size_t n_chunks = mtmd_input_chunks_size(chunks);
+                        for (size_t i = 0; i < n_chunks; ++i) {
+                            const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, i);
+                            if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_AUDIO) continue;
                             llama_pos new_n_past = n_past;
                             if (mtmd_helper_eval_chunk_single(
                                     app.mtmd_ctx, ctx, chunk, n_past, seq_id, /*n_batch*/ 512,
@@ -1356,16 +1410,26 @@ int main(int argc, char ** argv) {
                                 decoded = false;
                                 break;
                             }
+                            n_past = new_n_past;
                         }
+                        if (decoded) {
+                            result = InjectStatus::ok;
+                        } else {
+                            llama_memory_seq_rm(memory, seq_id, original_n_past, -1);
+                        }
+                    } else if (rc == 0 && has_audio) {
+                        result = InjectStatus::context_full;
                     }
                     mtmd_bitmap_free(bmp);
                     mtmd_input_chunks_free(chunks);
-                    return decoded && has_audio;
+                    return result;
                 });
 
-                if (!ok) {
-                    res.status = 500;
-                    res.set_content(error_body("failed to decode streaming audio chunk", 500).dump(), "application/json");
+                if (status != InjectStatus::ok) {
+                    res.status = status == InjectStatus::context_full ? 409 : 500;
+                    const std::string message = res.status == 409
+                        ? "session context full" : "failed to decode streaming audio chunk";
+                    res.set_content(error_body(message, res.status).dump(), "application/json");
                     return;
                 }
 
@@ -1438,6 +1502,9 @@ int main(int argc, char ** argv) {
             batch.n_tokens = (int32_t) toks.size();
             const bool result = llama_decode(ctx, batch) == 0;
             llama_batch_free(batch);
+            if (!result) {
+                llama_memory_seq_rm(llama_get_memory(ctx), seq_id, used, -1);
+            }
             return result;
         });
         if (!decoded) {
@@ -1546,6 +1613,19 @@ int main(int argc, char ** argv) {
         if (!mark_session_busy(app, sid_num, res)) return;
         auto busy = std::make_shared<BusyGuard>(app, sid_num);
         const llama_seq_id seq_id = session->seq_id;
+        if (gp.max_tokens > 0) {
+            const int current_size = app.scheduler->invoke_preserving_logits(
+                [seq_id](llama_context * ctx) {
+                    return llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) + 1;
+                });
+            const int cells_needed = current_size == 0 ? 2 : 1;
+            if (current_size + cells_needed > app.n_ctx_per_session) {
+                res.status = 409;
+                res.set_content(error_body("session context full", 409).dump(),
+                                "application/json");
+                return;
+            }
+        }
         const llama_token pre_generation_last = session->last_token;
         auto generation = std::make_shared<GenerationRegistration>(app, sid);
 
@@ -1647,6 +1727,7 @@ int main(int argc, char ** argv) {
         const uint32_t total_ctx = app.scheduler->invoke([](llama_context * ctx) {
             return llama_n_ctx(ctx);
         });
+        const SchedulerLogicalUsage logical = app.scheduler->logical_usage();
         json body = {
             {"vram", {{"n_sessions", vram_sessions.size()}, {"total_state_bytes", vram_total}, {"sessions", vram_sessions}}},
             {"ram",  {{"n_sessions", ram_sessions.size()},  {"total_state_bytes", ram_total},  {"sessions", ram_sessions}}},
@@ -1658,7 +1739,11 @@ int main(int argc, char ** argv) {
                 {"ctx_size_per_sequence", app.n_ctx_per_session},
                 {"ctx_size_total", total_ctx},
                 {"preallocated_bytes", app.pool_footprint_bytes},
-                {"logical_allocated_bytes", app.scheduler->logical_allocated_bytes()},
+                {"model_gpu_bytes", app.model_gpu_bytes},
+                {"gpu_free_bytes", gpu_free_bytes()},
+                {"logical_owned_cells", logical.owned_cells},
+                {"logical_allocated_bytes", logical.estimated_bytes},
+                {"sequence_capabilities_probed", app.scheduler->sequence_capabilities_probed()},
             }},
         };
         res.set_content(body.dump(), "application/json");
@@ -1706,7 +1791,8 @@ int main(int argc, char ** argv) {
             if (parked != app.offloaded_sessions.end()) {
                 res.set_content(json{{"session_id", make_session_id(sid_num)}, {"location", "ram"},
                                      {"cache_size", parked->second.cache_size},
-                                     {"state_bytes", parked->second.state_bytes}}.dump(),
+                                     {"state_bytes", parked->second.state_bytes},
+                                     {"busy", parked->second.loading}}.dump(),
                                 "application/json");
                 return;
             }
@@ -1724,6 +1810,12 @@ int main(int argc, char ** argv) {
             std::lock_guard<std::mutex> lk(app.mu);
             auto parked = app.offloaded_sessions.find(sid_num);
             if (parked != app.offloaded_sessions.end()) {
+                if (parked->second.loading) {
+                    res.status = 409;
+                    res.set_content(error_body("session already has an active operation", 409).dump(),
+                                    "application/json");
+                    return;
+                }
                 res.set_content(json{{"session_id", sid}, {"location", "ram"},
                                      {"cache_size", parked->second.cache_size},
                                      {"state_bytes", parked->second.state_bytes},
@@ -1761,6 +1853,12 @@ int main(int argc, char ** argv) {
         const std::string sid = extract_session_id(req.path, "load");
         const int64_t sid_num = parse_session_id_num(sid);
         if (auto live = lookup_session(app, sid_num)) {
+            if (live->busy) {
+                res.status = 409;
+                res.set_content(error_body("session already has an active operation", 409).dump(),
+                                "application/json");
+                return;
+            }
             const auto status = app.scheduler->invoke([seq = live->seq_id](llama_context * ctx) {
                 return std::pair<int, size_t>{
                     llama_memory_seq_pos_max(llama_get_memory(ctx), seq) + 1,
@@ -1780,10 +1878,23 @@ int main(int argc, char ** argv) {
                 res.set_content(error_body("unknown session", 404).dump(), "application/json");
                 return;
             }
+            if (parked->second.loading) {
+                res.status = 409;
+                res.set_content(error_body("session already has an active operation", 409).dump(),
+                                "application/json");
+                return;
+            }
+            parked->second.loading = true;
             state = parked->second;
         }
+        auto clear_loading_reservation = [&] {
+            std::lock_guard<std::mutex> lk(app.mu);
+            auto parked = app.offloaded_sessions.find(sid_num);
+            if (parked != app.offloaded_sessions.end()) parked->second.loading = false;
+        };
         const int seq_id = app.scheduler->allocate_sequence();
         if (seq_id < 0) {
+            clear_loading_reservation();
             res.status = 503;
             res.set_content(error_body("pooled sequence capacity exhausted", 503).dump(), "application/json");
             return;
@@ -1791,10 +1902,14 @@ int main(int argc, char ** argv) {
         const double t0 = now_s();
         try {
             app.scheduler->invoke_when_no_generation([&](llama_context * ctx) {
-                llama_state_seq_set_data(ctx, state.state.data(), state.state_bytes, seq_id);
+                if (llama_state_seq_set_data(
+                        ctx, state.state.data(), state.state_bytes, seq_id) == 0) {
+                    throw std::runtime_error("failed to restore offloaded sequence state");
+                }
             });
         } catch (...) {
             app.scheduler->release_sequence(seq_id);
+            clear_loading_reservation();
             throw;
         }
         {
@@ -1830,10 +1945,20 @@ int main(int argc, char ** argv) {
                 }
                 sequence = live->second.seq_id;
                 app.sessions.erase(live);
-            } else if (app.offloaded_sessions.erase(sid_num) == 0) {
-                res.status = 404;
-                res.set_content(error_body("unknown session", 404).dump(), "application/json");
-                return;
+            } else {
+                auto parked = app.offloaded_sessions.find(sid_num);
+                if (parked == app.offloaded_sessions.end()) {
+                    res.status = 404;
+                    res.set_content(error_body("unknown session", 404).dump(), "application/json");
+                    return;
+                }
+                if (parked->second.loading) {
+                    res.status = 409;
+                    res.set_content(error_body("session already has an active operation", 409).dump(),
+                                    "application/json");
+                    return;
+                }
+                app.offloaded_sessions.erase(parked);
             }
         }
         if (sequence) app.scheduler->release_sequence(*sequence);

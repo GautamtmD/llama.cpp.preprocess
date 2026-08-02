@@ -169,6 +169,34 @@ def test_load_is_idempotent(base, make_session):
     assert j["load_ms"] == 0
 
 
+def test_load_capacity_failure_releases_loading_reservation(base, make_session):
+    subject = make_session()
+    _inject_chat(base, subject)
+    assert _offload(base, subject).status_code == 200
+
+    fillers = []
+    while True:
+        created = requests.post(f"{base}/sessions", timeout=30)
+        if created.status_code == 503:
+            break
+        assert created.status_code == 200, created.text
+        fillers.append(created.json()["session_id"])
+
+    try:
+        first = _load(base, subject)
+        second = _load(base, subject)
+        assert first.status_code == 503, first.text
+        assert second.status_code == 503, second.text
+
+        assert _delete(base, fillers.pop()).status_code == 200
+        restored = _load(base, subject)
+        assert restored.status_code == 200, restored.text
+        assert _status(base, subject).json()["location"] == "vram"
+    finally:
+        for sid in fillers:
+            _delete(base, sid)
+
+
 # ------------------------------- SC #3: GET ---------------------------------
 
 

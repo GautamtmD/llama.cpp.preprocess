@@ -27,6 +27,11 @@ struct SchedulerStepResult {
     std::string error;
 };
 
+struct SchedulerLogicalUsage {
+    uint64_t owned_cells = 0;
+    size_t estimated_bytes = 0;
+};
+
 struct SchedulerDiagnostics {
     uint64_t decode_calls = 0;
     uint64_t decoded_tokens = 0;
@@ -80,6 +85,7 @@ public:
     void release_sequence(llama_seq_id seq_id);
     void prepare_sequence_mutation(llama_seq_id seq_id);
     std::optional<llama_seq_id> fork_sequence(llama_seq_id source, llama_token boundary_token);
+    bool probe_sequence_capabilities(std::string & error);
 
     std::future<SchedulerStepResult> step(llama_seq_id seq_id, common_sampler * sampler,
                                           llama_token boundary_token);
@@ -89,7 +95,8 @@ public:
     int capacity() const { return max_sequences_; }
     int active_sequences();
     size_t preallocated_bytes() const { return preallocated_bytes_; }
-    size_t logical_allocated_bytes();
+    SchedulerLogicalUsage logical_usage();
+    bool sequence_capabilities_probed() const { return sequence_capabilities_probed_; }
 
 private:
     template <bool InvalidateLogits, bool DeferForGeneration, typename Fn>
@@ -162,6 +169,6 @@ private:
     std::set<uint64_t> detached_families_;
     uint64_t next_family_ = 1;
     SchedulerDiagnostics diagnostics_;
-    uint64_t logical_cells_ = 0;
     size_t bytes_per_cell_ = 1;
+    bool sequence_capabilities_probed_ = false;
 };

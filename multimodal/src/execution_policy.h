@@ -2,12 +2,18 @@
 // benchmarks. Pure/header-only so it is covered by multimodal-util-tests.
 #pragma once
 
+#include <cstddef>
 #include <string>
 
-// `gpu_model_layers` is the number of model layers assigned to a GPU after
-// model load. CPU-only execution requires the explicit --allow-cpu opt-in.
-inline bool gpu_execution_allowed(bool allow_cpu, int gpu_model_layers) {
-    return allow_cpu || gpu_model_layers > 0;
+inline size_t gpu_allocation_delta(size_t free_before, size_t free_after) {
+    return free_before > free_after ? free_before - free_after : 0;
+}
+
+// Require evidence from the backend's device-memory counters after model load,
+// not merely a requested --n-gpu-layers value. CPU-only execution requires the
+// explicit --allow-cpu opt-in.
+inline bool gpu_execution_allowed(bool allow_cpu, size_t actual_gpu_model_bytes) {
+    return allow_cpu || actual_gpu_model_bytes > 0;
 }
 
 inline std::string gpu_execution_error(const std::string & program) {

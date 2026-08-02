@@ -37,7 +37,22 @@
 #include <vector>
 
 #include "execution_policy.h"
+#include "ggml-backend.h"
 #include "llama.h"
+
+static size_t gpu_free_bytes() {
+    size_t result = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * device = ggml_backend_dev_get(i);
+        const auto type = ggml_backend_dev_type(device);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(device, &free, &total);
+        result += free;
+    }
+    return result;
+}
 
 static double now_s() {
     using namespace std::chrono;
@@ -124,6 +139,7 @@ int main(int argc, char ** argv) {
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = ngl;
     std::fprintf(stderr, "loading model: %s ...\n", model_path.c_str());
+    const size_t gpu_free_before_model = gpu_free_bytes();
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);
     if (!model) {
         std::fprintf(stderr, "error: model load failed\n");
@@ -131,17 +147,16 @@ int main(int argc, char ** argv) {
         llama_backend_free();
         return 1;
     }
-    const int gpu_model_layers = (gpu_devices > 0 && ngl != 0)
-        ? (ngl < 0 ? llama_model_n_layer(model) + 1 : std::min(ngl, llama_model_n_layer(model) + 1))
-        : 0;
-    if (!gpu_execution_allowed(allow_cpu, gpu_model_layers)) {
+    const size_t gpu_model_bytes =
+        gpu_allocation_delta(gpu_free_before_model, gpu_free_bytes());
+    if (!gpu_execution_allowed(allow_cpu, gpu_model_bytes)) {
         std::fprintf(stderr, "error: %s\n", gpu_execution_error("benchmark").c_str());
         llama_model_free(model);
         llama_backend_free();
         return 3;
     }
-    std::fprintf(stderr, "execution: %d model layer(s) assigned to GPU%s.\n",
-                 gpu_model_layers, allow_cpu ? " (--allow-cpu enabled)" : "");
+    std::fprintf(stderr, "execution: actual GPU model allocation=%zu bytes%s.\n",
+                 gpu_model_bytes, allow_cpu ? " (--allow-cpu enabled)" : "");
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     auto make_ctx = [&]() {
