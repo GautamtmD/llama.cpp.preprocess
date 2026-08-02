@@ -762,6 +762,7 @@ GenResult run_generation(
         r.cancelled = generation->finish(
             seq_id, p_start, rewind_token, checkpoint.family, r.cancelled, r.rewind_s);
     }
+    app.scheduler->finish_generation(seq_id);
 
     r.cache_size = app.scheduler->invoke_preserving_logits([seq_id](llama_context * ctx) {
         return llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) + 1;
@@ -1824,6 +1825,12 @@ int main(int argc, char ** argv) {
             {"decoded_tokens", metrics.decoded_tokens},
             {"max_sequences_per_decode", metrics.max_sequences_per_decode},
             {"decode_calls_by_sequence_count", histogram},
+            {"lineage_cache", {
+                {"active_families", metrics.active_lineage_families},
+                {"detached_families", metrics.detached_lineage_families},
+                {"transitions", metrics.lineage_transitions},
+                {"canonical_tokens", metrics.canonical_greedy_tokens},
+            }},
         }.dump(), "application/json");
     });
 

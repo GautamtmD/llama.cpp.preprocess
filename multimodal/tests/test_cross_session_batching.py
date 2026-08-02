@@ -198,6 +198,32 @@ def test_logical_ownership_tracks_inject_generate_and_offload(base, make_session
     assert after_offload["logical_owned_cells"] == initial["logical_owned_cells"]
 
 
+def test_released_sessions_reclaim_lineage_caches(base, make_session):
+    anchor = make_session()
+    _inject(base, anchor, "Persistent lineage must survive unrelated reclamation. ")
+    baseline = dict(_batching(base)["lineage_cache"])
+    sessions = []
+    for index in range(3):
+        sid = _fork(base, anchor)["session_id"] if index == 0 else make_session()
+        sessions.append(sid)
+        _inject(base, sid, f"Lineage cache reclamation cycle {index}. ")
+        _generate(base, sid, max_tokens=12)
+
+    peak = _batching(base)["lineage_cache"]
+    assert peak["active_families"] == baseline["active_families"] + len(sessions)
+    assert peak["transitions"] > baseline["transitions"]
+    assert peak["canonical_tokens"] > baseline["canonical_tokens"]
+
+    for sid in sessions:
+        _delete(base, sid)
+
+    reclaimed = _batching(base)["lineage_cache"]
+    assert reclaimed == baseline, (
+        "released sessions left unreachable scheduler lineage entries: "
+        f"baseline={baseline}, peak={peak}, reclaimed={reclaimed}"
+    )
+
+
 def test_six_jobs_share_decode_and_match_greedy_baseline(base, make_session):
     source = make_session()
     _inject(

@@ -42,6 +42,10 @@ struct SchedulerDiagnostics {
     uint64_t decoded_tokens = 0;
     uint32_t max_sequences_per_decode = 0;
     std::map<uint32_t, uint64_t> decode_calls_by_sequence_count;
+    uint64_t active_lineage_families = 0;
+    uint64_t detached_lineage_families = 0;
+    uint64_t lineage_transitions = 0;
+    uint64_t canonical_greedy_tokens = 0;
 };
 
 // Single owner of a pooled llama_context. Commands and generation steps may be
@@ -99,6 +103,7 @@ public:
     bool probe_sequence_capabilities(std::string & error);
 
     SchedulerGenerationCheckpoint generation_checkpoint(llama_seq_id seq_id);
+    void finish_generation(llama_seq_id seq_id);
     std::future<SchedulerStepResult> step(llama_seq_id seq_id, common_sampler * sampler,
                                           llama_token boundary_token,
                                           uint8_t canonical_greedy_policy,
@@ -161,6 +166,7 @@ private:
         const std::vector<std::shared_ptr<StepRequest>> & requests,
         std::map<llama_seq_id, std::string> & request_errors, std::string & error);
     void invalidate_logits();
+    void collect_lineage_garbage();
 
     llama_context * ctx_;
     const llama_vocab * vocab_;
@@ -185,6 +191,10 @@ private:
     // Exact logical-KV-state lineage used to prove row-coalescing safety. IDs
     // are shared only by fork/safe coalesced transitions and split on mutation.
     std::map<llama_seq_id, uint64_t> sequence_families_;
+    // Keeps a mutation's pre-split family reachable between its prepare and
+    // complete/abort scheduler commands, even if another session is released.
+    std::map<llama_seq_id, uint64_t> mutation_parent_families_;
+    std::map<llama_seq_id, uint64_t> generation_checkpoint_families_;
     std::map<llama_seq_id, llama_token> boundary_tokens_;
     std::set<uint64_t> detached_families_;
     std::map<std::tuple<uint64_t, llama_pos, llama_token>, uint64_t> transition_families_;

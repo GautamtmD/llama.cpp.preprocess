@@ -130,7 +130,8 @@ Expected:
   incremental resident GPU memory beyond the fixed pool (vs EUS-2's A':
   ~0.5–0.7 s + ~350 MiB).
 - Shared-prefix sessions do NOT duplicate BASE KV — only the divergent suffix KV
-  per fork.
+  per fork. Host-side lineage caches reclaim recycled-session branches once no
+  live sequence, mutation, checkpoint, or canonical replay path owns them.
 
 Latency / performance budget (implemented and measured):
 - Fork (`seq_cp`) in a pooled context: **< 5 ms, < 10 MiB** (~0 in practice; vs
@@ -145,8 +146,9 @@ Test:
   six-way decode proof and parity, sampler/grammar isolation, capacity reuse,
   same-session 409, cancellation race, divergent-history row isolation,
   transactional and per-job-isolated failed initialization, bounded progress
-  behind a slow streaming/tool-parsing job, current-boundary replay, repeated
-  cancellation/output isolation, atomic delete/snapshot races, truthful
+  behind a slow streaming/tool-parsing job, bounded lineage-cache reclamation,
+  current-boundary replay, repeated cancellation/output isolation, atomic
+  delete/snapshot races, truthful
   ownership/GPU telemetry, and shared-prefix lifecycle)
 - `tests/test_context_limits.py` (small-context generation and multimodal
   preflight/retry invariants)

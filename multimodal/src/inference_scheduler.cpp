@@ -1,6 +1,7 @@
 #include "inference_scheduler.h"
 
 #include <algorithm>
+#include <iterator>
 #include <stdexcept>
 #include <tuple>
 
@@ -85,6 +86,65 @@ void InferenceScheduler::invalidate_logits() {
     }
 }
 
+void InferenceScheduler::collect_lineage_garbage() {
+    // Current sequence states and in-flight rollback points are roots. Preserve
+    // their ancestor paths (needed to converge identical mutations) plus cached
+    // canonical-greedy paths reachable from them (needed for deterministic fork
+    // and cancellation replay). Non-canonical dead branches and lineages with no
+    // owner are unreachable.
+    using Transition = std::pair<llama_token, uint64_t>;
+    std::map<uint64_t, std::vector<Transition>> outgoing;
+    std::map<uint64_t, std::vector<uint64_t>> incoming;
+    for (const auto & [key, child] : transition_families_) {
+        const uint64_t parent = std::get<0>(key);
+        outgoing[parent].push_back({std::get<2>(key), child});
+        incoming[child].push_back(parent);
+    }
+    std::map<uint64_t, std::set<llama_token>> canonical_tokens;
+    for (const auto & [key, token] : canonical_greedy_tokens_) {
+        canonical_tokens[std::get<0>(key)].insert(token);
+    }
+
+    std::set<uint64_t> reachable;
+    std::deque<uint64_t> pending;
+    auto add_root = [&](uint64_t family) {
+        if (reachable.insert(family).second) pending.push_back(family);
+    };
+    for (const auto & [_, family] : sequence_families_) add_root(family);
+    for (const auto & [_, family] : mutation_parent_families_) add_root(family);
+    for (const auto & [_, family] : generation_checkpoint_families_) add_root(family);
+    while (!pending.empty()) {
+        const uint64_t parent = pending.front();
+        pending.pop_front();
+        const auto ancestors = incoming.find(parent);
+        if (ancestors != incoming.end()) {
+            for (uint64_t ancestor : ancestors->second) add_root(ancestor);
+        }
+        const auto transitions = outgoing.find(parent);
+        const auto canonical = canonical_tokens.find(parent);
+        if (transitions == outgoing.end() || canonical == canonical_tokens.end()) continue;
+        for (const auto & [token, child] : transitions->second) {
+            if (canonical->second.count(token)) add_root(child);
+        }
+    }
+
+    for (auto it = detached_families_.begin(); it != detached_families_.end();) {
+        it = reachable.count(*it) ? std::next(it) : detached_families_.erase(it);
+    }
+    for (auto it = transition_families_.begin(); it != transition_families_.end();) {
+        const uint64_t parent = std::get<0>(it->first);
+        it = reachable.count(parent) && reachable.count(it->second)
+                 ? std::next(it)
+                 : transition_families_.erase(it);
+    }
+    for (auto it = canonical_greedy_tokens_.begin();
+         it != canonical_greedy_tokens_.end();) {
+        it = reachable.count(std::get<0>(it->first))
+                 ? std::next(it)
+                 : canonical_greedy_tokens_.erase(it);
+    }
+}
+
 int InferenceScheduler::allocate_sequence() {
     return invoke([this](llama_context * ctx) {
         if (free_sequences_.empty()) {
@@ -108,7 +168,10 @@ void InferenceScheduler::release_sequence(llama_seq_id seq_id) {
         free_sequences_.insert(seq_id);
         logits_rows_[seq_id] = -1;
         sequence_families_.erase(seq_id);
+        mutation_parent_families_.erase(seq_id);
+        generation_checkpoint_families_.erase(seq_id);
         boundary_tokens_.erase(seq_id);
+        collect_lineage_garbage();
     });
 }
 
@@ -118,6 +181,7 @@ uint64_t InferenceScheduler::prepare_sequence_mutation(llama_seq_id seq_id) {
             throw std::runtime_error("cannot mutate inactive sequence");
         }
         const uint64_t parent_family = sequence_families_[seq_id];
+        mutation_parent_families_[seq_id] = parent_family;
         // Split exact-state identity before an external inject changes KV. If a
         // sibling generates before the inject command arrives, this can only
         // miss a safe coalescing opportunity; it can never merge unlike states.
@@ -145,8 +209,10 @@ void InferenceScheduler::complete_text_mutation(
             family = transition->second;
         }
         sequence_families_[seq_id] = family;
+        mutation_parent_families_.erase(seq_id);
         if (!tokens.empty()) boundary_tokens_[seq_id] = tokens.back();
         logits_rows_[seq_id] = -1;
+        collect_lineage_garbage();
     });
 }
 
@@ -156,8 +222,10 @@ void InferenceScheduler::complete_opaque_mutation(
         if (!active_sequences_.count(seq_id)) {
             throw std::runtime_error("cannot complete mutation for inactive sequence");
         }
+        mutation_parent_families_.erase(seq_id);
         boundary_tokens_[seq_id] = boundary_token;
         logits_rows_[seq_id] = -1;
+        collect_lineage_garbage();
     });
 }
 
@@ -167,8 +235,10 @@ void InferenceScheduler::abort_sequence_mutation(
         [this, seq_id, parent_family, boundary_token](llama_context *) {
             if (!active_sequences_.count(seq_id)) return;
             sequence_families_[seq_id] = parent_family;
+            mutation_parent_families_.erase(seq_id);
             boundary_tokens_[seq_id] = boundary_token;
             logits_rows_[seq_id] = -1;
+            collect_lineage_garbage();
         });
 }
 
@@ -196,6 +266,7 @@ std::optional<llama_seq_id> InferenceScheduler::fork_sequence(
         sequence_families_[destination] = fork_family;
         boundary_tokens_[source] = boundary_token;
         boundary_tokens_[destination] = boundary_token;
+        collect_lineage_garbage();
         return destination;
     });
 }
@@ -265,9 +336,17 @@ SchedulerGenerationCheckpoint InferenceScheduler::generation_checkpoint(llama_se
         if (!active_sequences_.count(seq_id)) {
             throw std::runtime_error("cannot checkpoint inactive sequence");
         }
+        const uint64_t family = sequence_families_.at(seq_id);
+        generation_checkpoint_families_[seq_id] = family;
         return SchedulerGenerationCheckpoint{
-            llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id),
-            sequence_families_.at(seq_id)};
+            llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id), family};
+    });
+}
+
+void InferenceScheduler::finish_generation(llama_seq_id seq_id) {
+    invoke_preserving_logits([this, seq_id](llama_context *) {
+        generation_checkpoint_families_.erase(seq_id);
+        collect_lineage_garbage();
     });
 }
 
@@ -325,7 +404,16 @@ void InferenceScheduler::rewind(
 }
 
 SchedulerDiagnostics InferenceScheduler::diagnostics() {
-    return invoke_preserving_logits([this](llama_context *) { return diagnostics_; });
+    return invoke_preserving_logits([this](llama_context *) {
+        SchedulerDiagnostics result = diagnostics_;
+        std::set<uint64_t> active_families;
+        for (const auto & [_, family] : sequence_families_) active_families.insert(family);
+        result.active_lineage_families = active_families.size();
+        result.detached_lineage_families = detached_families_.size();
+        result.lineage_transitions = transition_families_.size();
+        result.canonical_greedy_tokens = canonical_greedy_tokens_.size();
+        return result;
+    });
 }
 
 llama_token InferenceScheduler::boundary_token(llama_seq_id seq_id) {
