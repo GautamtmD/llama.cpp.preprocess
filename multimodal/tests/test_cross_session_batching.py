@@ -10,11 +10,14 @@ from __future__ import annotations
 import base64
 import json
 import math
+import socket
 import statistics
 import struct
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from urllib.parse import urlsplit
 
 import pytest
 import requests
@@ -67,6 +70,38 @@ def _batching(base: str) -> dict:
     response = requests.get(f"{base}/diagnostics/batching", timeout=60)
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def _open_unread_stream(base: str, sid: str, max_tokens: int = 512, **extra) -> socket.socket:
+    """Start SSE generation on an unread raw HTTP connection."""
+    parsed = urlsplit(base)
+    assert parsed.hostname is not None
+    assert parsed.scheme == "http", "raw streaming test expects the local HTTP server"
+    port = parsed.port or 80
+    payload = {
+        "stream": True,
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "ignore_eos": True,
+    }
+    payload.update(extra)
+    body = json.dumps(payload).encode("utf-8")
+    path = f"{parsed.path.rstrip('/')}/sessions/{sid}/generate"
+    request = (
+        f"POST {path} HTTP/1.1\r\n"
+        f"Host: {parsed.hostname}:{port}\r\n"
+        "Content-Type: application/json\r\n"
+        "Accept: text/event-stream\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii") + body
+
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+    client.settimeout(10)
+    client.connect((parsed.hostname, port))
+    client.sendall(request)
+    return client
 
 
 def _hist_delta(before: dict, after: dict, width: int) -> int:
@@ -213,6 +248,86 @@ def test_six_jobs_share_decode_and_match_greedy_baseline(base, make_session):
         assert ratio <= BATCHED_STEP_RATIO
     finally:
         for sid in sessions:
+            _delete(base, sid)
+
+
+def test_slow_streaming_tool_setup_does_not_stall_ready_generation(base, make_session):
+    source = make_session()
+    _inject(base, source, "Slow streaming client isolation sentinel. ")
+
+    control = _fork(base, source)["session_id"]
+    try:
+        expected = _generate(base, control, max_tokens=1)
+    finally:
+        _delete(base, control)
+
+    slow = _fork(base, source)["session_id"]
+    ready = _fork(base, source)["session_id"]
+    large_enum = [f"choice-{index}" for index in range(4_000)]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "select_choice",
+                "description": "Select one allowed choice.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"choice": {"type": "string", "enum": large_enum}},
+                    "required": ["choice"],
+                },
+            },
+        }
+    ]
+    unread = _open_unread_stream(base, slow, max_tokens=1, tools=tools)
+    timed_out = False
+
+    try:
+        # The busy reservation is acquired before streaming run_generation()
+        # constructs the tool grammar. Give its handler time to enter that slow
+        # setup while holding an active scheduler-generation registration.
+        busy_deadline = time.perf_counter() + 10
+        while time.perf_counter() < busy_deadline:
+            status = requests.get(f"{base}/sessions/{slow}", timeout=10)
+            assert status.status_code == 200, status.text
+            if status.json()["busy"]:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("slow streaming generation never acquired its busy reservation")
+        time.sleep(0.1)
+
+        started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            ready_future = executor.submit(_generate, base, ready, 1)
+            try:
+                observed = ready_future.result(timeout=1.0)
+            except FutureTimeoutError:
+                timed_out = True
+            finally:
+                unread.close()
+                if timed_out:
+                    ready_future.result(timeout=30)
+        elapsed = time.perf_counter() - started
+
+        assert not timed_out, (
+            "a ready generation remained blocked behind a streaming request's "
+            f"tool setup for more than 1.0s (completed after cleanup at {elapsed:.3f}s)"
+        )
+        assert observed["tokens"] == expected["tokens"]
+        assert observed["text"] == expected["text"]
+        assert observed["cache_size"] == expected["cache_size"]
+    finally:
+        try:
+            unread.close()
+        except OSError:
+            pass
+        for sid in (slow, ready):
+            deadline = time.perf_counter() + 10
+            while time.perf_counter() < deadline:
+                status = requests.get(f"{base}/sessions/{sid}", timeout=10)
+                if status.status_code != 200 or not status.json()["busy"]:
+                    break
+                time.sleep(0.05)
             _delete(base, sid)
 
 

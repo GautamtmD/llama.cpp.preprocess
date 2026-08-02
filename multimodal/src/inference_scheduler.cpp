@@ -370,16 +370,17 @@ void InferenceScheduler::worker_loop() {
                 command = std::move(commands_.front());
                 commands_.pop_front();
             } else if (!steps_.empty()) {
+                const auto deadline = std::chrono::steady_clock::now() + batching_window_;
                 if (!generation_cohort_started_) {
-                    const auto deadline = std::chrono::steady_clock::now() + batching_window_;
                     cv_.wait_until(
                         lock, deadline, [this] { return stopping_ || !commands_.empty(); });
                 }
-                if (commands_.empty()) {
-                    // Once a generation cohort is visible, never drain a partial
-                    // cadence. A job that stops/cancels decrements the target and
-                    // wakes this wait; a continuing job supplies exactly one step.
-                    cv_.wait(lock, [this] {
+                if (commands_.empty() &&
+                    steps_.size() < static_cast<size_t>(active_generations_)) {
+                    // Ready work may wait briefly for peers, but a client blocked
+                    // on streaming I/O or tool parsing must never become an
+                    // unbounded barrier for unrelated generations.
+                    cv_.wait_until(lock, deadline, [this] {
                         return stopping_ || !commands_.empty() ||
                                steps_.size() >= static_cast<size_t>(active_generations_);
                     });
