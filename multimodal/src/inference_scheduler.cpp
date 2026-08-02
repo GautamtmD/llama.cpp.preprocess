@@ -252,50 +252,107 @@ bool InferenceScheduler::decode_batch(
 
 bool InferenceScheduler::initialize_logits(
     const std::vector<std::shared_ptr<StepRequest>> & requests, std::string & error) {
+    struct InitializationPlan {
+        llama_seq_id seq_id;
+        llama_pos position;
+        llama_token token;
+        bool remove_boundary;
+    };
+
     llama_memory_t memory = llama_get_memory(ctx_);
-    llama_batch batch = llama_batch_init(static_cast<int32_t>(requests.size()), 0, max_sequences_);
-    std::vector<std::pair<llama_seq_id, int>> sequence_rows;
-    sequence_rows.reserve(requests.size());
+    std::vector<InitializationPlan> plans;
+    plans.reserve(requests.size());
+
+    // Validate the complete initialization set before mutating any sequence.
+    // Otherwise one later media/inactive request can leave earlier boundaries
+    // removed even though no replacement decode runs.
     for (const auto & request : requests) {
         if (!active_sequences_.count(request->seq_id)) {
             error = "sequence is no longer active";
-            llama_batch_free(batch);
             return false;
         }
         llama_pos position = llama_memory_seq_pos_max(memory, request->seq_id);
         llama_token token = request->boundary_token;
-        if (position < 0) {
+        const bool remove_boundary = position >= 0;
+        if (!remove_boundary) {
             position = 0;
             token = llama_vocab_bos(vocab_);
-        } else {
-            if (token == LLAMA_TOKEN_NULL) {
-                error = "sequence ends in media embeddings; inject text before generation";
-                llama_batch_free(batch);
-                return false;
-            }
-            if (!llama_memory_seq_rm(memory, request->seq_id, position, position + 1)) {
-                error = "model memory does not support pooled suffix removal";
-                llama_batch_free(batch);
-                return false;
-            }
+        } else if (token == LLAMA_TOKEN_NULL) {
+            error = "sequence ends in media embeddings; inject text before generation";
+            return false;
         }
+        plans.push_back({request->seq_id, position, token, remove_boundary});
+    }
+
+    std::vector<const InitializationPlan *> removed;
+    removed.reserve(plans.size());
+    auto rollback_removed = [&](const std::string & original_error) {
+        invalidate_logits();
+        if (removed.empty()) {
+            error = original_error;
+            return;
+        }
+        llama_batch rollback =
+            llama_batch_init(static_cast<int32_t>(removed.size()), 0, max_sequences_);
+        for (const InitializationPlan * plan : removed) {
+            const int row = rollback.n_tokens++;
+            rollback.token[row] = plan->token;
+            rollback.pos[row] = plan->position;
+            rollback.n_seq_id[row] = 1;
+            rollback.seq_id[row][0] = plan->seq_id;
+            rollback.logits[row] = 0;
+        }
+        std::string rollback_error;
+        const bool restored = decode_batch(
+            rollback, static_cast<uint32_t>(removed.size()), rollback_error);
+        llama_batch_free(rollback);
+        error = original_error;
+        if (!restored) {
+            error += "; boundary rollback failed: " + rollback_error;
+        }
+    };
+
+    for (const auto & plan : plans) {
+        if (!plan.remove_boundary) continue;
+        if (!llama_memory_seq_rm(memory, plan.seq_id, plan.position, plan.position + 1)) {
+            rollback_removed("model memory does not support pooled suffix removal");
+            return false;
+        }
+        removed.push_back(&plan);
+    }
+
+    llama_batch batch = llama_batch_init(static_cast<int32_t>(plans.size()), 0, max_sequences_);
+    std::vector<std::pair<llama_seq_id, int>> sequence_rows;
+    sequence_rows.reserve(plans.size());
+    for (const auto & plan : plans) {
         const int row = batch.n_tokens++;
-        batch.token[row] = token;
-        batch.pos[row] = position;
+        batch.token[row] = plan.token;
+        batch.pos[row] = plan.position;
         batch.n_seq_id[row] = 1;
-        batch.seq_id[row][0] = request->seq_id;
+        batch.seq_id[row][0] = plan.seq_id;
         batch.logits[row] = 1;
-        sequence_rows.push_back({request->seq_id, row});
+        sequence_rows.push_back({plan.seq_id, row});
     }
+
     invalidate_logits();
-    const bool ok = decode_batch(batch, static_cast<uint32_t>(sequence_rows.size()), error);
-    if (ok) {
-        for (const auto & [sequence, row] : sequence_rows) {
-            logits_rows_[sequence] = row;
-        }
-    }
+    std::string decode_error;
+    const bool ok = decode_batch(
+        batch, static_cast<uint32_t>(sequence_rows.size()), decode_error);
     llama_batch_free(batch);
-    return ok;
+    if (!ok) {
+        // A failed backend decode may have committed only a prefix of the batch.
+        // Remove any replacement/BOS rows that could have landed before
+        // restoring the original boundaries recorded above.
+        for (const auto & plan : plans) {
+            llama_memory_seq_rm(memory, plan.seq_id, plan.position, plan.position + 1);
+        }
+        rollback_removed(decode_error);
+        return false;
+    }
+    for (const auto & [sequence, row] : sequence_rows) {
+        logits_rows_[sequence] = row;
+    }
+    return true;
 }
 
 void InferenceScheduler::process_steps(std::vector<std::shared_ptr<StepRequest>> requests) {

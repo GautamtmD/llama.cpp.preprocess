@@ -137,8 +137,8 @@ Latency / performance budget (implemented and measured):
 Test:
 - `tests/test_cross_session_batching.py` (single pool, fork latency/memory,
   six-way decode proof and parity, sampler/grammar isolation, capacity reuse,
-  same-session 409, cancellation race, divergent-history row isolation, and
-  shared-prefix lifecycle)
+  same-session 409, cancellation race, divergent-history row isolation,
+  transactional failed initialization, and shared-prefix lifecycle)
 
 > [ADR 0004](../../../docs/decisions/0004-fork-copy-semantics.md) mandates
 > migrating fork to B (`seq_cp`) here; this unblocks the engagement pipeline's

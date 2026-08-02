@@ -7,9 +7,11 @@ merely running concurrently.
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import statistics
+import struct
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -219,6 +221,90 @@ def test_divergent_histories_never_merge_equal_position_token_rows(base, make_se
         "unrelated sequences were merged into one decode row solely because "
         f"position/token matched: expected {expected_rows} rows, observed {decoded_delta}"
     )
+
+
+@pytest.mark.requires("audio")
+def test_failed_media_logits_initialization_does_not_truncate_valid_sessions(base, make_session):
+    source = make_session()
+    source_inject = _inject(base, source, "Transactional logits boundary sentinel. ")
+    bad = make_session()
+    _inject(base, bad, "Raw audio follows: ")
+    pcm = struct.pack("<640f", *([0.0] * 640))
+    audio = _post(
+        base,
+        f"/sessions/{bad}/inject",
+        json={"audio": base64.b64encode(pcm).decode("ascii")},
+    )
+    assert audio.status_code == 200, audio.text
+
+    exercised_shared_batch = False
+    for _ in range(5):
+        sessions = [_fork(base, source)["session_id"] for _ in range(5)]
+        before = {sid: source_inject["cache_size"] for sid in sessions}
+        barrier = threading.Barrier(6)
+
+        def run_valid(sid: str, *, _barrier=barrier) -> requests.Response:
+            _barrier.wait(timeout=30)
+            return _post(
+                base,
+                f"/sessions/{sid}/generate",
+                json={"max_tokens": 1, "temperature": 0.0, "ignore_eos": True},
+            )
+
+        def run_invalid(*, _barrier=barrier) -> requests.Response:
+            _barrier.wait(timeout=30)
+            # Keep the media-ending request inside the scheduler's batching
+            # window but behind already-released valid request threads.
+            time.sleep(0.0005)
+            return _post(
+                base,
+                f"/sessions/{bad}/generate",
+                json={"max_tokens": 1, "temperature": 0.0, "ignore_eos": True},
+            )
+
+        try:
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                valid_futures = [executor.submit(run_valid, sid) for sid in sessions]
+                invalid_future = executor.submit(run_invalid)
+                valid_responses = [future.result(timeout=30) for future in valid_futures]
+                invalid_response = invalid_future.result(timeout=30)
+
+            shared_error = "sequence ends in media embeddings"
+            failed_valids = [
+                sid
+                for sid, response in zip(sessions, valid_responses, strict=True)
+                if shared_error in response.text
+            ]
+            exercised_shared_batch = shared_error in invalid_response.text and bool(failed_valids)
+            if not exercised_shared_batch:
+                continue
+
+            after = {}
+            for sid in failed_valids:
+                status = requests.get(f"{base}/sessions/{sid}", timeout=30)
+                assert status.status_code == 200, status.text
+                after[sid] = status.json()["cache_size"]
+            expected_sizes = {sid: before[sid] for sid in failed_valids}
+            assert after == expected_sizes, (
+                "failed initialization truncated unrelated sessions: "
+                f"before={expected_sizes}, after={after}"
+            )
+
+            control = _fork(base, source)["session_id"]
+            try:
+                expected = _generate(base, control, max_tokens=8)
+                observed = _generate(base, failed_valids[0], max_tokens=8)
+                assert observed["tokens"] == expected["tokens"]
+                assert observed["text"] == expected["text"]
+                assert observed["cache_size"] == expected["cache_size"]
+            finally:
+                _delete(base, control)
+            break
+        finally:
+            for sid in sessions:
+                _delete(base, sid)
+
+    assert exercised_shared_batch, "could not co-schedule valid and media-ending initialization"
 
 
 def test_cancel_one_of_six_leaves_other_jobs_byte_identical(base, make_session):
