@@ -260,9 +260,16 @@ def test_divergent_histories_never_merge_equal_position_token_rows(base, make_se
 
 
 @pytest.mark.requires("audio")
-def test_failed_media_logits_initialization_does_not_truncate_valid_sessions(base, make_session):
+def test_media_ending_job_error_is_isolated_from_valid_batch_jobs(base, make_session):
     source = make_session()
-    source_inject = _inject(base, source, "Transactional logits boundary sentinel. ")
+    source_inject = _inject(base, source, "Per-job logits error isolation sentinel. ")
+
+    control = _fork(base, source)["session_id"]
+    try:
+        expected = _generate(base, control, max_tokens=1)
+    finally:
+        _delete(base, control)
+
     bad = make_session()
     _inject(base, bad, "Raw audio follows: ")
     pcm = struct.pack("<640f", *([0.0] * 640))
@@ -273,74 +280,60 @@ def test_failed_media_logits_initialization_does_not_truncate_valid_sessions(bas
     )
     assert audio.status_code == 200, audio.text
 
-    exercised_shared_batch = False
-    for _ in range(5):
-        sessions = [_fork(base, source)["session_id"] for _ in range(5)]
-        before = {sid: source_inject["cache_size"] for sid in sessions}
-        barrier = threading.Barrier(6)
+    sessions = [_fork(base, source)["session_id"] for _ in range(5)]
+    barrier = threading.Barrier(6)
+    telemetry_before = _batching(base)
 
-        def run_valid(sid: str, *, _barrier=barrier) -> requests.Response:
-            _barrier.wait(timeout=30)
-            return _post(
-                base,
-                f"/sessions/{sid}/generate",
-                json={"max_tokens": 1, "temperature": 0.0, "ignore_eos": True},
-            )
+    def run_valid(sid: str) -> requests.Response:
+        barrier.wait(timeout=30)
+        return _post(
+            base,
+            f"/sessions/{sid}/generate",
+            json={"max_tokens": 1, "temperature": 0.0, "ignore_eos": True},
+        )
 
-        def run_invalid(*, _barrier=barrier) -> requests.Response:
-            _barrier.wait(timeout=30)
-            # Keep the media-ending request inside the scheduler's batching
-            # window but behind already-released valid request threads.
-            time.sleep(0.0005)
-            return _post(
-                base,
-                f"/sessions/{bad}/generate",
-                json={"max_tokens": 1, "temperature": 0.0, "ignore_eos": True},
-            )
+    def run_invalid() -> requests.Response:
+        barrier.wait(timeout=30)
+        # Keep the invalid request inside the same scheduler batching window,
+        # behind valid requests whose initialization plans must still run.
+        time.sleep(0.0005)
+        return _post(
+            base,
+            f"/sessions/{bad}/generate",
+            json={"max_tokens": 1, "temperature": 0.0, "ignore_eos": True},
+        )
 
-        try:
-            with ThreadPoolExecutor(max_workers=6) as executor:
-                valid_futures = [executor.submit(run_valid, sid) for sid in sessions]
-                invalid_future = executor.submit(run_invalid)
-                valid_responses = [future.result(timeout=30) for future in valid_futures]
-                invalid_response = invalid_future.result(timeout=30)
+    try:
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            valid_futures = [executor.submit(run_valid, sid) for sid in sessions]
+            invalid_future = executor.submit(run_invalid)
+            valid_responses = [future.result(timeout=30) for future in valid_futures]
+            invalid_response = invalid_future.result(timeout=30)
 
-            shared_error = "sequence ends in media embeddings"
-            failed_valids = [
-                sid
-                for sid, response in zip(sessions, valid_responses, strict=True)
-                if shared_error in response.text
-            ]
-            exercised_shared_batch = shared_error in invalid_response.text and bool(failed_valids)
-            if not exercised_shared_batch:
-                continue
+        shared_error = "sequence ends in media embeddings"
+        assert invalid_response.status_code == 500, invalid_response.text
+        assert shared_error in invalid_response.text
+        assert all(response.status_code == 200 for response in valid_responses), (
+            "the media-ending job's initialization error leaked into valid jobs: "
+            f"{[(response.status_code, response.text) for response in valid_responses]}"
+        )
 
-            after = {}
-            for sid in failed_valids:
-                status = requests.get(f"{base}/sessions/{sid}", timeout=30)
-                assert status.status_code == 200, status.text
-                after[sid] = status.json()["cache_size"]
-            expected_sizes = {sid: before[sid] for sid in failed_valids}
-            assert after == expected_sizes, (
-                "failed initialization truncated unrelated sessions: "
-                f"before={expected_sizes}, after={after}"
-            )
+        valid_results = [response.json() for response in valid_responses]
+        for result in valid_results:
+            assert result["tokens"] == expected["tokens"]
+            assert result["text"] == expected["text"]
+            assert result["cache_size"] == expected["cache_size"]
+            assert result["cache_size"] == source_inject["cache_size"] + 1
 
-            control = _fork(base, source)["session_id"]
-            try:
-                expected = _generate(base, control, max_tokens=8)
-                observed = _generate(base, failed_valids[0], max_tokens=8)
-                assert observed["tokens"] == expected["tokens"]
-                assert observed["text"] == expected["text"]
-                assert observed["cache_size"] == expected["cache_size"]
-            finally:
-                _delete(base, control)
-            break
-        finally:
-            for sid in sessions:
-                _delete(base, sid)
-
-    assert exercised_shared_batch, "could not co-schedule valid and media-ending initialization"
+        telemetry_after = _batching(base)
+        assert _hist_delta(telemetry_before, telemetry_after, len(sessions) + 1) >= 1, (
+            "the five valid jobs and their idle source did not initialize together",
+            telemetry_before,
+            telemetry_after,
+        )
+    finally:
+        for sid in sessions:
+            _delete(base, sid)
 
 
 def test_completed_coalesced_siblings_keep_current_boundary_when_one_resumes(base, make_session):

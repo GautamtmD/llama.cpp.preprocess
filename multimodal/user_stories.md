@@ -143,8 +143,8 @@ Test:
 - `tests/test_cross_session_batching.py` (single pool, fork latency/memory,
   six-way decode proof and parity, sampler/grammar isolation, capacity reuse,
   same-session 409, cancellation race, divergent-history row isolation,
-  transactional failed initialization, current-boundary replay, repeated
-  cancellation/output isolation, atomic delete/snapshot races, truthful
+  transactional and per-job-isolated failed initialization, current-boundary
+  replay, repeated cancellation/output isolation, atomic delete/snapshot races, truthful
   ownership/GPU telemetry, and shared-prefix lifecycle)
 - `tests/test_context_limits.py` (small-context generation and multimodal
   preflight/retry invariants)

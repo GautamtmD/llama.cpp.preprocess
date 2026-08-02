@@ -157,8 +157,9 @@ private:
     void worker_loop();
     void process_steps(std::vector<std::shared_ptr<StepRequest>> requests);
     bool decode_batch(llama_batch & batch, uint32_t distinct_sequences, std::string & error);
-    bool initialize_logits(const std::vector<std::shared_ptr<StepRequest>> & requests,
-                           std::string & error);
+    bool initialize_logits(
+        const std::vector<std::shared_ptr<StepRequest>> & requests,
+        std::map<llama_seq_id, std::string> & request_errors, std::string & error);
     void invalidate_logits();
 
     llama_context * ctx_;

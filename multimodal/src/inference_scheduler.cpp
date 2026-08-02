@@ -433,7 +433,8 @@ bool InferenceScheduler::decode_batch(
 }
 
 bool InferenceScheduler::initialize_logits(
-    const std::vector<std::shared_ptr<StepRequest>> & requests, std::string & error) {
+    const std::vector<std::shared_ptr<StepRequest>> & requests,
+    std::map<llama_seq_id, std::string> & request_errors, std::string & error) {
     struct InitializationPlan {
         llama_seq_id seq_id;
         llama_pos position;
@@ -447,12 +448,13 @@ bool InferenceScheduler::initialize_logits(
     plans.reserve(requests.size());
 
     // Validate the complete initialization set before mutating any sequence.
-    // Otherwise one later media/inactive request can leave earlier boundaries
-    // removed even though no replacement decode runs.
+    // Request-local failures are rejected individually: unrelated valid plans
+    // still initialize and generate in this cadence. Shared decode failures
+    // remain batch-wide because a backend may commit only a batch prefix.
     for (const auto & request : requests) {
         if (!active_sequences_.count(request->seq_id)) {
-            error = "sequence is no longer active";
-            return false;
+            request_errors.emplace(request->seq_id, "sequence is no longer active");
+            continue;
         }
         llama_pos position = llama_memory_seq_pos_max(memory, request->seq_id);
         llama_token token = request->boundary_token;
@@ -461,12 +463,18 @@ bool InferenceScheduler::initialize_logits(
             position = 0;
             token = llama_vocab_bos(vocab_);
         } else if (token == LLAMA_TOKEN_NULL) {
-            error = "sequence ends in media embeddings; inject text before generation";
-            return false;
+            request_errors.emplace(
+                request->seq_id,
+                "sequence ends in media embeddings; inject text before generation");
+            continue;
         }
         plans.push_back({
             request->seq_id, position, token,
             sequence_families_.at(request->seq_id), remove_boundary});
+    }
+
+    if (plans.empty()) {
+        return true;
     }
 
     std::vector<const InitializationPlan *> removed;
@@ -550,19 +558,25 @@ bool InferenceScheduler::initialize_logits(
 void InferenceScheduler::process_steps(std::vector<std::shared_ptr<StepRequest>> requests) {
     std::string error;
     for (const auto & request : requests) {
-        boundary_tokens_[request->seq_id] = request->boundary_token;
+        auto boundary = boundary_tokens_.find(request->seq_id);
+        if (boundary != boundary_tokens_.end()) boundary->second = request->boundary_token;
     }
     const bool needs_initialization = std::any_of(
-        requests.begin(), requests.end(),
-        [this](const auto & request) { return logits_rows_[request->seq_id] < 0; });
+        requests.begin(), requests.end(), [this](const auto & request) {
+            const auto row = logits_rows_.find(request->seq_id);
+            return row == logits_rows_.end() || row->second < 0;
+        });
     if (needs_initialization) {
         std::vector<std::shared_ptr<StepRequest>> initialization = requests;
         std::set<llama_seq_id> included;
         std::set<uint64_t> families_to_detach;
         for (const auto & request : requests) {
             included.insert(request->seq_id);
-            const uint64_t family = sequence_families_[request->seq_id];
-            if (!detached_families_.count(family)) families_to_detach.insert(family);
+            const auto family = sequence_families_.find(request->seq_id);
+            if (family != sequence_families_.end() &&
+                !detached_families_.count(family->second)) {
+                families_to_detach.insert(family->second);
+            }
         }
         for (const auto & [sequence, family] : sequence_families_) {
             if (!families_to_detach.count(family) || included.count(sequence)) continue;
@@ -574,13 +588,34 @@ void InferenceScheduler::process_steps(std::vector<std::shared_ptr<StepRequest>>
             sibling->generation_step = 0;
             initialization.push_back(std::move(sibling));
         }
-        if (!initialize_logits(initialization, error)) {
+        std::map<llama_seq_id, std::string> request_errors;
+        if (!initialize_logits(initialization, request_errors, error)) {
             for (auto & request : requests) {
-                request->promise.set_value({LLAMA_TOKEN_NULL, false, 0, error});
+                const auto individual = request_errors.find(request->seq_id);
+                request->promise.set_value({
+                    LLAMA_TOKEN_NULL, false, 0,
+                    individual == request_errors.end() ? error : individual->second});
             }
             return;
         }
-        detached_families_.insert(families_to_detach.begin(), families_to_detach.end());
+        requests.erase(
+            std::remove_if(
+                requests.begin(), requests.end(), [&](const auto & request) {
+                    const auto individual = request_errors.find(request->seq_id);
+                    if (individual == request_errors.end()) return false;
+                    request->promise.set_value(
+                        {LLAMA_TOKEN_NULL, false, 0, individual->second});
+                    return true;
+                }),
+            requests.end());
+        if (requests.empty()) return;
+        for (const auto & request : requests) {
+            const auto family = sequence_families_.find(request->seq_id);
+            if (family != sequence_families_.end() &&
+                families_to_detach.count(family->second)) {
+                detached_families_.insert(family->second);
+            }
+        }
     }
 
     struct Sampled {
