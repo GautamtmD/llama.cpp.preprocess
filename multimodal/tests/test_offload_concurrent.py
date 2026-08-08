@@ -3,9 +3,9 @@
 - SC #8: offload/load on OTHER sessions must not significantly degrade an ongoing
   generation, and the generating session's greedy output must be byte-identical
   to a solo run.
-- SC #9 sentinel: generate on one of two identical-KV (forked) sessions while
-  offloading the other — a placeholder that will catch breakage when KV sharing
-  lands (slice-5 / EUS-4).
+- SC #9: generate on one of two shared-prefix forked sessions while offloading
+  the other; releasing the offloaded sequence must preserve shared KV cells that
+  the active source still owns.
 
 Model-agnostic; launch with the model as a parameter (see tests/conftest.py)::
 
@@ -329,21 +329,17 @@ def test_offload_load_does_not_degrade_concurrent_generation(base, make_session)
     )
 
 
-# ----------------------- SC #9 shared-KV sentinel ---------------------------
+# ----------------------- SC #9 shared-KV isolation --------------------------
 
 
-def test_offload_forked_session_during_active_generation__shared_kv_sentinel(base, make_session):
-    """PLACEHOLDER / FORWARD-COMPAT SENTINEL.
+def test_offload_forked_session_during_active_generation_preserves_shared_kv(base, make_session):
+    """Offloading a shared-prefix fork must not disturb its active source.
 
-    Fork A -> A' (identical KV). Stream-generate on A; mid-generation, offload A'.
-    A must finish with byte-identical greedy output to an identical solo run, and
-    A' must end up in RAM.
-
-    TODAY this passes trivially: A' is an independent deep copy (ADR 0004 A'), so
-    offloading it cannot touch A's cache. The test exists to CATCH a regression
-    when slice-5 (EUS-4) makes A and A' SHARE KV via llama_memory_seq_cp in a
-    pooled context: then offloading A' must NOT evict shared cells A depends on.
-    If that future change breaks A's decoding, this test fails loudly here.
+    Fork A -> A' so the pooled sequences alias A's immutable prefix KV. While A
+    stream-generates, offload A'. A must finish with byte-identical greedy output
+    to an identical solo run, and A' must end up in RAM. Releasing A' may reclaim
+    its sequence and uniquely owned suffix, but must retain every shared prefix
+    cell that A still owns.
     """
     a = make_session()
     _inject_chat(base, a)
@@ -375,9 +371,8 @@ def test_offload_forked_session_during_active_generation__shared_kv_sentinel(bas
 
     text_a = outcome.get("text", "")
     assert text_a == baseline, (
-        "offloading the forked session perturbed the source's decoding "
-        "(this is the shared-KV sentinel — see test docstring):\n"
+        "offloading the shared-prefix fork perturbed the source's decoding:\n"
         f"  baseline : {baseline!r}\n  A        : {text_a!r}"
     )
     assert _status(base, ap).json()["location"] == "ram"
-    print("  [sc9-sentinel] offloaded fork mid-generation; source output unchanged")
+    print("  [sc9-shared-kv] offloaded fork mid-generation; source output unchanged")

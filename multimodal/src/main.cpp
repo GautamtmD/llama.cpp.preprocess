@@ -5,7 +5,7 @@
 //   POST   /sessions/{id}/inject  -> body {text}; tokenize + decode into KV cache (no gen)
 //   POST   /sessions/{id}/generate-> body {max_tokens, stream, ...}
 //       stream=false (default): returns slice-1 JSON {text, tokens, ...}
-//       stream=true : text/event-stream; one event per token + a final usage event
+//       stream=true : SSE token/tool-call events, then exactly one terminal done/error event
 //   DELETE /sessions/{id}         -> free the session
 //   GET    /health                -> liveness
 //
@@ -151,12 +151,12 @@ static ModelConfig load_config_for_model(const std::string & model_path, const s
 
 double now_s();
 
-// A session parked in host RAM (offloaded from VRAM). The live llama_context
-// has been freed (that is what actually releases VRAM — llama_memory_seq_rm only
-// clears logical cells, not the pre-allocated KV buffer); this holds the
-// serialized seq-0 state so the session can be loaded back into a fresh
-// context unchanged. `state` is the per-sequence serializable state (KV +, for
-// hybrid models like Qwen3.5/MiniCPM-V-4.6, the SSM/Mamba recurrent state).
+// A session parked in host RAM (offloaded from the pooled context). Its internal
+// sequence has been released, reclaiming a live-sequence slot and logical KV
+// capacity; the process-wide pooled buffers remain allocated. `state` holds the
+// serialized target-sequence state so load can restore it into a newly reserved
+// pooled sequence. This includes KV plus, for hybrid models such as
+// Qwen3.5/MiniCPM-V-4.6, the SSM/Mamba recurrent state.
 struct OffloadedState {
     std::vector<uint8_t> state;                       // llama_state_seq_get_data output
     llama_token          last_token = LLAMA_TOKEN_NULL; // for logits refresh on load
@@ -1125,16 +1125,15 @@ int main(int argc, char ** argv) {
         res.set_content(body.dump(), "application/json");
     });
 
-    // ---- POST /sessions/{id}/fork : copy this session's KV into a NEW session ----
+    // ---- POST /sessions/{id}/fork : alias this session's prefix into a NEW session ----
     //
-    // Approach A' (see docs/decisions/0004-fork-copy-semantics.md): snapshot the
-    // source sequence's KV via llama_state_seq_get_data and restore it into a
-    // fresh context (llama_state_seq_set_data). The forked session owns an
-    // independent K/V copy, so source and fork generate independently. Forkable
-    // at any point — it snapshots whatever the source cache currently holds
-    // (after a text inject, an audio inject, or a generate). The source session
-    // is untouched. (Slice 5 will swap this for llama_memory_seq_cp once
-    // sessions become sequences in a pooled context — see the ADR.)
+    // Approach B (ADRs 0004 and 0009): allocate another sequence in the pooled
+    // context and copy the source's sequence metadata with llama_memory_seq_cp.
+    // The immutable prefix KV cells are shared; only later divergent suffixes
+    // consume additional cells. Source and fork keep independent sequence,
+    // sampler, and generation state. Forking snapshots whatever cache the source
+    // currently holds (after text/audio injection or generation) without
+    // modifying the source.
     svr.Post(R"(/sessions/[^/]+/fork)", [&](const httplib::Request &req, httplib::Response &res) {
         std::string sid = extract_session_id(req.path, "fork");
         const int64_t sid_num = parse_session_id_num(sid);
