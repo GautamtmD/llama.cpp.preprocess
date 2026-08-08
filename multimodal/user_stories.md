@@ -125,9 +125,11 @@ Expected:
 - All ready jobs decode in one batched pass. Each cadence waits at most the
   bounded 10 ms batching window for active peers, then drains ready work; a job
   blocked on stream I/O or parsing cannot stall unrelated generations. Each
-  session sees correct, independent output. Unconstrained greedy transitions are
-  canonical by exact lineage/EOS policy/generation step, so batched, cancelled,
-  and standalone replays remain byte-identical across GPU batch shapes.
+  session sees correct, independent output. A streaming scheduler failure ends
+  that job with an SSE `error` event, never an ordinary `done`, and does not leak
+  into other jobs. Unconstrained greedy transitions are canonical by exact
+  lineage/EOS policy/generation step, so batched, cancelled, and standalone
+  replays remain byte-identical across GPU batch shapes.
 - Forking within the pooled context uses `llama_memory_seq_cp`: ~0 ms + ~0
   incremental resident GPU memory beyond the fixed pool (vs EUS-2's A':
   ~0.5–0.7 s + ~350 MiB).
@@ -147,10 +149,10 @@ Test:
 - `tests/test_cross_session_batching.py` (single pool, fork latency/memory,
   six-way decode proof and parity, sampler/grammar isolation, capacity reuse,
   same-session 409, cancellation race, divergent-history row isolation,
-  transactional and per-job-isolated failed initialization, bounded progress
-  behind a slow streaming/tool-parsing job, bounded lineage-cache reclamation,
-  current-boundary replay, repeated cancellation/output isolation, atomic
-  delete/snapshot races, truthful
+  transactional and per-job-isolated failed initialization over JSON and SSE,
+  bounded progress behind a slow streaming/tool-parsing job, bounded
+  lineage-cache reclamation, current-boundary replay, repeated
+  cancellation/output isolation, atomic delete/snapshot races, truthful
   ownership/GPU telemetry, and shared-prefix lifecycle)
 - `tests/test_context_limits.py` (small `--n-batch` text/multimodal chunking,
   small-context generation partial-success and boundary parity, plus atomic

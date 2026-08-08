@@ -1701,21 +1701,30 @@ int main(int argc, char ** argv) {
                 if (r.cancelled) {
                     std::cerr << "generation cancelled for " << sid << "; rewind=" << r.rewind_s * 1000.0 << " ms\n";
                 }
-                const double tok_s = (r.gen_s > 0) ? (r.ids.size() / r.gen_s) : 0.0;
-                json done_body = {
-                    {"type", "done"},
-                    {"n_tokens", r.ids.size()},
-                    {"gen_ms", (int)(r.gen_s * 1000)},
-                    {"gen_ms_precise", r.gen_s * 1000.0},
-                    {"tokens_per_s", tok_s},
-                    {"cache_size", r.cache_size},
-                };
-                if (!r.tool_calls.empty()) done_body["tool_calls"] = r.tool_calls;
-                if (r.error == "session context full" && !r.ids.empty()) {
-                    done_body["finish_reason"] = "context_full";
+                const bool partial_context_full =
+                    r.error == "session context full" && !r.ids.empty();
+                json terminal;
+                if (!r.error.empty() && !partial_context_full) {
+                    terminal = {
+                        {"type", "error"},
+                        {"error", r.error},
+                        {"code", r.error == "session context full" ? 409 : 500},
+                    };
+                } else {
+                    const double tok_s = (r.gen_s > 0) ? (r.ids.size() / r.gen_s) : 0.0;
+                    terminal = {
+                        {"type", "done"},
+                        {"n_tokens", r.ids.size()},
+                        {"gen_ms", (int)(r.gen_s * 1000)},
+                        {"gen_ms_precise", r.gen_s * 1000.0},
+                        {"tokens_per_s", tok_s},
+                        {"cache_size", r.cache_size},
+                    };
+                    if (!r.tool_calls.empty()) terminal["tool_calls"] = r.tool_calls;
+                    if (partial_context_full) terminal["finish_reason"] = "context_full";
                 }
-                std::string done = sse_event(done_body);
-                ds.write(done.data(), done.size());
+                std::string terminal_event = sse_event(terminal);
+                ds.write(terminal_event.data(), terminal_event.size());
                 ds.done();
                 return true;
             }

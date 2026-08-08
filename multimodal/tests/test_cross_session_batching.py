@@ -401,7 +401,10 @@ def test_divergent_histories_never_merge_equal_position_token_rows(base, make_se
 
 
 @pytest.mark.requires("audio")
-def test_media_ending_job_error_is_isolated_from_valid_batch_jobs(base, make_session):
+@pytest.mark.parametrize("stream_invalid", [False, True], ids=["json", "sse"])
+def test_media_ending_job_error_is_isolated_from_valid_batch_jobs(
+    base, make_session, stream_invalid
+):
     source = make_session()
     source_inject = _inject(base, source, "Per-job logits error isolation sentinel. ")
 
@@ -433,27 +436,49 @@ def test_media_ending_job_error_is_isolated_from_valid_batch_jobs(base, make_ses
             json={"max_tokens": 1, "temperature": 0.0, "ignore_eos": True},
         )
 
-    def run_invalid() -> requests.Response:
+    def run_invalid() -> tuple[requests.Response, list[dict]]:
         barrier.wait(timeout=30)
         # Keep the invalid request inside the same scheduler batching window,
         # behind valid requests whose initialization plans must still run.
         time.sleep(0.0005)
-        return _post(
+        response = _post(
             base,
             f"/sessions/{bad}/generate",
-            json={"max_tokens": 1, "temperature": 0.0, "ignore_eos": True},
+            json={
+                "stream": stream_invalid,
+                "max_tokens": 1,
+                "temperature": 0.0,
+                "ignore_eos": True,
+            },
+            stream=stream_invalid,
         )
+        events = []
+        if stream_invalid:
+            for line in response.iter_lines(decode_unicode=True):
+                if line and line.startswith("data: "):
+                    events.append(json.loads(line[len("data: ") :]))
+        return response, events
 
     try:
         with ThreadPoolExecutor(max_workers=6) as executor:
             valid_futures = [executor.submit(run_valid, sid) for sid in sessions]
             invalid_future = executor.submit(run_invalid)
             valid_responses = [future.result(timeout=30) for future in valid_futures]
-            invalid_response = invalid_future.result(timeout=30)
+            invalid_response, invalid_events = invalid_future.result(timeout=30)
 
         shared_error = "sequence ends in media embeddings"
-        assert invalid_response.status_code == 500, invalid_response.text
-        assert shared_error in invalid_response.text
+        if stream_invalid:
+            assert invalid_response.status_code == 200, invalid_response.text
+            assert invalid_events == [
+                {
+                    "type": "error",
+                    "error": f"{shared_error}; inject text before generation",
+                    "code": 500,
+                }
+            ]
+        else:
+            assert invalid_response.status_code == 500, invalid_response.text
+            assert shared_error in invalid_response.text
         assert all(response.status_code == 200 for response in valid_responses), (
             "the media-ending job's initialization error leaked into valid jobs: "
             f"{[(response.status_code, response.text) for response in valid_responses]}"

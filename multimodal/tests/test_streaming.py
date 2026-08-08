@@ -7,7 +7,9 @@ manually (no extra deps).
 
 from __future__ import annotations
 
+import base64
 import json
+import struct
 from collections.abc import Iterator
 
 import pytest
@@ -78,6 +80,51 @@ def test_stream_text_concatenates(base, make_session):
     # (whether it actually counts 1-5) depends on chat-template formatting.
     assert isinstance(text, str)
     print(f"  [stream] text: {text!r}")
+
+
+@pytest.mark.requires("audio")
+def test_stream_media_ending_returns_terminal_error(base, make_session):
+    sid = make_session()
+    pcm = struct.pack("<640f", *([0.0] * 640))
+    injected = requests.post(
+        f"{base}/sessions/{sid}/inject",
+        json={"audio": base64.b64encode(pcm).decode("ascii")},
+        timeout=60,
+    )
+    assert injected.status_code == 200, injected.text
+    before = requests.get(f"{base}/sessions/{sid}", timeout=30).json()
+
+    response = requests.post(
+        f"{base}/sessions/{sid}/generate",
+        json={"stream": True, "max_tokens": 1, "temperature": 0.0},
+        stream=True,
+        timeout=60,
+    )
+    assert response.status_code == 200, response.text
+    assert "text/event-stream" in response.headers.get("content-type", "")
+    events = list(_parse_sse(response))
+    assert events == [
+        {
+            "type": "error",
+            "error": "sequence ends in media embeddings; inject text before generation",
+            "code": 500,
+        }
+    ]
+
+    after = requests.get(f"{base}/sessions/{sid}", timeout=30).json()
+    assert after["cache_size"] == before["cache_size"]
+    assert after["boundary_token"] == before["boundary_token"] == -1
+
+    non_streaming = requests.post(
+        f"{base}/sessions/{sid}/generate",
+        json={"max_tokens": 1, "temperature": 0.0},
+        timeout=60,
+    )
+    assert non_streaming.status_code == 500, non_streaming.text
+    assert non_streaming.json() == {
+        "error": "sequence ends in media embeddings; inject text before generation",
+        "code": 500,
+    }
 
 
 def test_stream_unknown_session_404(base):
