@@ -136,6 +136,9 @@ Expected:
 - Shared-prefix sessions do NOT duplicate BASE KV — only the divergent suffix KV
   per fork. Host-side lineage caches reclaim recycled-session branches once no
   live sequence, mutation, checkpoint, or canonical replay path owns them.
+- Multipart media requests own every decoded bitmap with RAII until request
+  completion. A later decode/parser/template error or mtmd injection failure
+  releases earlier media and leaves the target sequence unchanged.
 
 Latency / performance budget (implemented and measured):
 - Fork (`seq_cp`) in a pooled context: **< 5 ms, < 10 MiB** (~0 in practice; vs
@@ -157,6 +160,8 @@ Test:
 - `tests/test_context_limits.py` (small `--n-batch` text/multimodal chunking,
   small-context generation partial-success and boundary parity, plus atomic
   multimodal preflight/retry invariants)
+- `tests/test_multimodal.py` (normal multi-image injection plus malformed
+  multipart/malformed-message cleanup and bounded server RSS)
 
 > [ADR 0004](../../../docs/decisions/0004-fork-copy-semantics.md) mandates
 > migrating fork to B (`seq_cp`) here; this unblocks the engagement pipeline's

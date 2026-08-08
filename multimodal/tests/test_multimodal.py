@@ -17,8 +17,10 @@ instance started without ``--mmproj``. Point the env var
 from __future__ import annotations
 
 import base64
+import ctypes
 import io
 import os
+from pathlib import Path
 
 import pytest
 import requests
@@ -39,6 +41,53 @@ def _png_b64(img: Image.Image) -> str:
 def _solid_png_b64(color: tuple[int, int, int], size: tuple[int, int]) -> str:
     img = Image.new("RGB", size, color)
     return _png_b64(img)
+
+
+def _process_rss_bytes(pid: int) -> int:
+    if os.name == "nt":
+        from ctypes import wintypes
+
+        class ProcessMemoryCounters(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(ProcessMemoryCounters),
+            wintypes.DWORD,
+        ]
+        handle = kernel32.OpenProcess(0x0400, False, pid)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            counters = ProcessMemoryCounters()
+            counters.cb = ctypes.sizeof(counters)
+            if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return int(counters.WorkingSetSize)
+        finally:
+            kernel32.CloseHandle(handle)
+
+    statm = Path(f"/proc/{pid}/statm")
+    if statm.exists():
+        resident_pages = int(statm.read_text(encoding="ascii").split()[1])
+        return resident_pages * os.sysconf("SC_PAGE_SIZE")
+    pytest.skip("RSS measurement is unsupported on this platform")
 
 
 # ------------------------------- /info --------------------------------------
@@ -218,6 +267,70 @@ def test_inject_multi_image_interleaved(base, make_session):
     assert g.status_code == 200, g.text
     assert isinstance(g.json()["text"], str) and len(g.json()["text"]) > 0
     print(f"  [multi-image] model said: {g.json()['text']!r}")
+
+
+@pytest.mark.requires("image")
+def test_malformed_multi_image_releases_earlier_bitmaps(base, make_session, server_pid):
+    sid = make_session()
+    valid = _solid_png_b64((64, 128, 192), (1024, 1024))
+    invalid = base64.b64encode(b"not an image").decode("ascii")
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "data": valid},
+                    {"type": "image", "data": invalid},
+                ],
+            }
+        ]
+    }
+
+    def reject() -> None:
+        response = requests.post(f"{base}/sessions/{sid}/inject", json=body, timeout=120)
+        assert response.status_code == 400, response.text
+        assert "failed to decode image" in response.text
+
+    for _ in range(3):
+        reject()
+    rss_before = _process_rss_bytes(server_pid)
+    for _ in range(24):
+        reject()
+    rss_after = _process_rss_bytes(server_pid)
+    retained = rss_after - rss_before
+    print(
+        f"  [multipart-rss] before={rss_before} after={rss_after} "
+        f"retained={retained / (1024 * 1024):.1f} MiB"
+    )
+    assert retained < 24 * 1024 * 1024, (
+        f"24 rejected multipart requests retained {retained / (1024 * 1024):.1f} MiB RSS"
+    )
+
+    status = requests.get(f"{base}/sessions/{sid}", timeout=30)
+    assert status.status_code == 200, status.text
+    assert status.json()["cache_size"] == 0
+
+
+@pytest.mark.requires("image")
+def test_malformed_message_after_image_leaves_session_unchanged(base, make_session):
+    sid = make_session()
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "image", "data": _solid_png_b64((255, 0, 0), (224, 224))}],
+            },
+            {
+                "role": 123,
+                "content": "malformed role after an already decoded bitmap",
+            },
+        ]
+    }
+    response = requests.post(f"{base}/sessions/{sid}/inject", json=body, timeout=120)
+    assert response.status_code == 400, response.text
+    status = requests.get(f"{base}/sessions/{sid}", timeout=30)
+    assert status.status_code == 200, status.text
+    assert status.json()["cache_size"] == 0
 
 
 # --------------------- error path: image without --mmproj -------------------

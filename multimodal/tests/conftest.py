@@ -180,6 +180,14 @@ def base(_ensure_server):
     return BASE
 
 
+@pytest.fixture(scope="session")
+def server_pid(_ensure_server):
+    """PID for process-footprint regressions; unavailable for manual servers."""
+    if not _PROCS:
+        pytest.skip("process-footprint regression requires a self-booted server")
+    return _PROCS[-1].pid
+
+
 @pytest.fixture
 def make_session(base):
     """Create a session, yield its id, and ensure it's deleted at teardown."""

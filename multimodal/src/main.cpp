@@ -759,17 +759,9 @@ GenResult run_generation(
 
 // ---- multimodal helpers (outside anon namespace so they can be forward-declared) ----
 
-// Decode image bytes (PNG/JPEG/BMP/...) into an mtmd_bitmap via the mtmd
-// helper. We use the public helper (not stb directly) because the stb_image
-// implementation is compiled statically into the mtmd library and its symbols
-// are not exported from mtmd.dll. The helper also auto-detects audio files,
-// which sets up slice 3b (audio inject) for free.
-// Returns nullptr on failure. Caller owns the result (free with mtmd_bitmap_free).
-// Decode image OR audio bytes into an mtmd_bitmap via the mtmd helper. The
-// helper auto-detects the media type by magic bytes: images via stb_image
-// (jpg/png/bmp/...), audio via miniaudio (wav/mp3/flac) resampled to the
-// projector's sample rate (mtmd_get_audio_sample_rate). Returns nullptr on
-// failure. Caller owns the result (free with mtmd_bitmap_free).
+// Decode image or audio bytes into an independently owned mtmd bitmap. The
+// upstream helper is thread-safe; mtmd's official `bitmap_ptr` wrapper releases
+// the result with the context-free `mtmd_bitmap_free` function.
 static mtmd_bitmap * bitmap_from_media_bytes(mtmd_context * mtmd_ctx,
                                              const std::string & bytes) {
     mtmd_helper_bitmap_wrapper wrap = mtmd_helper_bitmap_init_from_buf(
@@ -777,9 +769,10 @@ static mtmd_bitmap * bitmap_from_media_bytes(mtmd_context * mtmd_ctx,
         reinterpret_cast<const unsigned char *>(bytes.data()),
         bytes.size(),
         /*placeholder*/ false);
-    // video_ctx is non-null only for video input, which we don't support here.
-    // (Image/audio decode produces a bitmap with a null video_ctx.)
-    return wrap.bitmap;  // may be nullptr on failure
+    mtmd::bitmap_ptr bitmap{wrap.bitmap};
+    mtmd_helper::video_ptr video{wrap.video_ctx};
+    if (video) return nullptr;  // video is outside this endpoint's contract
+    return bitmap.release();  // may be nullptr on failure
 }
 
 static bool decode_tokens_in_chunks(
@@ -826,7 +819,7 @@ struct MtmdInjectResult {
 
 static MtmdInjectResult mtmd_inject(mtmd_context * mtmd_ctx, llama_context * ctx,
                                     llama_seq_id seq_id, const std::string & text,
-                                    const std::vector<mtmd_bitmap *> & bitmaps,
+                                    const std::vector<mtmd::bitmap_ptr> & bitmaps,
                                     llama_pos context_limit) {
     mtmd_input_text input_text;
     input_text.text          = text.c_str();
@@ -836,7 +829,7 @@ static MtmdInjectResult mtmd_inject(mtmd_context * mtmd_ctx, llama_context * ctx
     mtmd_input_chunks * chunks = mtmd_input_chunks_init();
     std::vector<const mtmd_bitmap *> bptrs;
     bptrs.reserve(bitmaps.size());
-    for (auto * b : bitmaps) bptrs.push_back(b);
+    for (const auto & bitmap : bitmaps) bptrs.push_back(bitmap.get());
 
     int32_t rc = mtmd_tokenize(mtmd_ctx, chunks, &input_text,
                                bptrs.data(), bptrs.size());
@@ -1204,7 +1197,7 @@ int main(int argc, char ** argv) {
                 }
                 // First pass: collect any media parts across all messages, replacing
                 // each with the mtmd media marker in the text content.
-                std::vector<mtmd_bitmap *> bitmaps;  // owned; freed by the scheduler
+                std::vector<mtmd::bitmap_ptr> bitmaps;
                 const std::string & media_marker = app.media_marker;
                 auto replace_media_in_content = [&](const json & content) -> std::string {
                     if (content.is_string()) {
@@ -1233,13 +1226,14 @@ int main(int argc, char ** argv) {
                                 b64 = b64.substr(comma + 1);
                             }
                             std::string bytes = base64_decode(b64);
-                            mtmd_bitmap * bmp = app.scheduler->invoke_preserving_logits([&](llama_context *) {
-                                return bitmap_from_media_bytes(app.mtmd_ctx, bytes);
-                            });
+                            mtmd::bitmap_ptr bmp{
+                                app.scheduler->invoke_preserving_logits([&](llama_context *) {
+                                    return bitmap_from_media_bytes(app.mtmd_ctx, bytes);
+                                })};
                             if (!bmp) {
                                 throw std::runtime_error("failed to decode image");
                             }
-                            bitmaps.push_back(bmp);
+                            bitmaps.push_back(std::move(bmp));
                             out += media_marker;
                             used_multimodal = true;
                         } else if (ptype == "audio" || ptype == "input_audio") {
@@ -1262,13 +1256,14 @@ int main(int argc, char ** argv) {
                                 b64 = b64.substr(comma + 1);
                             }
                             std::string bytes = base64_decode(b64);
-                            mtmd_bitmap * bmp = app.scheduler->invoke_preserving_logits([&](llama_context *) {
-                                return bitmap_from_media_bytes(app.mtmd_ctx, bytes);
-                            });
+                            mtmd::bitmap_ptr bmp{
+                                app.scheduler->invoke_preserving_logits([&](llama_context *) {
+                                    return bitmap_from_media_bytes(app.mtmd_ctx, bytes);
+                                })};
                             if (!bmp) {
                                 throw std::runtime_error("failed to decode audio");
                             }
-                            bitmaps.push_back(bmp);
+                            bitmaps.push_back(std::move(bmp));
                             out += media_marker;
                             used_multimodal = true;
                         }
@@ -1314,7 +1309,6 @@ int main(int argc, char ** argv) {
                     MtmdInjectResult inject_result = app.scheduler->invoke_invalidating_logits([&](llama_context * ctx) {
                         const auto result = mtmd_inject(
                             app.mtmd_ctx, ctx, seq_id, text, bitmaps, app.n_ctx_per_session);
-                        for (auto * bitmap : bitmaps) mtmd_bitmap_free(bitmap);
                         return result;
                     });
                     const double dt = now_s() - t0;
