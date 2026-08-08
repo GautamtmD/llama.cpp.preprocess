@@ -332,6 +332,121 @@ def test_stop_sequences(base, make_session):
     assert "banana" in r2.json()["text"].lower(), r2.json()["text"]
 
 
+def test_non_streaming_stop_commits_only_the_completion_token(base, make_session):
+    source = make_session()
+    _inject_chat(base, source, "Count from 1 to 5.")
+    forked = requests.post(f"{base}/sessions/{source}/fork", timeout=120)
+    assert forked.status_code == 200, forked.text
+    subject = forked.json()["session_id"]
+    try:
+        before = requests.get(f"{base}/sessions/{subject}", timeout=30).json()
+        control = _generate(base, source, max_tokens=1).json()
+        assert control["n_tokens"] == 1, control
+        assert control["text"], control
+
+        stopped_response = _generate(
+            base,
+            subject,
+            max_tokens=5,
+            stop=[control["text"]],
+        )
+        assert stopped_response.status_code == 200, stopped_response.text
+        stopped = stopped_response.json()
+        assert stopped["text"] == "", stopped
+        assert stopped["n_tokens"] == 1, stopped
+        assert stopped["tokens"] == control["tokens"], (stopped, control)
+        assert stopped["cache_size"] == before["cache_size"] + 1, (stopped, before)
+        assert stopped["cache_size"] == control["cache_size"], (stopped, control)
+
+        control_next = _generate(base, source, max_tokens=5).json()
+        subject_next = _generate(base, subject, max_tokens=5).json()
+        assert subject_next["tokens"] == control_next["tokens"], (
+            subject_next,
+            control_next,
+        )
+        assert subject_next["text"] == control_next["text"], (
+            subject_next,
+            control_next,
+        )
+        assert subject_next["cache_size"] == control_next["cache_size"]
+    finally:
+        requests.delete(f"{base}/sessions/{subject}", timeout=30)
+
+
+@pytest.mark.parametrize("stop", ["", ["valid", ""]], ids=["empty-string", "empty-member"])
+@pytest.mark.parametrize("stream", [False, True], ids=["json", "stream-request"])
+def test_empty_stop_sequence_returns_400_without_mutating_session(base, make_session, stop, stream):
+    sid = make_session()
+    _inject_chat(base, sid, "Say hello.")
+    before = requests.get(f"{base}/sessions/{sid}", timeout=30).json()
+
+    response = _generate(base, sid, stop=stop, stream=stream, max_tokens=5)
+
+    assert response.status_code == 400, response.text
+    assert response.headers["Content-Type"].startswith("application/json")
+    assert response.json()["code"] == 400
+    assert "empty" in response.json()["error"]
+    assert requests.get(f"{base}/sessions/{sid}", timeout=30).json() == before
+    assert _generate(base, sid, max_tokens=1).status_code == 200
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["json", "sse"])
+def test_tool_generation_honors_stop_at_first_token(base, make_session, stream):
+    source = make_session()
+    _inject_chat(
+        base,
+        source,
+        "What is the weather in Paris?",
+        tools=WEATHER_TOOL,
+        tool_choice="required",
+    )
+    forked = requests.post(f"{base}/sessions/{source}/fork", timeout=120)
+    assert forked.status_code == 200, forked.text
+    subject = forked.json()["session_id"]
+    try:
+        before = requests.get(f"{base}/sessions/{subject}", timeout=30).json()
+        control = _generate(
+            base,
+            source,
+            tools=WEATHER_TOOL,
+            tool_choice="required",
+            max_tokens=1,
+        ).json()
+        assert control["n_tokens"] == 1, control
+        assert control["text"], control
+
+        stopped_response = _generate(
+            base,
+            subject,
+            tools=WEATHER_TOOL,
+            tool_choice="required",
+            stop=[control["text"]],
+            stream=stream,
+            max_tokens=5,
+        )
+        assert stopped_response.status_code == 200, stopped_response.text
+        if stream:
+            events = list(_parse_sse(stopped_response))
+            assert not [event for event in events if event.get("type") in {"token", "tool_call"}], (
+                events
+            )
+            done = [event for event in events if event.get("type") == "done"]
+            assert len(done) == 1, events
+            assert done[0]["n_tokens"] == 1, done[0]
+            assert done[0]["cache_size"] == before["cache_size"] + 1
+        else:
+            stopped = stopped_response.json()
+            assert stopped["text"] == "", stopped
+            assert stopped["n_tokens"] == 1, stopped
+            assert stopped["tokens"] == control["tokens"], (stopped, control)
+            assert stopped["cache_size"] == before["cache_size"] + 1, (
+                stopped,
+                before,
+            )
+    finally:
+        requests.delete(f"{base}/sessions/{subject}", timeout=30)
+
+
 def test_ignore_eos(base, make_session):
     """ignore_eos forces generation to run to exactly max_tokens."""
     sid = make_session()

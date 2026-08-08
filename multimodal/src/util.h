@@ -11,9 +11,11 @@
 #include "execution_policy.h"
 #include "nlohmann/json.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // RFC4648 base64 decode (no URL-safe; ignores whitespace and '='; skips any
@@ -83,7 +85,13 @@ inline nlohmann::ordered_json error_body(const std::string & msg, int code) {
 inline std::string validate_generation_constraints(
     const nlohmann::ordered_json & response_format,
     const std::string & grammar,
-    bool tools_active) {
+    bool tools_active,
+    const std::vector<std::string> & stops = {}) {
+    if (std::any_of(stops.begin(), stops.end(), [](const std::string & stop) {
+            return stop.empty();
+        })) {
+        return "stop sequences must not be empty";
+    }
     if (response_format.is_null()) return "";
     if (!response_format.is_object()) {
         return "response_format must be an object";
@@ -117,6 +125,81 @@ inline std::string validate_generation_constraints(
     }
     return "";
 }
+
+struct StopMatchResult {
+    bool matched = false;
+    bool emission_failed = false;
+};
+
+// Incremental byte matcher shared by JSON and SSE generation. It retains only a
+// suffix that could still complete a stop sequence, so stop bytes never reach
+// the response/parser. Empty stops are ignored defensively; request validation
+// rejects them before this path.
+class StopSequenceMatcher {
+public:
+    template <typename Emit>
+    StopMatchResult append(
+        std::string_view text,
+        const std::vector<std::string> & stops,
+        Emit && emit) {
+        if (matched_) return {true, false};
+        buffer_.append(text.data(), text.size());
+
+        size_t earliest = std::string::npos;
+        for (const std::string & stop : stops) {
+            if (stop.empty()) continue;
+            earliest = std::min(earliest, buffer_.find(stop));
+        }
+        if (earliest != std::string::npos) {
+            bool emitted = true;
+            if (earliest > 0) {
+                emitted = emit(std::string_view(buffer_.data(), earliest));
+            }
+            buffer_.clear();
+            matched_ = true;
+            return {true, !emitted};
+        }
+
+        size_t hold = 0;
+        for (const std::string & stop : stops) {
+            if (stop.empty()) continue;
+            const size_t maximum =
+                std::min(buffer_.size(), stop.size() - 1);
+            for (size_t length = maximum; length > hold; --length) {
+                if (buffer_.compare(
+                        buffer_.size() - length, length,
+                        stop, 0, length) == 0) {
+                    hold = length;
+                    break;
+                }
+            }
+        }
+
+        const size_t emit_length = buffer_.size() - hold;
+        bool emitted = true;
+        if (emit_length > 0) {
+            emitted = emit(std::string_view(buffer_.data(), emit_length));
+            buffer_.erase(0, emit_length);
+        }
+        return {false, !emitted};
+    }
+
+    template <typename Emit>
+    StopMatchResult finish(Emit && emit) {
+        if (matched_ || buffer_.empty()) return {matched_, false};
+        const bool emitted = emit(std::string_view(buffer_));
+        buffer_.clear();
+        return {false, !emitted};
+    }
+
+    bool matched() const {
+        return matched_;
+    }
+
+private:
+    std::string buffer_;
+    bool matched_ = false;
+};
 
 // SSE event frame: "data: <json>\n\n".
 inline std::string sse_event(const nlohmann::ordered_json & j) {

@@ -82,6 +82,62 @@ def test_stream_text_concatenates(base, make_session):
     print(f"  [stream] text: {text!r}")
 
 
+def test_streaming_stop_commits_only_the_completion_token(base, make_session):
+    source = make_session()
+    _inject_chat(base, source, "Count from 1 to 5.")
+    forked = requests.post(f"{base}/sessions/{source}/fork", timeout=120)
+    assert forked.status_code == 200, forked.text
+    subject = forked.json()["session_id"]
+    try:
+        before = requests.get(f"{base}/sessions/{subject}", timeout=30).json()
+        control_response = requests.post(
+            f"{base}/sessions/{source}/generate",
+            json={"max_tokens": 1, "temperature": 0.0},
+            timeout=120,
+        )
+        assert control_response.status_code == 200, control_response.text
+        control = control_response.json()
+        assert control["n_tokens"] == 1, control
+        assert control["text"], control
+
+        stopped_response = requests.post(
+            f"{base}/sessions/{subject}/generate",
+            json={
+                "stream": True,
+                "max_tokens": 5,
+                "temperature": 0.0,
+                "stop": [control["text"]],
+            },
+            stream=True,
+            timeout=120,
+        )
+        assert stopped_response.status_code == 200, stopped_response.text
+        events = list(_parse_sse(stopped_response))
+        assert not [event for event in events if event.get("type") == "token"], events
+        done = [event for event in events if event.get("type") == "done"]
+        assert len(done) == 1, events
+        assert done[0]["n_tokens"] == 1, done[0]
+        assert done[0]["cache_size"] == before["cache_size"] + 1, (done[0], before)
+
+        control_next = requests.post(
+            f"{base}/sessions/{source}/generate",
+            json={"max_tokens": 5, "temperature": 0.0},
+            timeout=120,
+        ).json()
+        subject_next = requests.post(
+            f"{base}/sessions/{subject}/generate",
+            json={"max_tokens": 5, "temperature": 0.0},
+            timeout=120,
+        ).json()
+        assert subject_next["tokens"] == control_next["tokens"], (
+            subject_next,
+            control_next,
+        )
+        assert subject_next["cache_size"] == control_next["cache_size"]
+    finally:
+        requests.delete(f"{base}/sessions/{subject}", timeout=30)
+
+
 @pytest.mark.requires("audio")
 def test_stream_media_ending_returns_terminal_error(base, make_session):
     sid = make_session()

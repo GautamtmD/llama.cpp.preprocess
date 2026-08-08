@@ -190,6 +190,11 @@ static void test_generation_constraint_validation() {
               "", false).empty());
     CHECK(validate_generation_constraints(
               json{{"type", "json_object"}}, R"(root ::= "x")", true).empty());
+    CHECK(validate_generation_constraints(
+              json(), "", false, std::vector<std::string>{"valid"}).empty());
+    CHECK(validate_generation_constraints(
+              json(), "", false, std::vector<std::string>{""}).find(
+              "stop sequences must not be empty") != std::string::npos);
 
     CHECK(validate_generation_constraints(json::array(), "", false).find(
               "response_format must be an object") != std::string::npos);
@@ -210,6 +215,43 @@ static void test_generation_constraint_validation() {
               json{{"type", "json_object"}}, R"(root ::= "x")", false).find(
               "cannot specify both response_format and grammar") != std::string::npos);
 }
+
+static void test_stop_sequence_matcher() {
+    std::string emitted;
+    auto emit = [&emitted](std::string_view text) {
+        emitted.append(text);
+        return true;
+    };
+
+    StopSequenceMatcher spanning;
+    const std::vector<std::string> end_stop{"END"};
+    auto first = spanning.append("prefix E", end_stop, emit);
+    CHECK(!first.matched);
+    CHECK(!first.emission_failed);
+    CHECK_EQ(emitted, std::string("prefix "));
+    auto second = spanning.append("ND hidden", end_stop, emit);
+    CHECK(second.matched);
+    CHECK(!second.emission_failed);
+    CHECK_EQ(emitted, std::string("prefix "));
+
+    emitted.clear();
+    StopSequenceMatcher earliest;
+    const std::vector<std::string> ordered_late_first{"LATE", "EARLY"};
+    auto ordered = earliest.append(
+        "visible EARLY hidden LATE", ordered_late_first, emit);
+    CHECK(ordered.matched);
+    CHECK_EQ(emitted, std::string("visible "));
+
+    emitted.clear();
+    StopSequenceMatcher defensive_empty;
+    const std::vector<std::string> empty_and_real{"", "STOP"};
+    auto safe = defensive_empty.append("ordinary text", empty_and_real, emit);
+    CHECK(!safe.matched);
+    CHECK(!safe.emission_failed);
+    defensive_empty.finish(emit);
+    CHECK_EQ(emitted, std::string("ordinary text"));
+}
+
 
 static void test_server_argument_validation() {
     auto expect_error = [](std::vector<std::string> args, const std::string & expected) {
@@ -275,6 +317,7 @@ int main() {
     test_server_argument_validation();
     test_model_config();
     test_generation_constraint_validation();
+    test_stop_sequence_matcher();
 
     if (g_failures) {
         std::cerr << g_failures << " util test check(s) FAILED\n";

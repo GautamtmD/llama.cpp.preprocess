@@ -356,40 +356,6 @@ common_params_sampling build_sampling_params(const AppState & app, const GenPara
     return sparams;
 }
 
-// Streaming stop-sequence buffering. Tokens accumulate in `buf`; this flushes
-// the longest safe prefix to the SSE stream, holding back any tail that is a
-// partial prefix of a stop sequence (so raw stop characters never leak). Returns
-// true (and clears the matched part) if a FULL stop sequence is present, meaning
-// generation should stop. `emit` writes one chunk to the stream.
-struct stop_match { bool matched = false; };
-stop_match flush_stream_buffer(std::string & buf, const std::vector<std::string> & stops,
-                               const std::function<bool(const std::string &)> & emit) {
-    // 1. Full stop present? Truncate the buffer at it and stop.
-    for (const auto & s : stops) {
-        if (s.empty()) continue;
-        auto pos = buf.find(s);
-        if (pos != std::string::npos) {
-            if (pos > 0) emit(buf.substr(0, pos));
-            buf.clear();
-            return {true};
-        }
-    }
-    // 2. Hold back the longest tail that is a proper prefix of some stop.
-    size_t hold = 0;
-    for (const auto & s : stops) {
-        const size_t maxp = std::min(buf.size(), s.size() - 1);
-        for (size_t l = maxp; l > hold; --l) {
-            if (std::equal(s.begin(), s.begin() + (std::ptrdiff_t) l, buf.end() - (std::ptrdiff_t) l)) {
-                hold = l;
-                break;
-            }
-        }
-    }
-    const size_t emit_len = buf.size() - hold;
-    if (emit_len > 0) emit(buf.substr(0, emit_len));
-    buf.erase(0, emit_len);
-    return {false};
-}
 
 int64_t register_session(AppState & app, llama_seq_id seq_id,
                          llama_token last_token = LLAMA_TOKEN_NULL) {
@@ -696,38 +662,70 @@ GenResult run_generation(
     const double t0 = now_s();
     bool keep_going = true;
 
+    StopSequenceMatcher stop_matcher;
     if (tool_calling_active) {
-        // ---- tool-calling loop: parse the accumulated text each step ----
-        std::string acc;                          // full accumulated generation
-        common_chat_msg prev_msg;                 // previous parse (for diffing)
-        std::vector<std::string> tc_ids_cache;    // stable ids across re-parses
+        // Tool parsing consumes only stop-safe text. Holding a possible stop
+        // prefix here also prevents partial stop bytes from leaking as SSE
+        // content/tool deltas.
+        std::string acc;
+        common_chat_msg prev_msg;
+        std::vector<std::string> tc_ids_cache;
         int tc_counter = 0;
         auto gen_tc_id = [&]() { return std::to_string(++tc_counter); };
         auto emit_diffs = [&](const std::vector<common_chat_msg_diff> & diffs) {
             for (const auto & d : diffs) {
                 if (!keep_going) break;
                 if (d.tool_call_index == std::string::npos) {
-                    // content / reasoning delta → token event
                     if (!d.content_delta.empty() && on_event) {
-                        keep_going = on_event(json{{"type", "token"}, {"token", d.content_delta}});
+                        keep_going = on_event(
+                            json{{"type", "token"}, {"token", d.content_delta}});
                         if (!keep_going) r.cancelled = true;
                     }
-                    if (keep_going && !d.reasoning_content_delta.empty() && on_event) {
-                        keep_going = on_event(json{{"type", "token"}, {"token", d.reasoning_content_delta}});
+                    if (keep_going &&
+                        !d.reasoning_content_delta.empty() && on_event) {
+                        keep_going = on_event(json{
+                            {"type", "token"},
+                            {"token", d.reasoning_content_delta},
+                        });
                         if (!keep_going) r.cancelled = true;
                     }
                 } else if (on_event) {
-                    json tc = {{"index", (int) d.tool_call_index}};
-                    if (!d.tool_call_delta.id.empty())        tc["id"]        = std::string("fc_") + d.tool_call_delta.id;
-                    if (!d.tool_call_delta.name.empty())      tc["name"]      = d.tool_call_delta.name;
-                    if (!d.tool_call_delta.arguments.empty()) tc["arguments"] = d.tool_call_delta.arguments;
-                    keep_going = on_event(json{{"type", "tool_call"}, {"tool_call", std::move(tc)}});
+                    json tc = {{"index", static_cast<int>(d.tool_call_index)}};
+                    if (!d.tool_call_delta.id.empty()) {
+                        tc["id"] = std::string("fc_") + d.tool_call_delta.id;
+                    }
+                    if (!d.tool_call_delta.name.empty()) {
+                        tc["name"] = d.tool_call_delta.name;
+                    }
+                    if (!d.tool_call_delta.arguments.empty()) {
+                        tc["arguments"] = d.tool_call_delta.arguments;
+                    }
+                    keep_going = on_event(json{
+                        {"type", "tool_call"},
+                        {"tool_call", std::move(tc)},
+                    });
                     if (!keep_going) r.cancelled = true;
                 }
             }
         };
+        auto parse_partial = [&]() {
+            // TECH DEBT: re-parse the entire safe text on each emitted chunk.
+            auto next = common_chat_parse(
+                acc, /*is_partial*/ true, parser_params);
+            if (next.empty()) return;
+            next.set_tool_call_ids(tc_ids_cache, gen_tc_id);
+            emit_diffs(common_chat_msg_diff::compute_diffs(prev_msg, next));
+            prev_msg = std::move(next);
+        };
+        auto append_safe = [&](std::string_view text) {
+            acc.append(text.data(), text.size());
+            r.text.append(text.data(), text.size());
+            return true;
+        };
+
         for (int step = 0; step < p.max_tokens && keep_going; ++step) {
-            if (generation && generation->cancelled->load(std::memory_order_relaxed)) {
+            if (generation &&
+                generation->cancelled->load(std::memory_order_relaxed)) {
                 r.cancelled = true;
                 break;
             }
@@ -739,92 +737,123 @@ GenResult run_generation(
             auto step_result = app.scheduler->step(
                 seq_id, smpl, boundary_token, canonical_greedy_policy,
                 static_cast<uint32_t>(step)).get();
-            if (!step_result.error.empty()) { r.error = step_result.error; break; }
+            if (!step_result.error.empty()) {
+                r.error = step_result.error;
+                break;
+            }
             if (step_result.eog) break;
-            llama_token id = step_result.token;
+
+            const llama_token id = step_result.token;
             r.cache_size = step_result.cache_size;
-            std::string piece = common_token_to_piece(app.vocab, id, true);
+            const std::string piece =
+                common_token_to_piece(app.vocab, id, true);
             common_sampler_accept(smpl, id, true);
             boundary_token = id;
-            r.ids.push_back((int64_t) id);
-            acc += piece;
-            r.text += piece;
-            // TECH DEBT: re-parse the ENTIRE accumulated text on each step —
-            // O(n²) over generation length. Incremental parsing is future work.
-            auto new_msg = common_chat_parse(acc, /*is_partial*/ true, parser_params);
-            if (!new_msg.empty()) {
-                new_msg.set_tool_call_ids(tc_ids_cache, gen_tc_id);
-                auto diffs = common_chat_msg_diff::compute_diffs(prev_msg, new_msg);
-                prev_msg = new_msg;
-                emit_diffs(diffs);
-            }
+            r.ids.push_back(static_cast<int64_t>(id));
+
+            const size_t safe_size_before = acc.size();
+            const StopMatchResult stop =
+                stop_matcher.append(piece, p.stop, append_safe);
+            if (acc.size() != safe_size_before) parse_partial();
             if (!keep_going) break;
+            if (stop.matched) {
+                keep_going = false;
+                break;
+            }
         }
-        // Final non-partial parse: emit remaining diffs and extract tool_calls.
-        auto final_msg = common_chat_parse(acc, /*is_partial*/ false, parser_params);
-        if (!final_msg.empty()) {
-            final_msg.set_tool_call_ids(tc_ids_cache, gen_tc_id);
-            emit_diffs(common_chat_msg_diff::compute_diffs(prev_msg, final_msg));
-            for (const auto & tc : final_msg.tool_calls) {
-                r.tool_calls.push_back({
-                    {"id", std::string("fc_") + tc.id},
-                    {"type", "function"},
-                    {"function", {{"name", tc.name}, {"arguments", tc.arguments}}},
-                });
+
+        if (keep_going && !stop_matcher.matched()) {
+            const size_t safe_size_before = acc.size();
+            stop_matcher.finish(append_safe);
+            if (acc.size() != safe_size_before) parse_partial();
+        }
+
+        // An intentional stop may leave a partial tool serialization. Parse it
+        // in partial mode; completed tool calls remain available, while an
+        // incomplete call is not promoted to a final result.
+        if (!acc.empty()) {
+            auto final_msg = common_chat_parse(
+                acc, /*is_partial*/ stop_matcher.matched(), parser_params);
+            if (!final_msg.empty()) {
+                final_msg.set_tool_call_ids(tc_ids_cache, gen_tc_id);
+                emit_diffs(
+                    common_chat_msg_diff::compute_diffs(prev_msg, final_msg));
+                for (const auto & tc : final_msg.tool_calls) {
+                    r.tool_calls.push_back({
+                        {"id", std::string("fc_") + tc.id},
+                        {"type", "function"},
+                        {"function", {
+                            {"name", tc.name},
+                            {"arguments", tc.arguments},
+                        }},
+                    });
+                }
             }
         }
     } else {
-        // ---- plain loop with streaming stop-sequence buffering ----
-        std::string stream_buf;
-        for (int step = 0; step < p.max_tokens && keep_going; ++step) {
-            if (generation && generation->cancelled->load(std::memory_order_relaxed)) {
-                r.cancelled = true;
-                break;
-            }
-            const int cells_needed = r.cache_size == 0 ? 2 : 1;
-            if (r.cache_size + cells_needed > n_ctx) {
-                r.error = "session context full";
-                break;
-            }
-            auto step_result = app.scheduler->step(
-                seq_id, smpl, boundary_token, canonical_greedy_policy,
-                static_cast<uint32_t>(step)).get();
-            if (!step_result.error.empty()) { r.error = step_result.error; break; }
-            if (step_result.eog) break;
-            llama_token id = step_result.token;
-            r.cache_size = step_result.cache_size;
-            std::string piece = common_token_to_piece(app.vocab, id, true);
-            common_sampler_accept(smpl, id, true);
-            boundary_token = id;
-            r.ids.push_back((int64_t) id);
-            r.text += piece;
-            if (on_event) {
-                stream_buf += piece;
-                auto m = flush_stream_buffer(stream_buf, p.stop, [&](const std::string & chunk) {
-                    bool ok = on_event(json{{"type", "token"}, {"token", chunk}, {"id", (int64_t) id}});
-                    if (!ok) {
-                        keep_going = false;
-                        r.cancelled = true;
-                    }
-                    return ok;
-                });
-                if (m.matched) keep_going = false;
-            }
-        }
-        // Flush any held-back tail (a partial stop that never completed).
-        if (on_event && !stream_buf.empty() && keep_going) {
-            const bool delivered = on_event(json{{"type", "token"}, {"token", stream_buf},
-                                                 {"id", r.ids.empty() ? (int64_t) 0 : r.ids.back()}});
+        int64_t emitted_token_id = 0;
+        auto emit_safe = [&](std::string_view text) {
+            r.text.append(text.data(), text.size());
+            if (!on_event) return true;
+            const bool delivered = on_event(json{
+                {"type", "token"},
+                {"token", std::string(text)},
+                {"id", emitted_token_id},
+            });
             if (!delivered) {
                 keep_going = false;
                 r.cancelled = true;
             }
+            return delivered;
+        };
+
+        for (int step = 0; step < p.max_tokens && keep_going; ++step) {
+            if (generation &&
+                generation->cancelled->load(std::memory_order_relaxed)) {
+                r.cancelled = true;
+                break;
+            }
+            const int cells_needed = r.cache_size == 0 ? 2 : 1;
+            if (r.cache_size + cells_needed > n_ctx) {
+                r.error = "session context full";
+                break;
+            }
+            auto step_result = app.scheduler->step(
+                seq_id, smpl, boundary_token, canonical_greedy_policy,
+                static_cast<uint32_t>(step)).get();
+            if (!step_result.error.empty()) {
+                r.error = step_result.error;
+                break;
+            }
+            if (step_result.eog) break;
+
+            const llama_token id = step_result.token;
+            r.cache_size = step_result.cache_size;
+            const std::string piece =
+                common_token_to_piece(app.vocab, id, true);
+            common_sampler_accept(smpl, id, true);
+            boundary_token = id;
+            r.ids.push_back(static_cast<int64_t>(id));
+            emitted_token_id = static_cast<int64_t>(id);
+
+            const StopMatchResult stop =
+                stop_matcher.append(piece, p.stop, emit_safe);
+            if (stop.emission_failed) {
+                keep_going = false;
+                r.cancelled = true;
+            } else if (stop.matched) {
+                keep_going = false;
+            }
         }
-        // Truncate the final text at the first stop sequence (non-streaming
-        // result, and the authoritative text for streaming too).
-        for (const auto & s : p.stop) {
-            auto pos = r.text.find(s);
-            if (pos != std::string::npos) { r.text = r.text.substr(0, pos); break; }
+
+        // Flush a tail that only partially matched when generation ended for a
+        // reason other than a completed stop or disconnected output.
+        if (keep_going && !stop_matcher.matched()) {
+            const StopMatchResult final = stop_matcher.finish(emit_safe);
+            if (final.emission_failed) {
+                keep_going = false;
+                r.cancelled = true;
+            }
         }
     }
 
@@ -1692,7 +1721,7 @@ int main(int argc, char ** argv) {
         const bool has_tools = gp.tools.is_array() && !gp.tools.empty();
         const std::string validation_error =
             validate_generation_constraints(
-                gp.response_format, gp.grammar, has_tools);
+                gp.response_format, gp.grammar, has_tools, gp.stop);
         if (!validation_error.empty()) {
             res.status = 400;
             res.set_content(

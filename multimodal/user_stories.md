@@ -194,6 +194,11 @@ Expected:
 - Tool calls parsed engine-side via `common_chat_parse` (streaming via
   `is_partial`); `/generate` streams tokens OR returns parsed tool calls.
 - greedy-at-`temperature`≤0 reproducibility preserved (EUS-2 fork/source parity).
+- `stop` uses one incremental matcher for streaming, non-streaming, and tool
+  parsing. The first completed stop ends decode immediately; the completing
+  token remains counted and cached while stop bytes are omitted from text/events.
+  Multiple matches choose the earliest buffered occurrence, and empty stops
+  return HTTP 400 without changing the session.
 - Malformed grammar/response-format constraints fail before sampler/checkpoint
   registration: JSON HTTP 400 for both streaming and non-streaming requests, no
   SSE headers, and the unchanged session remains reusable. Once a stream starts,
@@ -208,10 +213,12 @@ Latency / performance budget (retained acceptance targets; functional path imple
 Test:
 - `tests/test_common_sampler.py` (JSON object/schema constraints, raw GBNF,
   malformed-constraint 400/session reuse, grammar XOR validation, required/none
-  tool choices, streaming parsed tool-call deltas, stop/ignore-EOS behavior, and
-  greedy fork parity)
-- `tests/test_util.cpp` (model-config defaults, parsing, and model-free
-  generation-constraint validation)
+  tool choices, unified non-streaming/tool stop boundaries with token/KV/retry
+  assertions, stop/ignore-EOS behavior, and greedy fork parity)
+- `tests/test_streaming.py` (SSE stop buffering, terminal counts/cache boundary,
+  and deterministic continuation)
+- `tests/test_util.cpp` (model-config defaults, parsing, model-free generation
+  validation, and incremental stop matching/order/empty-input defenses)
 
 The functional suite is implemented. The numeric grammar-overhead/final-parse
 budgets above still require a dedicated benchmark before they can become
