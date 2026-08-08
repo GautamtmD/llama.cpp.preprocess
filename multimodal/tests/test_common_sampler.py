@@ -148,6 +148,65 @@ def test_invalid_response_format_type_400(base, make_session):
     assert r.status_code == 400, r.text
 
 
+@pytest.mark.parametrize("stream", [False, True], ids=["json", "stream-request"])
+def test_invalid_grammar_returns_400_and_preserves_session(base, make_session, stream):
+    sid = make_session()
+    _inject_chat(base, sid, "Write one uppercase letter.")
+    status_before = requests.get(f"{base}/sessions/{sid}", timeout=30).json()
+
+    response = _generate(
+        base,
+        sid,
+        stream=stream,
+        grammar="root ::= (",
+        max_tokens=1,
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.headers["Content-Type"].startswith("application/json")
+    assert response.json()["code"] == 400
+    assert "grammar" in response.json()["error"].lower()
+    assert requests.get(f"{base}/health", timeout=10).status_code == 200
+    assert requests.get(f"{base}/sessions/{sid}", timeout=30).json() == status_before
+
+    retry = _generate(
+        base,
+        sid,
+        stream=stream,
+        grammar='root ::= "X"',
+        max_tokens=1,
+    )
+    assert retry.status_code == 200, retry.text
+    if stream:
+        events = list(_parse_sse(retry))
+        terminal = [event for event in events if event["type"] in {"done", "error"}]
+        assert len(terminal) == 1, events
+        assert terminal[0]["type"] == "done", events
+    else:
+        assert retry.headers["Content-Type"].startswith("application/json")
+        assert retry.json()["n_tokens"] == 1
+
+
+@pytest.mark.parametrize(
+    "response_format",
+    [
+        [],
+        {"type": "json_schema", "json_schema": []},
+        {"type": "json_schema", "json_schema": {}},
+        {"type": "json_object", "schema": []},
+    ],
+)
+def test_malformed_response_format_returns_structured_400(base, make_session, response_format):
+    sid = make_session()
+    _inject_chat(base, sid, "hello")
+    response = _generate(base, sid, response_format=response_format, max_tokens=1)
+    assert response.status_code == 400, response.text
+    assert response.headers["Content-Type"].startswith("application/json")
+    assert response.json()["code"] == 400
+    assert "response_format" in response.json()["error"]
+    assert requests.get(f"{base}/health", timeout=10).status_code == 200
+
+
 # ------------------------------ tool calling -------------------------------
 
 

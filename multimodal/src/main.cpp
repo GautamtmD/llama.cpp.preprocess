@@ -495,13 +495,168 @@ struct LiveReadersGuard {
 
 struct SchedulerGenerationGuard {
     InferenceScheduler & scheduler;
-    explicit SchedulerGenerationGuard(InferenceScheduler & scheduler) : scheduler(scheduler) {
+    llama_seq_id seq_id;
+    SchedulerGenerationCheckpoint checkpoint;
+    bool checkpoint_registered = false;
+
+    SchedulerGenerationGuard(InferenceScheduler & scheduler, llama_seq_id seq_id)
+        : scheduler(scheduler), seq_id(seq_id) {
         scheduler.begin_generation();
+        try {
+            checkpoint = scheduler.generation_checkpoint(seq_id);
+            checkpoint_registered = true;
+        } catch (...) {
+            scheduler.end_generation();
+            throw;
+        }
     }
     SchedulerGenerationGuard(const SchedulerGenerationGuard &) = delete;
     SchedulerGenerationGuard & operator=(const SchedulerGenerationGuard &) = delete;
-    ~SchedulerGenerationGuard() { scheduler.end_generation(); }
+    ~SchedulerGenerationGuard() {
+        if (checkpoint_registered) {
+            try {
+                scheduler.finish_generation(seq_id);
+            } catch (const std::exception & e) {
+                std::cerr << "failed to release generation checkpoint: "
+                          << e.what() << "\n";
+            } catch (...) {
+                std::cerr << "failed to release generation checkpoint\n";
+            }
+        }
+        scheduler.end_generation();
+    }
 };
+
+struct GenerationRegistrationGuard {
+    GenerationRegistration * registration;
+    llama_seq_id seq_id;
+    llama_pos start_position;
+    llama_token rewind_token;
+    uint64_t checkpoint_family;
+    bool finished = false;
+
+    ~GenerationRegistrationGuard() {
+        if (!registration || finished) return;
+        double rewind_s = 0.0;
+        try {
+            registration->finish(
+                seq_id, start_position, rewind_token, checkpoint_family,
+                /*disconnected*/ true, rewind_s);
+        } catch (const std::exception & e) {
+            std::cerr << "failed to rewind exceptional generation: "
+                      << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "failed to rewind exceptional generation\n";
+        }
+    }
+
+    void finish(GenResult & result) {
+        if (registration) {
+            result.cancelled = registration->finish(
+                seq_id, start_position, rewind_token, checkpoint_family,
+                result.cancelled, result.rewind_s);
+        }
+        finished = true;
+    }
+};
+
+struct PreparedGeneration {
+    common_sampler_ptr sampler;
+    common_chat_parser_params parser_params;
+    bool tool_calling_active = false;
+    uint8_t canonical_greedy_policy = 0;
+};
+
+PreparedGeneration prepare_generation(AppState & app, const GenParams & p) {
+    PreparedGeneration prepared;
+    common_params_sampling sparams = build_sampling_params(app, p);
+
+    if (p.tools.is_array() && !p.tools.empty() && app.chat_templates) {
+        // Tool-calling path (ADR 0006): derive the grammar, lazy triggers,
+        // preserved tokens, and PEG parser exactly as llama-server does.
+        common_chat_templates_inputs inputs;
+        inputs.use_jinja              = app.use_jinja;
+        inputs.chat_template_kwargs   = app.chat_template_kwargs;
+        inputs.tools                  = common_chat_tools_parse_oaicompat(p.tools);
+        inputs.tool_choice            = common_chat_tool_choice_parse_oaicompat(p.tool_choice);
+        inputs.add_generation_prompt  = true;
+        common_chat_msg dummy;
+        dummy.role    = "user";
+        dummy.content = "hello";
+        inputs.messages.push_back(std::move(dummy));
+
+        common_chat_params cp =
+            common_chat_templates_apply(app.chat_templates.get(), inputs);
+        if (!cp.grammar.empty()) {
+            sparams.grammar = {COMMON_GRAMMAR_TYPE_TOOL_CALLS, cp.grammar};
+        }
+        sparams.grammar_lazy = cp.grammar_lazy;
+        for (const auto & token_text : cp.preserved_tokens) {
+            auto ids = common_tokenize(app.vocab, token_text, false, true);
+            if (ids.size() == 1) sparams.preserved_tokens.insert(ids[0]);
+        }
+        for (auto trigger : cp.grammar_triggers) {
+            if (trigger.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD) {
+                auto ids = common_tokenize(app.vocab, trigger.value, false, true);
+                if (ids.size() == 1) {
+                    trigger.type  = COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN;
+                    trigger.token = ids[0];
+                }
+            }
+            sparams.grammar_triggers.push_back(std::move(trigger));
+        }
+        prepared.parser_params = common_chat_parser_params(cp);
+        if (!cp.parser.empty()) prepared.parser_params.parser.load(cp.parser);
+        prepared.tool_calling_active = true;
+        // generation_prompt intentionally stays empty: the injected assistant
+        // turn marker is consumed by the grammar's optional start rule.
+    } else if (p.response_format.is_object()) {
+        const std::string rf_type = p.response_format.at("type").get<std::string>();
+        if (rf_type == "json_object") {
+            const json schema = p.response_format.value("schema", json::object());
+            sparams.grammar = {
+                COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT,
+                json_schema_to_grammar(schema),
+            };
+        } else if (rf_type == "json_schema") {
+            const json & schema = p.response_format.at("json_schema").at("schema");
+            sparams.grammar = {
+                COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT,
+                json_schema_to_grammar(schema),
+            };
+        }
+    } else if (!p.grammar.empty()) {
+        sparams.grammar = {COMMON_GRAMMAR_TYPE_USER, p.grammar};
+    }
+
+    const std::string & grammar = common_grammar_value(sparams.grammar);
+    if (!grammar.empty()) {
+        // common_sampler_init throws after allocating its sampler chain when
+        // grammar parsing fails. Parse once with an RAII-owned probe first so
+        // malformed client input cannot leak constructor state or reach SSE.
+        std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> grammar_probe{
+            llama_sampler_init_grammar(app.vocab, grammar.c_str(), "root"),
+            llama_sampler_free,
+        };
+        if (!grammar_probe) {
+            const std::string source =
+                p.response_format.is_object() ? "response_format" : "grammar";
+            throw std::invalid_argument("invalid " + source + ": failed to parse grammar");
+        }
+    }
+
+    prepared.sampler.reset(common_sampler_init(app.model, sparams));
+    if (!prepared.sampler) {
+        throw std::runtime_error("failed to initialize sampler");
+    }
+    const bool canonical_greedy =
+        p.temp <= 0.0f && p.grammar.empty() && p.response_format.is_null() &&
+        (!p.tools.is_array() || p.tools.empty()) &&
+        (!p.sampling.is_object() || p.sampling.empty());
+    prepared.canonical_greedy_policy =
+        canonical_greedy ? (p.ignore_eos ? 2 : 1) : 0;
+    return prepared;
+}
 
 // Shared generation loop, now built on llama.cpp's `common_sampler` (ADR 0005).
 //
@@ -511,100 +666,32 @@ struct SchedulerGenerationGuard {
 // to stop early (client disconnect). When null (non-streaming), everything is
 // accumulated into GenResult. Both handlers go through this one path.
 //
-// Grammar / response_format / tools are derived here (they need the chat
-// templates): tools → common_chat_templates_apply (grammar + lazy triggers +
-// parser); response_format → json_schema_to_grammar; raw grammar → GBNF.
+// Grammar, response-format, tool-parser, and sampler construction are preflighted
+// by prepare_generation before this function registers scheduler state or emits
+// streaming headers.
 GenResult run_generation(
     AppState & app, llama_seq_id seq_id, const GenParams & p,
+    PreparedGeneration & prepared,
     std::function<bool(const json & event)> on_event,
     GenerationRegistration * generation = nullptr,
     llama_token rewind_token = LLAMA_TOKEN_NULL
 ) {
     GenResult r;
-    SchedulerGenerationGuard scheduler_generation{*app.scheduler};
-    const SchedulerGenerationCheckpoint checkpoint =
-        app.scheduler->generation_checkpoint(seq_id);
+    SchedulerGenerationGuard scheduler_generation{*app.scheduler, seq_id};
+    const SchedulerGenerationCheckpoint & checkpoint =
+        scheduler_generation.checkpoint;
     const llama_pos pmax = checkpoint.position;
     // Rewind starts at the first position absent from the checkpoint. For an
     // empty sequence pmax is -1, so cancellation removes the temporary BOS at 0.
     const llama_pos p_start = pmax + 1;
+    GenerationRegistrationGuard registration_guard{
+        generation, seq_id, p_start, rewind_token, checkpoint.family};
     r.cache_size = pmax < 0 ? 0 : pmax + 1;
     llama_token boundary_token = rewind_token;
-
-    common_params_sampling sparams = build_sampling_params(app, p);
-
-    bool tool_calling_active = false;
-    common_chat_parser_params parser_params;
-
-    // ---- derive grammar / parser / triggers from tools or response_format ----
-    if (p.tools.is_array() && !p.tools.empty() && app.chat_templates) {
-        // Tool-calling path (ADR 0006): parse the OpenAI tool defs, then let
-        // common_chat_templates_apply derive the GBNF grammar, lazy triggers,
-        // preserved tokens, and the per-format PEG parser — exactly as
-        // llama-server does. A dummy user message is supplied only because the
-        // template requires a non-empty message list; common_chat_templates_apply
-        // derives grammar/triggers/parser solely from tools + tool_choice + the
-        // template definition, NOT from message content, so "hello" is harmless.
-        common_chat_templates_inputs inputs;
-        inputs.use_jinja            = app.use_jinja;
-        inputs.chat_template_kwargs = app.chat_template_kwargs;
-        inputs.tools                = common_chat_tools_parse_oaicompat(p.tools);
-        inputs.tool_choice          = common_chat_tool_choice_parse_oaicompat(p.tool_choice);
-        inputs.add_generation_prompt = true;
-        common_chat_msg dummy;
-        dummy.role    = "user";
-        dummy.content = "hello";
-        inputs.messages.push_back(std::move(dummy));
-
-        common_chat_params cp = common_chat_templates_apply(app.chat_templates.get(), inputs);
-        if (!cp.grammar.empty()) {
-            sparams.grammar = {COMMON_GRAMMAR_TYPE_TOOL_CALLS, cp.grammar};
-        }
-        sparams.grammar_lazy = cp.grammar_lazy;
-        // Preserved tokens + triggers: tokenize each (single-token results become
-        // TOKEN triggers / preserved ids), mirroring the server's schema handler.
-        for (const auto & s : cp.preserved_tokens) {
-            auto ids = common_tokenize(app.vocab, s, false, true);
-            if (ids.size() == 1) sparams.preserved_tokens.insert(ids[0]);
-        }
-        for (auto trig : cp.grammar_triggers) {
-            if (trig.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD) {
-                auto ids = common_tokenize(app.vocab, trig.value, false, true);
-                if (ids.size() == 1) { trig.type = COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN; trig.token = ids[0]; }
-            }
-            sparams.grammar_triggers.push_back(std::move(trig));
-        }
-        parser_params = common_chat_parser_params(cp);
-        if (!cp.parser.empty()) parser_params.parser.load(cp.parser);
-        tool_calling_active = true;
-        // NOTE: generation_prompt is intentionally left empty. For models like
-        // Gemma 4 the chat handler leaves cp.generation_prompt empty in the
-        // normal (non-continuation) case and the grammar's optional `start`
-        // rule absorbs the assistant turn marker that is already in the KV cache
-        // (injected via /inject with add_generation_prompt=true). Pre-filling it
-        // would wrongly advance the grammar past tokens the model must generate.
-    } else if (p.response_format.is_object()) {
-        // response_format → GBNF via json_schema_to_grammar (ADR 0007).
-        std::string rf_type = p.response_format.value("type", std::string{});
-        if (rf_type == "json_object") {
-            json schema = p.response_format.value("schema", json::object());
-            sparams.grammar = {COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, json_schema_to_grammar(schema)};
-        } else if (rf_type == "json_schema") {
-            json schema = p.response_format.value("json_schema", json::object()).value("schema", json::object());
-            sparams.grammar = {COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, json_schema_to_grammar(schema)};
-        }
-        // type == "text" applies no constraint (no grammar set).
-    } else if (!p.grammar.empty()) {
-        sparams.grammar = {COMMON_GRAMMAR_TYPE_USER, p.grammar};
-    }
-
-    common_sampler * smpl = common_sampler_init(app.model, sparams);
-    const bool canonical_greedy =
-        p.temp <= 0.0f && p.grammar.empty() && !p.response_format.is_object() &&
-        (!p.tools.is_array() || p.tools.empty()) &&
-        (!p.sampling.is_object() || p.sampling.empty());
-    const uint8_t canonical_greedy_policy =
-        canonical_greedy ? (p.ignore_eos ? 2 : 1) : 0;
+    common_sampler * smpl = prepared.sampler.get();
+    common_chat_parser_params & parser_params = prepared.parser_params;
+    const bool tool_calling_active = prepared.tool_calling_active;
+    const uint8_t canonical_greedy_policy = prepared.canonical_greedy_policy;
     const int n_ctx = app.n_ctx_per_session;
     const double t0 = now_s();
     bool keep_going = true;
@@ -741,17 +828,11 @@ GenResult run_generation(
         }
     }
 
-    if (generation) {
-        r.cancelled = generation->finish(
-            seq_id, p_start, rewind_token, checkpoint.family, r.cancelled, r.rewind_s);
-    }
-    app.scheduler->finish_generation(seq_id);
-
+    registration_guard.finish(r);
     r.cache_size = app.scheduler->invoke_preserving_logits([seq_id](llama_context * ctx) {
         return llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) + 1;
     });
     r.gen_s = now_s() - t0;
-    common_sampler_free(smpl);
     return r;
 }
 
@@ -1058,7 +1139,8 @@ int main(int argc, char ** argv) {
     warm_params.max_tokens = 5;
     warm_params.temp = 0.0f;
     warm_params.seed = 0;
-    run_generation(app, warm_seq, warm_params, nullptr);
+    PreparedGeneration warm_prepared = prepare_generation(app, warm_params);
+    run_generation(app, warm_seq, warm_params, warm_prepared, nullptr);
     if (auto warm_fork = app.scheduler->fork_sequence(warm_seq, LLAMA_TOKEN_NULL)) {
         app.scheduler->release_sequence(*warm_fork);
     }
@@ -1607,24 +1689,37 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        // response_format XOR grammar (both → 400). tools take precedence over
-        // both (the chat template derives its own grammar), so the conflict only
-        // applies when tools are absent.
-        const bool has_rf = gp.response_format.is_object();
-        const bool has_gr = !gp.grammar.empty();
         const bool has_tools = gp.tools.is_array() && !gp.tools.empty();
-        if (!has_tools && has_rf && has_gr) {
+        const std::string validation_error =
+            validate_generation_constraints(
+                gp.response_format, gp.grammar, has_tools);
+        if (!validation_error.empty()) {
             res.status = 400;
-            res.set_content(error_body("cannot specify both response_format and grammar", 400).dump(), "application/json");
+            res.set_content(
+                error_body(validation_error, 400).dump(), "application/json");
             return;
         }
-        if (has_rf) {
-            std::string rf_type = gp.response_format.value("type", std::string{});
-            if (rf_type != "json_object" && rf_type != "json_schema" && rf_type != "text") {
-                res.status = 400;
-                res.set_content(error_body("invalid response_format.type (expected json_object, json_schema, or text)", 400).dump(), "application/json");
-                return;
-            }
+
+        // Derive and parse every client-selected constraint, then construct the
+        // RAII-owned sampler before registering generation state or SSE headers.
+        std::shared_ptr<PreparedGeneration> prepared;
+        try {
+            prepared = std::make_shared<PreparedGeneration>(
+                prepare_generation(app, gp));
+        } catch (const std::bad_alloc &) {
+            res.status = 500;
+            res.set_content(
+                error_body("generation preflight allocation failed", 500).dump(),
+                "application/json");
+            return;
+        } catch (const std::exception & e) {
+            res.status = 400;
+            res.set_content(
+                error_body(
+                    std::string("invalid generation constraints: ") + e.what(),
+                    400).dump(),
+                "application/json");
+            return;
         }
         const llama_seq_id seq_id = session->seq_id;
         if (gp.max_tokens > 0) {
@@ -1645,7 +1740,25 @@ int main(int argc, char ** argv) {
 
         if (!stream) {
             // Non-streaming: whole response as JSON (incl. tool_calls if any).
-            GenResult r = run_generation(app, seq_id, gp, nullptr, generation.get(), pre_generation_last);
+            GenResult r;
+            try {
+                r = run_generation(
+                    app, seq_id, gp, *prepared, nullptr,
+                    generation.get(), pre_generation_last);
+            } catch (const std::exception & e) {
+                res.status = 500;
+                res.set_content(
+                    error_body(
+                        std::string("generation failed: ") + e.what(), 500).dump(),
+                    "application/json");
+                return;
+            } catch (...) {
+                res.status = 500;
+                res.set_content(
+                    error_body("generation failed", 500).dump(),
+                    "application/json");
+                return;
+            }
             const bool partial_context_full =
                 r.error == "session context full" && !r.ids.empty();
             if (!r.error.empty() && !partial_context_full) {
@@ -1684,41 +1797,87 @@ int main(int argc, char ** argv) {
         const auto is_connection_closed = req.is_connection_closed;
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&app, seq_id, gp, sid, sid_num, generation, busy, pre_generation_last, is_connection_closed](size_t, httplib::DataSink & ds) -> bool {
-                GenResult r = run_generation(app, seq_id, gp, [&ds, &is_connection_closed](const json & event) {
-                    if (is_connection_closed()) return false;
-                    std::string ev = sse_event(event);
-                    return ds.write(ev.data(), ev.size());
-                }, generation.get(), pre_generation_last);
-                if (!r.cancelled && !r.ids.empty()) set_last_token(app, sid_num, (llama_token) r.ids.back());
-                if (r.cancelled) {
-                    std::cerr << "generation cancelled for " << sid << "; rewind=" << r.rewind_s * 1000.0 << " ms\n";
-                }
-                const bool partial_context_full =
-                    r.error == "session context full" && !r.ids.empty();
-                json terminal;
-                if (!r.error.empty() && !partial_context_full) {
-                    terminal = {
-                        {"type", "error"},
-                        {"error", r.error},
-                        {"code", r.error == "session context full" ? 409 : 500},
+            [&app, seq_id, gp, sid, sid_num, prepared, generation, busy,
+             pre_generation_last, is_connection_closed]
+            (size_t, httplib::DataSink & ds) -> bool {
+                auto close_stream = [&ds](const json & terminal) noexcept {
+                    try {
+                        const std::string event = sse_event(terminal);
+                        ds.write(event.data(), event.size());
+                    } catch (...) {
+                    }
+                    try {
+                        ds.done();
+                    } catch (...) {
+                    }
+                };
+                auto close_with_error =
+                    [&close_stream, &ds](const char * message) noexcept {
+                        try {
+                            close_stream(json{
+                                {"type", "error"},
+                                {"error", message},
+                                {"code", 500},
+                            });
+                        } catch (...) {
+                            try {
+                                ds.done();
+                            } catch (...) {
+                            }
+                        }
                     };
-                } else {
-                    const double tok_s = (r.gen_s > 0) ? (r.ids.size() / r.gen_s) : 0.0;
-                    terminal = {
-                        {"type", "done"},
-                        {"n_tokens", r.ids.size()},
-                        {"gen_ms", (int)(r.gen_s * 1000)},
-                        {"gen_ms_precise", r.gen_s * 1000.0},
-                        {"tokens_per_s", tok_s},
-                        {"cache_size", r.cache_size},
-                    };
-                    if (!r.tool_calls.empty()) terminal["tool_calls"] = r.tool_calls;
-                    if (partial_context_full) terminal["finish_reason"] = "context_full";
+
+                try {
+                    GenResult r = run_generation(
+                        app, seq_id, gp, *prepared,
+                        [&ds, &is_connection_closed](const json & event) {
+                            if (is_connection_closed()) return false;
+                            const std::string encoded = sse_event(event);
+                            return ds.write(encoded.data(), encoded.size());
+                        },
+                        generation.get(), pre_generation_last);
+                    if (!r.cancelled && !r.ids.empty()) {
+                        set_last_token(
+                            app, sid_num, static_cast<llama_token>(r.ids.back()));
+                    }
+                    if (r.cancelled) {
+                        std::cerr << "generation cancelled for " << sid
+                                  << "; rewind=" << r.rewind_s * 1000.0
+                                  << " ms\n";
+                    }
+                    const bool partial_context_full =
+                        r.error == "session context full" && !r.ids.empty();
+                    json terminal;
+                    if (!r.error.empty() && !partial_context_full) {
+                        terminal = {
+                            {"type", "error"},
+                            {"error", r.error},
+                            {"code", r.error == "session context full" ? 409 : 500},
+                        };
+                    } else {
+                        const double tok_s =
+                            r.gen_s > 0 ? r.ids.size() / r.gen_s : 0.0;
+                        terminal = {
+                            {"type", "done"},
+                            {"n_tokens", r.ids.size()},
+                            {"gen_ms", static_cast<int>(r.gen_s * 1000)},
+                            {"gen_ms_precise", r.gen_s * 1000.0},
+                            {"tokens_per_s", tok_s},
+                            {"cache_size", r.cache_size},
+                        };
+                        if (!r.tool_calls.empty()) {
+                            terminal["tool_calls"] = r.tool_calls;
+                        }
+                        if (partial_context_full) {
+                            terminal["finish_reason"] = "context_full";
+                        }
+                    }
+                    close_stream(terminal);
+                } catch (const std::exception & e) {
+                    close_with_error(e.what());
+                } catch (...) {
+                    close_with_error("generation failed");
                 }
-                std::string terminal_event = sse_event(terminal);
-                ds.write(terminal_event.data(), terminal_event.size());
-                ds.done();
                 return true;
             }
         );

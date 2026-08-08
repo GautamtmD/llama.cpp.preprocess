@@ -77,6 +77,47 @@ inline nlohmann::ordered_json error_body(const std::string & msg, int code) {
     return nlohmann::ordered_json{{"error", msg}, {"code", code}};
 }
 
+// Validate the model-free shape and precedence rules for /generate constraints.
+// Grammar syntax and JSON-schema conversion require the loaded model/vocabulary
+// and are preflighted separately before response headers are committed.
+inline std::string validate_generation_constraints(
+    const nlohmann::ordered_json & response_format,
+    const std::string & grammar,
+    bool tools_active) {
+    if (response_format.is_null()) return "";
+    if (!response_format.is_object()) {
+        return "response_format must be an object";
+    }
+    const auto type = response_format.find("type");
+    if (type == response_format.end() || !type->is_string()) {
+        return "response_format.type must be a string";
+    }
+    const std::string value = type->get<std::string>();
+    if (value != "json_object" && value != "json_schema" && value != "text") {
+        return "invalid response_format.type (expected json_object, json_schema, or text)";
+    }
+    if (value == "json_object") {
+        const auto schema = response_format.find("schema");
+        if (schema != response_format.end() && !schema->is_object()) {
+            return "response_format.schema must be an object";
+        }
+    }
+    if (value == "json_schema") {
+        const auto wrapper = response_format.find("json_schema");
+        if (wrapper == response_format.end() || !wrapper->is_object()) {
+            return "response_format.json_schema must be an object";
+        }
+        const auto schema = wrapper->find("schema");
+        if (schema == wrapper->end() || !schema->is_object()) {
+            return "response_format.json_schema.schema must be an object";
+        }
+    }
+    if (!tools_active && !grammar.empty()) {
+        return "cannot specify both response_format and grammar";
+    }
+    return "";
+}
+
 // SSE event frame: "data: <json>\n\n".
 inline std::string sse_event(const nlohmann::ordered_json & j) {
     std::ostringstream os;

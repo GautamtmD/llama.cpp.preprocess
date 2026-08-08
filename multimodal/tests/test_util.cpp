@@ -175,6 +175,42 @@ static void test_model_config() {
     CHECK(std::abs(c4.min_p - 0.01f) < 1e-5f);
 }
 
+static void test_generation_constraint_validation() {
+    using json = nlohmann::ordered_json;
+
+    CHECK(validate_generation_constraints(json(), "", false).empty());
+    CHECK(validate_generation_constraints(json{{"type", "text"}}, "", false).empty());
+    CHECK(validate_generation_constraints(
+              json{{"type", "json_object"}}, "", false).empty());
+    CHECK(validate_generation_constraints(
+              json{{"type", "json_object"}, {"schema", json::object()}}, "", false).empty());
+    CHECK(validate_generation_constraints(
+              json{{"type", "json_schema"},
+                   {"json_schema", json{{"schema", json::object()}}}},
+              "", false).empty());
+    CHECK(validate_generation_constraints(
+              json{{"type", "json_object"}}, R"(root ::= "x")", true).empty());
+
+    CHECK(validate_generation_constraints(json::array(), "", false).find(
+              "response_format must be an object") != std::string::npos);
+    CHECK(validate_generation_constraints(json::object(), "", false).find(
+              "response_format.type must be a string") != std::string::npos);
+    CHECK(validate_generation_constraints(json{{"type", "yaml"}}, "", false).find(
+              "invalid response_format.type") != std::string::npos);
+    CHECK(validate_generation_constraints(
+              json{{"type", "json_object"}, {"schema", json::array()}}, "", false).find(
+              "response_format.schema must be an object") != std::string::npos);
+    CHECK(validate_generation_constraints(
+              json{{"type", "json_schema"}, {"json_schema", json::array()}}, "", false).find(
+              "response_format.json_schema must be an object") != std::string::npos);
+    CHECK(validate_generation_constraints(
+              json{{"type", "json_schema"}, {"json_schema", json::object()}}, "", false).find(
+              "response_format.json_schema.schema must be an object") != std::string::npos);
+    CHECK(validate_generation_constraints(
+              json{{"type", "json_object"}}, R"(root ::= "x")", false).find(
+              "cannot specify both response_format and grammar") != std::string::npos);
+}
+
 static void test_server_argument_validation() {
     auto expect_error = [](std::vector<std::string> args, const std::string & expected) {
         const ServerCliResult result = parse_server_arguments(args);
@@ -238,6 +274,7 @@ int main() {
     test_gpu_execution_policy();
     test_server_argument_validation();
     test_model_config();
+    test_generation_constraint_validation();
 
     if (g_failures) {
         std::cerr << g_failures << " util test check(s) FAILED\n";
