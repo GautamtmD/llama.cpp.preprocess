@@ -77,6 +77,14 @@ engine/multimodal/build/bin/Release/multimodal-server.exe \
 
 For deliberate CPU diagnosis only, add `--allow-cpu --n-gpu-layers 0`.
 
+The pooled scheduler requires `--n-batch >= --max-sequences`; otherwise startup
+exits with an argument error explaining which value to increase or reduce.
+`--ctx-size`, `--n-batch`, and `--max-sequences` must be positive, their pooled
+context product must fit the llama API, and `--port` must be in `1..65535`.
+Malformed, missing, and unknown arguments are rejected before model loading.
+Long text and multimodal injections are automatically split to the effective
+batch size; users do not need to divide request payloads.
+
 Endpoints are documented in the parent repo's `docs/ipc-protocol.md`. Tests:
 
 ```bash

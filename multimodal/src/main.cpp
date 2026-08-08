@@ -9,9 +9,9 @@
 //   DELETE /sessions/{id}         -> free the session
 //   GET    /health                -> liveness
 //
-// All MultiModalAgent engine code lives under engine/multimodal/ — we do NOT
-// modify the upstream llama.cpp fork. One model is loaded and shared; each
-// session is its own llama_context (owning its KV cache).
+// All MultiModalAgent engine code stays under engine/multimodal/; upstream
+// llama.cpp remains untouched. One model and one pooled context are shared;
+// external sessions map to scheduler-owned sequence IDs.
 
 #include <algorithm>
 #include <array>
@@ -34,6 +34,7 @@
 #include "nlohmann/json.hpp"
 
 #include "inference_scheduler.h"
+#include "server_cli.h"
 #include "util.h"
 
 #include "common.h"
@@ -147,25 +148,6 @@ static ModelConfig load_config_for_model(const std::string & model_path, const s
     return cfg;
 }
 
-struct ServerConfig {
-    std::string model_path;
-    std::string mmproj_path;   // multimodal projector gguf (empty = text-only)
-    int  port          = 8080;
-    int  n_gpu_layers  = 99;
-    int  ctx_size      = 4096;
-    int  n_batch       = 2048;
-    int  max_sequences = 8;
-    bool allow_cpu     = false;  // GPU model offload is required unless explicitly opted out
-
-    // Chat-template handling (mirrors llama-server / common/arg.cpp). We reuse
-    // common/'s templating; these just feed it the same inputs llama-server does.
-    std::string chat_template;                                // --chat-template / --chat-template-file (override; empty = model's default)
-    bool        use_jinja            = true;                  // --jinja / --no-jinja (default true, like llama-server)
-    bool        enable_chat_template = true;                  // --no-chat-template disables the 'messages' inject path
-    std::map<std::string, std::string> chat_template_kwargs;  // --chat-template-kwargs (key -> JSON value serialized as a string)
-    std::string system_prompt;                                // --system-prompt (prepended as a system message to every conversation)
-    std::string config_path;                                  // --config (optional path to model config JSON file)
-};
 
 double now_s();
 
@@ -203,7 +185,6 @@ struct AppState {
     int audio_sample_rate = 0;
     std::string media_marker;
     int n_ctx_per_session = 4096;
-    int n_batch = 2048;
     // Chat-template options (copied from ServerConfig at startup) — passed to
     // common_chat_templates_apply so our rendering matches llama-server.
     bool                                 use_jinja            = true;
@@ -799,6 +780,33 @@ static mtmd_bitmap * bitmap_from_media_bytes(mtmd_context * mtmd_ctx,
     return wrap.bitmap;  // may be nullptr on failure
 }
 
+static bool decode_tokens_in_chunks(
+    llama_context * ctx, llama_seq_id seq_id, llama_pos start_position,
+    const std::vector<llama_token> & tokens) {
+    const uint32_t batch_capacity = llama_n_batch(ctx);
+    if (batch_capacity == 0) return false;
+
+    for (size_t offset = 0; offset < tokens.size(); offset += batch_capacity) {
+        const size_t chunk_size =
+            std::min<size_t>(batch_capacity, tokens.size() - offset);
+        llama_batch batch =
+            llama_batch_init(static_cast<int32_t>(chunk_size), 0, 1);
+        for (size_t i = 0; i < chunk_size; ++i) {
+            const size_t token_index = offset + i;
+            batch.token[i] = tokens[token_index];
+            batch.pos[i] = start_position + static_cast<llama_pos>(token_index);
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = seq_id;
+            batch.logits[i] = token_index + 1 == tokens.size();
+        }
+        batch.n_tokens = static_cast<int32_t>(chunk_size);
+        const bool decoded = llama_decode(ctx, batch) == 0;
+        llama_batch_free(batch);
+        if (!decoded) return false;
+    }
+    return true;
+}
+
 // Run the mtmd tokenize + per-chunk eval path: turns the marker-containing text
 // + bitmaps into chunks and decodes each into the session's KV cache. Preserve
 // the final discrete token when the rendered prompt ends in text: the pooled
@@ -861,7 +869,8 @@ static MtmdInjectResult mtmd_inject(mtmd_context * mtmd_ctx, llama_context * ctx
         const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, i);
         llama_pos new_n_past = n_past;
         int32_t r = mtmd_helper_eval_chunk_single(
-            mtmd_ctx, ctx, chunk, n_past, seq_id, /*n_batch*/ 512,
+            mtmd_ctx, ctx, chunk, n_past, seq_id,
+            static_cast<int32_t>(llama_n_batch(ctx)),
             /*logits_last*/ (i == n_chunks - 1), &new_n_past);
         if (r != 0) { ok = false; break; }
         n_past = new_n_past;
@@ -875,75 +884,24 @@ static MtmdInjectResult mtmd_inject(mtmd_context * mtmd_ctx, llama_context * ctx
 }
 
 int main(int argc, char ** argv) {
-    ServerConfig cfg;
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        auto next = [&]() -> std::string {
-            return (i + 1 < argc) ? std::string(argv[++i]) : std::string{};
-        };
-        if      (a == "--port")          cfg.port = std::atoi(next().c_str());
-        else if (a == "--model" || a == "-m") cfg.model_path = next();
-        else if (a == "--mmproj")        cfg.mmproj_path = next();
-        else if (a == "--n-gpu-layers" || a == "-ngl") cfg.n_gpu_layers = std::atoi(next().c_str());
-        else if (a == "--ctx-size" || a == "-c") cfg.ctx_size = std::atoi(next().c_str());
-        else if (a == "--n-batch")      cfg.n_batch = std::atoi(next().c_str());
-        else if (a == "--max-sequences") cfg.max_sequences = std::atoi(next().c_str());
-        else if (a == "--allow-cpu")     cfg.allow_cpu = true;
-        else if (a == "--chat-template")      cfg.chat_template = next();
-        else if (a == "--chat-template-file") cfg.chat_template = read_file_contents(next());
-        else if (a == "--jinja")              cfg.use_jinja = true;
-        else if (a == "--no-jinja")           cfg.use_jinja = false;
-        else if (a == "--no-chat-template")   cfg.enable_chat_template = false;
-        else if (a == "--system-prompt")      cfg.system_prompt = next();
-        else if (a == "--config")             cfg.config_path = next();
-        else if (a == "--chat-template-kwargs") {
-            // Parse a JSON object string, e.g. '{"k":"v"}'. Each value is stored
-            // as its JSON serialization (mirrors common/arg.cpp); re-parsed by
-            // common_chat_templates_apply when rendering.
-            std::string v = next();
-            try {
-                json parsed = json::parse(v);
-                if (!parsed.is_object()) {
-                    std::cerr << "error: --chat-template-kwargs must be a JSON object\n";
-                    return 2;
-                }
-                for (auto it = parsed.begin(); it != parsed.end(); ++it) {
-                    cfg.chat_template_kwargs[it.key()] = it.value().dump();
-                }
-            } catch (const std::exception & e) {
-                std::cerr << "error: --chat-template-kwargs must be valid JSON: " << e.what() << "\n";
-                return 2;
-            }
-        }
-        else if (a == "--help" || a == "-h") {
-            std::cout <<
-                "multimodal-server [options]\n"
-                "  -m, --model PATH          model gguf (required)\n"
-                "      --mmproj PATH         multimodal projector gguf (enables image/audio)\n"
-                "      --port N              HTTP port (default 8080)\n"
-                "  -ngl,--n-gpu-layers N     GPU layers (default 99)\n"
-                "  -c, --ctx-size N          context per sequence (default 4096)\n"
-                "      --n-batch N           batch size (default 2048)\n"
-                "      --max-sequences N     pooled live-sequence capacity (default 8)\n"
-                "      --allow-cpu           explicitly permit CPU-only execution (default: GPU required)\n"
-                "      --chat-template TPL   Jinja chat template override (else model default)\n"
-                "      --chat-template-file F  read Jinja chat template override from a file\n"
-                "      --jinja / --no-jinja  use the Jinja template engine (default: enabled)\n"
-                "      --no-chat-template    disable templating: 'messages' inject is rejected\n"
-                "      --system-prompt TEXT  system prompt prepended to every conversation\n"
-                "      --chat-template-kwargs JSON  extra Jinja vars, e.g. '{\"k\":\"v\"}'\n"
-                "      --config PATH         path to model config JSON file\n";
-            return 0;
-        }
+    ServerCliResult cli = parse_server_arguments(argc, argv);
+    if (cli.show_help) {
+        std::cout << server_help_text();
+        return 0;
     }
-    if (cfg.model_path.empty()) {
-        std::cerr << "error: --model is required (see --help)\n";
+    if (!cli.error.empty()) {
+        std::cerr << "error: " << cli.error << "\n";
         return 2;
     }
-    if (cfg.ctx_size <= 0 || cfg.max_sequences <= 0 || cfg.n_batch <= 0 ||
-        static_cast<uint64_t>(cfg.ctx_size) * static_cast<uint64_t>(cfg.max_sequences) > UINT32_MAX) {
-        std::cerr << "error: --ctx-size, --max-sequences, and --n-batch must define a valid pooled context\n";
-        return 2;
+    ServerConfig cfg = std::move(cli.config);
+    if (!cfg.chat_template_file.empty()) {
+        try {
+            cfg.chat_template = read_file_contents(cfg.chat_template_file);
+        } catch (const std::exception & exception) {
+            std::cerr << "error: cannot read --chat-template-file '"
+                      << cfg.chat_template_file << "': " << exception.what() << "\n";
+            return 2;
+        }
     }
 
     // Validate a user-supplied chat template up front (fail fast), mirroring
@@ -1015,7 +973,6 @@ int main(int argc, char ** argv) {
         std::cerr << "warning: no chat template in model; 'messages' inject will fail.\n";
     }
     app.n_ctx_per_session = cfg.ctx_size;
-    app.n_batch = cfg.n_batch;
     app.max_sequences = cfg.max_sequences;
     std::cerr << "model loaded.\n";
 
@@ -1024,7 +981,7 @@ int main(int argc, char ** argv) {
     if (!cfg.mmproj_path.empty()) {
         std::cerr << "loading mmproj: " << cfg.mmproj_path << " ...\n";
         mtmd_context_params mp = mtmd_context_params_default();
-        mp.use_gpu = (cfg.n_gpu_layers > 0);
+        mp.use_gpu = (cfg.n_gpu_layers != 0);
         mp.warmup  = true;
         app.mtmd_ctx = mtmd_init_from_file(cfg.mmproj_path.c_str(), app.model, mp);
         if (!app.mtmd_ctx) {
@@ -1043,11 +1000,17 @@ int main(int argc, char ** argv) {
     // llama receives the explicitly multiplied pool size and sequence capacity.
     const size_t gpu_free_before_pool = gpu_free_bytes();
     llama_context_params pooled_params = llama_context_default_params();
-    pooled_params.n_ctx = static_cast<uint32_t>(cfg.ctx_size * cfg.max_sequences);
-    pooled_params.n_batch = std::min<int>(cfg.n_batch, pooled_params.n_ctx);
+    const uint64_t requested_pool_size =
+        static_cast<uint64_t>(cfg.ctx_size) * static_cast<uint64_t>(cfg.max_sequences);
+    pooled_params.n_ctx = static_cast<uint32_t>(requested_pool_size);
+    pooled_params.n_batch =
+        static_cast<uint32_t>(std::min<uint64_t>(cfg.n_batch, requested_pool_size));
     // Keep two internal IDs available for the disposable startup copy/removal
     // probe even when public live capacity is configured as one.
     pooled_params.n_seq_max = std::max(cfg.max_sequences, 2);
+    // Output reservation is keyed to n_seq_max even when a smaller n_batch
+    // decodes the two disposable probe sequences in separate calls.
+    pooled_params.n_outputs_max = pooled_params.n_seq_max;
     pooled_params.kv_unified = true;  // required for tokens coupled to multiple fork sequences
     pooled_params.no_perf = true;
     llama_context * pooled_ctx = llama_init_from_model(app.model, pooled_params);
@@ -1060,6 +1023,16 @@ int main(int argc, char ** argv) {
                   << " total tokens; requested " << pooled_params.n_ctx << "\n";
         llama_free(pooled_ctx);
         return 1;
+    }
+    if (llama_n_batch(pooled_ctx) < static_cast<uint32_t>(cfg.max_sequences)) {
+        std::cerr << "error: pooled context batch capacity " << llama_n_batch(pooled_ctx)
+                  << " is smaller than --max-sequences " << cfg.max_sequences
+                  << "; increase --n-batch or reduce --max-sequences\n";
+        llama_free(pooled_ctx);
+        if (app.mtmd_ctx) mtmd_free(app.mtmd_ctx);
+        llama_model_free(app.model);
+        llama_backend_free();
+        return 2;
     }
     app.scheduler = std::make_unique<InferenceScheduler>(
         pooled_ctx, app.vocab, cfg.max_sequences);
@@ -1075,6 +1048,7 @@ int main(int argc, char ** argv) {
     std::cerr << "pool: capacity=" << cfg.max_sequences
               << " per_sequence_ctx=" << cfg.ctx_size
               << " total_ctx=" << llama_n_ctx(pooled_ctx)
+              << " decode_batch_capacity=" << llama_n_batch(pooled_ctx)
               << " preallocated_state_bytes=" << app.scheduler->preallocated_bytes() << "\n";
 
     // Warm the pooled decode and same-stream seq_cp paths without creating a
@@ -1446,7 +1420,8 @@ int main(int argc, char ** argv) {
                             if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_AUDIO) continue;
                             llama_pos new_n_past = n_past;
                             if (mtmd_helper_eval_chunk_single(
-                                    app.mtmd_ctx, ctx, chunk, n_past, seq_id, /*n_batch*/ 512,
+                                    app.mtmd_ctx, ctx, chunk, n_past, seq_id,
+                                    static_cast<int32_t>(llama_n_batch(ctx)),
                                     /*logits_last*/ true, &new_n_past) != 0) {
                                 decoded = false;
                                 break;
@@ -1536,17 +1511,7 @@ int main(int argc, char ** argv) {
         const uint64_t mutation_parent =
             app.scheduler->prepare_sequence_mutation(seq_id);
         const bool decoded = app.scheduler->invoke_invalidating_logits([&](llama_context * ctx) {
-            llama_batch batch = llama_batch_init((int32_t) toks.size(), 0, 1);
-            for (int i = 0; i < (int) toks.size(); ++i) {
-                batch.token[i] = toks[i];
-                batch.pos[i] = used + i;
-                batch.n_seq_id[i] = 1;
-                batch.seq_id[i][0] = seq_id;
-                batch.logits[i] = i + 1 == (int) toks.size();
-            }
-            batch.n_tokens = (int32_t) toks.size();
-            const bool result = llama_decode(ctx, batch) == 0;
-            llama_batch_free(batch);
+            const bool result = decode_tokens_in_chunks(ctx, seq_id, used, toks);
             if (!result) {
                 llama_memory_seq_rm(llama_get_memory(ctx), seq_id, used, -1);
             }

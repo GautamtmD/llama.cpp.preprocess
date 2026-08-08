@@ -17,6 +17,8 @@ import subprocess
 import tempfile
 import time
 import wave
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -41,8 +43,8 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-@pytest.fixture(scope="module")
-def tiny_server():
+@contextmanager
+def _running_server(n_batch: int, max_sequences: int) -> Iterator[str]:
     if not MODEL or not MMPROJ:
         pytest.skip("MULTIMODAL_MODEL and MULTIMODAL_MMPROJ are required")
     if not EXE.exists():
@@ -60,7 +62,9 @@ def tiny_server():
         "--ctx-size",
         str(CTX_SIZE),
         "--max-sequences",
-        "2",
+        str(max_sequences),
+        "--n-batch",
+        str(n_batch),
     ]
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = CUDA_GPU
@@ -86,17 +90,31 @@ def tiny_server():
             process.wait(timeout=10)
         log.seek(0)
         output = log.read().decode("utf-8", "replace")
+        log.close()
         pytest.fail(f"tiny-context server failed to start:\n{output[-4000:]}")
 
-    yield base
-
-    process.terminate()
     try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=10)
-    log.close()
+        yield base
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
+        log.close()
+
+
+@pytest.fixture(scope="module")
+def tiny_server():
+    with _running_server(n_batch=2, max_sequences=2) as base:
+        yield base
+
+
+@pytest.fixture
+def single_batch_server():
+    with _running_server(n_batch=1, max_sequences=1) as base:
+        yield base
 
 
 def _cache_size(base: str, sid: str) -> int:
@@ -107,6 +125,96 @@ def _cache_size(base: str, sid: str) -> int:
 
 def _inject_text(base: str, sid: str, text: str) -> requests.Response:
     return requests.post(f"{base}/sessions/{sid}/inject", json={"text": text}, timeout=30)
+
+
+def test_batch_one_startup_probe_and_text_injection(single_batch_server):
+    created = requests.post(f"{single_batch_server}/sessions", timeout=30)
+    assert created.status_code == 200, created.text
+    sid = created.json()["session_id"]
+    try:
+        injected = _inject_text(
+            single_batch_server,
+            sid,
+            "alpha beta gamma delta",
+        )
+        assert injected.status_code == 200, injected.text
+        assert injected.json()["tokens_injected"] > 1
+
+        generated = requests.post(
+            f"{single_batch_server}/sessions/{sid}/generate",
+            json={"max_tokens": 1, "temperature": 0.0, "ignore_eos": True},
+            timeout=30,
+        )
+        assert generated.status_code == 200, generated.text
+        assert generated.json()["n_tokens"] == 1
+    finally:
+        requests.delete(f"{single_batch_server}/sessions/{sid}", timeout=30)
+
+
+def test_small_batch_chunks_text_and_multimodal_injection(tiny_server):
+    created = requests.post(f"{tiny_server}/sessions", timeout=30)
+    assert created.status_code == 200, created.text
+    sid = created.json()["session_id"]
+    try:
+        text = _inject_text(
+            tiny_server,
+            sid,
+            "alpha beta gamma delta epsilon zeta eta theta",
+        )
+        assert text.status_code == 200, text.text
+        assert text.json()["tokens_injected"] > 2
+    finally:
+        requests.delete(f"{tiny_server}/sessions/{sid}", timeout=30)
+
+    created = requests.post(f"{tiny_server}/sessions", timeout=30)
+    assert created.status_code == 200, created.text
+    sid = created.json()["session_id"]
+    try:
+        pcm = struct.pack("<2560f", *([0.0] * 2560))
+        raw_audio = requests.post(
+            f"{tiny_server}/sessions/{sid}/inject",
+            json={"audio": base64.b64encode(pcm).decode("ascii")},
+            timeout=30,
+        )
+        assert raw_audio.status_code == 200, raw_audio.text
+        assert raw_audio.json()["cache_size"] > 2
+    finally:
+        requests.delete(f"{tiny_server}/sessions/{sid}", timeout=30)
+
+    created = requests.post(f"{tiny_server}/sessions", timeout=30)
+    assert created.status_code == 200, created.text
+    sid = created.json()["session_id"]
+    try:
+        wav = io.BytesIO()
+        with wave.open(wav, "wb") as audio_file:
+            audio_file.setnchannels(1)
+            audio_file.setsampwidth(2)
+            audio_file.setframerate(16000)
+            audio_file.writeframes(b"\0\0" * 2560)
+        messages = requests.post(
+            f"{tiny_server}/sessions/{sid}/inject",
+            json={
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_audio",
+                                "input_audio": {
+                                    "data": base64.b64encode(wav.getvalue()).decode("ascii")
+                                },
+                            },
+                            {"type": "text", "text": "transcribe"},
+                        ],
+                    }
+                ]
+            },
+            timeout=30,
+        )
+        assert messages.status_code == 200, messages.text
+        assert messages.json()["cache_size"] > 2
+    finally:
+        requests.delete(f"{tiny_server}/sessions/{sid}", timeout=30)
 
 
 def test_context_full_after_one_token_returns_partial_success(tiny_server):
@@ -198,7 +306,9 @@ def test_streaming_context_full_reports_partial_success(tiny_server):
         requests.delete(f"{tiny_server}/sessions/{sid}", timeout=30)
 
 
-def test_generation_and_multimodal_injection_never_exceed_per_sequence_limit(tiny_server):
+def test_generation_and_multimodal_injection_never_exceed_per_sequence_limit(
+    tiny_server,
+):
     created = requests.post(f"{tiny_server}/sessions", timeout=30)
     assert created.status_code == 200, created.text
     sid = created.json()["session_id"]

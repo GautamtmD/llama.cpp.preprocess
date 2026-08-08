@@ -15,6 +15,10 @@ InferenceScheduler::InferenceScheduler(
     if (!ctx_ || max_sequences_ <= 0) {
         throw std::invalid_argument("scheduler requires a context and positive sequence capacity");
     }
+    if (llama_n_batch(ctx_) < static_cast<uint32_t>(max_sequences_)) {
+        throw std::invalid_argument(
+            "scheduler sequence capacity exceeds the context decode batch capacity");
+    }
     for (int i = 0; i < max_sequences_; ++i) {
         free_sequences_.insert(i);
         logits_rows_[i] = -1;
@@ -290,21 +294,28 @@ bool InferenceScheduler::probe_sequence_capabilities(std::string & error) {
 
         llama_token token = llama_vocab_bos(vocab_);
         if (token == LLAMA_TOKEN_NULL) token = 0;
-        llama_batch batch = llama_batch_init(2, 0, max_sequences_);
-        for (int i = 0; i < 2; ++i) {
-            batch.token[i] = token;
-            batch.pos[i] = i;
-            batch.n_seq_id[i] = 1;
-            batch.seq_id[i][0] = source;
-            batch.logits[i] = i == 1;
-        }
-        batch.n_tokens = 2;
-        const int decode_result = llama_decode(ctx, batch);
-        llama_batch_free(batch);
-        if (decode_result != 0) {
-            cleanup();
-            error = "pooled sequence probe decode failed";
-            return false;
+        const uint32_t batch_capacity = llama_n_batch(ctx);
+        for (int offset = 0; offset < 2;) {
+            const int chunk_size =
+                std::min<int>(static_cast<int>(batch_capacity), 2 - offset);
+            llama_batch batch = llama_batch_init(chunk_size, 0, 1);
+            for (int i = 0; i < chunk_size; ++i) {
+                const int position = offset + i;
+                batch.token[i] = token;
+                batch.pos[i] = position;
+                batch.n_seq_id[i] = 1;
+                batch.seq_id[i][0] = source;
+                batch.logits[i] = position == 1;
+            }
+            batch.n_tokens = chunk_size;
+            const int decode_result = llama_decode(ctx, batch);
+            llama_batch_free(batch);
+            if (decode_result != 0) {
+                cleanup();
+                error = "pooled sequence probe decode failed";
+                return false;
+            }
+            offset += chunk_size;
         }
 
         llama_memory_seq_cp(memory, source, destination, 0, -1);
@@ -508,6 +519,10 @@ bool InferenceScheduler::decode_batch(
     llama_batch & batch, uint32_t distinct_sequences, std::string & error) {
     if (batch.n_tokens == 0) {
         return true;
+    }
+    if (batch.n_tokens > static_cast<int32_t>(llama_n_batch(ctx_))) {
+        error = "pooled scheduler batch exceeds the configured context batch capacity";
+        return false;
     }
     if (llama_decode(ctx_, batch) != 0) {
         error = "llama_decode failed in pooled scheduler";

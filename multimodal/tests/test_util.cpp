@@ -6,6 +6,7 @@
 // Exits non-zero on any check failure (so it can gate the build).
 
 #include "util.h"
+#include "server_cli.h"
 
 #include <iostream>
 #include <string>
@@ -174,6 +175,59 @@ static void test_model_config() {
     CHECK(std::abs(c4.min_p - 0.01f) < 1e-5f);
 }
 
+static void test_server_argument_validation() {
+    auto expect_error = [](std::vector<std::string> args, const std::string & expected) {
+        const ServerCliResult result = parse_server_arguments(args);
+        CHECK(!result.error.empty());
+        CHECK(result.error.find(expected) != std::string::npos);
+    };
+
+    const ServerCliResult valid = parse_server_arguments({
+        "--model", "model.gguf",
+        "--port", "1234",
+        "--n-gpu-layers", "-1",
+        "--ctx-size", "1024",
+        "--n-batch", "8",
+        "--max-sequences", "8",
+        "--chat-template-kwargs", R"({"custom":"value"})",
+    });
+    CHECK(valid.error.empty());
+    CHECK(!valid.show_help);
+    CHECK_EQ(valid.config.port, 1234);
+    CHECK_EQ(valid.config.n_gpu_layers, -1);
+    CHECK_EQ(valid.config.ctx_size, 1024);
+    CHECK_EQ(valid.config.n_batch, 8);
+    CHECK_EQ(valid.config.max_sequences, 8);
+    CHECK_EQ(valid.config.chat_template_kwargs.at("custom"), "\"value\"");
+
+    const ServerCliResult help = parse_server_arguments({"--help"});
+    CHECK(help.error.empty());
+    CHECK(help.show_help);
+
+    expect_error({}, "--model is required");
+    expect_error({"--model"}, "--model requires a path");
+    expect_error({"--model", "model.gguf", "--unknown"}, "unrecognized argument '--unknown'");
+    expect_error({"--model", "model.gguf", "--port", "12x"}, "--port must be an integer");
+    expect_error(
+        {"--model", "model.gguf", "--ctx-size", "999999999999999999999"},
+        "--ctx-size must be an integer");
+    expect_error({"--model", "model.gguf", "--ctx-size", "0"}, "--ctx-size must be positive");
+    expect_error({"--model", "model.gguf", "--n-batch", "0"}, "--n-batch must be positive");
+    expect_error(
+        {"--model", "model.gguf", "--max-sequences", "0"},
+        "--max-sequences must be positive");
+    expect_error(
+        {"--model", "model.gguf", "--n-batch", "3", "--max-sequences", "4"},
+        "--n-batch (3) must be at least --max-sequences (4)");
+    expect_error(
+        {"--model", "model.gguf", "--ctx-size", "2147483647", "--max-sequences", "3",
+         "--n-batch", "3"},
+        "exceeds the maximum pooled context size");
+    expect_error(
+        {"--model", "model.gguf", "--chat-template-kwargs", "[]"},
+        "--chat-template-kwargs must be a JSON object");
+}
+
 int main() {
     test_base64_decode();
     test_make_session_id();
@@ -182,6 +236,7 @@ int main() {
     test_error_body();
     test_sse_event();
     test_gpu_execution_policy();
+    test_server_argument_validation();
     test_model_config();
 
     if (g_failures) {
