@@ -62,6 +62,20 @@ def _delete(base: str, sid: str) -> None:
     assert response.status_code == 200, response.text
 
 
+def _assert_empty_checkpoint(base: str, sid: str) -> None:
+    response = requests.get(f"{base}/sessions/{sid}", timeout=30)
+    assert response.status_code == 200, response.text
+    state = response.json()
+    assert state["cache_size"] == 0, state
+    assert state["boundary_token"] == -1, state
+
+
+def _assert_empty_reusable(base: str, sid: str) -> None:
+    """Retry generation from the restored empty checkpoint."""
+    retry = _generate(base, sid, max_tokens=16)
+    assert retry["n_tokens"] > 0, retry
+
+
 def _assert_clean_and_reusable(base: str, sid: str, cache_before: int, control_sid: str) -> None:
     """Compare cancelled state to an untouched control and a post-cancel fork."""
     post_cancel = _fork(base, sid)
@@ -89,12 +103,18 @@ def test_cancel_unknown_session_404(base):
     assert "error" in response.json()
 
 
-def test_cancel_streaming_rewinds_cache_and_leaves_session_reusable(base, make_session):
+@pytest.mark.parametrize("empty_session", [False, True], ids=["injected", "empty"])
+def test_cancel_streaming_rewinds_cache_and_leaves_session_reusable(
+    base, make_session, empty_session
+):
     sid = make_session()
-    before = _inject(base, sid, "Write a very long numbered list about the solar system.")[
-        "cache_size"
-    ]
-    control_sid = _fork(base, sid)["session_id"]
+    if empty_session:
+        before = 0
+    else:
+        before = _inject(base, sid, "Write a very long numbered list about the solar system.")[
+            "cache_size"
+        ]
+        control_sid = _fork(base, sid)["session_id"]
     second_token = threading.Event()
     token_times: list[float] = []
     outcome: dict[str, object] = {}
@@ -146,7 +166,11 @@ def test_cancel_streaming_rewinds_cache_and_leaves_session_reusable(base, make_s
         f"cancel-to-clean={halted_ms:.1f} ms"
     )
 
-    _assert_clean_and_reusable(base, sid, before, control_sid)
+    if empty_session:
+        _assert_empty_checkpoint(base, sid)
+        _assert_empty_reusable(base, sid)
+    else:
+        _assert_clean_and_reusable(base, sid, before, control_sid)
 
 
 def test_cancel_non_streaming_rewinds_cache_and_leaves_session_reusable(base, make_session):
@@ -199,10 +223,14 @@ def test_cancel_non_streaming_rewinds_cache_and_leaves_session_reusable(base, ma
     _assert_clean_and_reusable(base, sid, before, control_sid)
 
 
-def test_stream_disconnect_rewinds_cache(base, make_session):
+@pytest.mark.parametrize("empty_session", [False, True], ids=["injected", "empty"])
+def test_stream_disconnect_rewinds_cache(base, make_session, empty_session):
     sid = make_session()
-    before = _inject(base, sid, "List every ocean current in detail.")["cache_size"]
-    control_sid = _fork(base, sid)["session_id"]
+    if empty_session:
+        before = 0
+    else:
+        before = _inject(base, sid, "List every ocean current in detail.")["cache_size"]
+        control_sid = _fork(base, sid)["session_id"]
     second_token = threading.Event()
     token_times: list[float] = []
 
@@ -242,4 +270,8 @@ def test_stream_disconnect_rewinds_cache(base, make_session):
         f"inactive within {clean_completion_budget_ms:.1f} ms"
     )
 
-    _assert_clean_and_reusable(base, sid, before, control_sid)
+    if empty_session:
+        _assert_empty_checkpoint(base, sid)
+        _assert_empty_reusable(base, sid)
+    else:
+        _assert_clean_and_reusable(base, sid, before, control_sid)

@@ -89,6 +89,8 @@ Expected:
 - Partial tokens generated after the cancel point are NOT persisted: the
   session's KV cache is at the pre-generation token boundary (verified by cache
   size and by the next generate reproducing the pre-cancel greedy output).
+- Cancelling generation from an empty session removes its temporary BOS,
+  restoring `cache_size=0` and a null boundary token; retry generation succeeds.
 - The session is fully reusable afterwards (inject / generate / fork work normally).
 - In the engagement pipeline (D5) generations run on **forks**, so abort = drop
   the fork (no effect on BASE). A BASE-resident generate abort **rewinds** the
@@ -102,8 +104,8 @@ Latency / performance budget:
 
 Test:
 - `tests/test_cancel.py` (streaming and non-streaming cancellation, disconnect
-  cleanup, measured halt budget, exact greedy parity after rewind, and session
-  reuse)
+  cleanup, measured halt budget, exact greedy parity after rewind, empty-session
+  checkpoint restoration, and session reuse)
 - `tests/test_fork.py` (fork independence keeps BASE untouched when a fork is
   discarded)
 

@@ -525,7 +525,9 @@ GenResult run_generation(
     const SchedulerGenerationCheckpoint checkpoint =
         app.scheduler->generation_checkpoint(seq_id);
     const llama_pos pmax = checkpoint.position;
-    const llama_pos p_start = pmax < 0 ? 1 : pmax + 1;
+    // Rewind starts at the first position absent from the checkpoint. For an
+    // empty sequence pmax is -1, so cancellation removes the temporary BOS at 0.
+    const llama_pos p_start = pmax + 1;
     r.cache_size = pmax < 0 ? 0 : pmax + 1;
     llama_token boundary_token = rewind_token;
 
