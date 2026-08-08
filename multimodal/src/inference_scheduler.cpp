@@ -674,16 +674,26 @@ void InferenceScheduler::process_steps(std::vector<std::shared_ptr<StepRequest>>
         std::vector<std::shared_ptr<StepRequest>> initialization = requests;
         std::set<llama_seq_id> included;
         std::set<uint64_t> families_to_detach;
+        const llama_memory_t memory = llama_get_memory(ctx_);
         for (const auto & request : requests) {
             included.insert(request->seq_id);
             const auto family = sequence_families_.find(request->seq_id);
+            // Existing shared boundary cells must be detached as a family so
+            // every owner retains a valid boundary after its re-decode. An
+            // empty sequence has no boundary to preserve: adding idle siblings
+            // would incorrectly decode the temporary initialization BOS into
+            // sessions that did not request generation.
             if (family != sequence_families_.end() &&
-                !detached_families_.count(family->second)) {
+                !detached_families_.count(family->second) &&
+                llama_memory_seq_pos_max(memory, request->seq_id) >= 0) {
                 families_to_detach.insert(family->second);
             }
         }
         for (const auto & [sequence, family] : sequence_families_) {
-            if (!families_to_detach.count(family) || included.count(sequence)) continue;
+            if (!families_to_detach.count(family) || included.count(sequence) ||
+                llama_memory_seq_pos_max(memory, sequence) < 0) {
+                continue;
+            }
             auto sibling = std::make_shared<StepRequest>();
             sibling->seq_id = sequence;
             sibling->sampler = nullptr;

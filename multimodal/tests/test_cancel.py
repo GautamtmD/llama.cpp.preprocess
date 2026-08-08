@@ -103,6 +103,48 @@ def test_cancel_unknown_session_404(base):
     assert "error" in response.json()
 
 
+@pytest.mark.parametrize("generate_source_first", [False, True], ids=["fork-first", "source-first"])
+def test_cancel_empty_fork_generation_preserves_both_empty_checkpoints(
+    base, make_session, generate_source_first
+):
+    source = make_session()
+    fork = _fork(base, source)["session_id"]
+    active, idle = (source, fork) if generate_source_first else (fork, source)
+    second_token = threading.Event()
+    outcome: dict[str, list[dict]] = {}
+
+    def generate() -> None:
+        response = requests.post(
+            f"{base}/sessions/{active}/generate",
+            json={"stream": True, "max_tokens": 256, "temperature": 0.0},
+            stream=True,
+            timeout=120,
+        )
+        assert response.status_code == 200, response.text
+        events = []
+        token_count = 0
+        for event in _parse_sse(response):
+            events.append(event)
+            if event.get("type") == "token":
+                token_count += 1
+                if token_count == 2:
+                    second_token.set()
+        outcome["events"] = events
+
+    worker = threading.Thread(target=generate, daemon=True)
+    worker.start()
+    assert second_token.wait(30), "stream did not produce two tokens"
+    assert _cancel(base, active) == {"session_id": active, "cancelled": True}
+    worker.join(30)
+    assert not worker.is_alive(), "cancelled empty-fork generation did not halt"
+    assert len([event for event in outcome["events"] if event.get("type") == "done"]) == 1
+
+    _assert_empty_checkpoint(base, active)
+    _assert_empty_checkpoint(base, idle)
+    _delete(base, active)
+    _assert_empty_reusable(base, idle)
+
+
 @pytest.mark.parametrize("empty_session", [False, True], ids=["injected", "empty"])
 def test_cancel_streaming_rewinds_cache_and_leaves_session_reusable(
     base, make_session, empty_session

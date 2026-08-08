@@ -8,12 +8,12 @@ Run against a LIVE multimodal-server (built from this branch — it has /fork)::
 
     pytest engine/multimodal/tests/test_fork.py
 
-Approach A' (per-sequence deep-copy into a new context — see
-docs/decisions/0004-fork-copy-semantics.md): the forked session owns an
-independent K/V copy, so source and fork generate independently. These tests
+Approach B (shared-prefix sequences in one pooled context — see
+docs/decisions/0004-fork-copy-semantics.md and ADR 0009): the fork aliases its
+immutable prefix and owns independently divergent suffix state. These tests
 check snapshot correctness (forkable after inject / after generate; source
 untouched; later source mutations do not leak into the fork; the fork generates
-coherently), the 404 path, and the latency budget (fork_ms).
+coherently), empty-fork lifecycle independence, the 404 path, and fork latency.
 """
 
 from __future__ import annotations
@@ -60,6 +60,17 @@ def _generate(base, sid, **kw):
     return r.json()
 
 
+def _status(base, sid):
+    response = requests.get(f"{base}/sessions/{sid}", timeout=30)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _delete(base, sid):
+    response = requests.delete(f"{base}/sessions/{sid}", timeout=30)
+    assert response.status_code == 200, response.text
+
+
 # ------------------------------- core contract ------------------------------
 
 
@@ -67,6 +78,27 @@ def test_fork_unknown_session_404(base):
     r = requests.post(f"{base}/sessions/s_999999/fork", timeout=30)
     assert r.status_code == 404
     assert "error" in r.json()
+
+
+@pytest.mark.parametrize("generate_source_first", [False, True], ids=["fork-first", "source-first"])
+def test_empty_fork_generation_leaves_idle_sibling_empty_and_reusable(
+    base, make_session, generate_source_first
+):
+    source = make_session()
+    forked = _fork(base, source)
+    assert forked["fork_ms"] < FORK_LATENCY_BUDGET_MS, forked
+    fork = forked["session_id"]
+    active, idle = (source, fork) if generate_source_first else (fork, source)
+
+    generated = _generate(base, active, max_tokens=1)
+    assert generated["n_tokens"] == 1, generated
+    idle_state = _status(base, idle)
+    assert idle_state["cache_size"] == 0, idle_state
+    assert idle_state["boundary_token"] == -1, idle_state
+
+    _delete(base, active)
+    retry = _generate(base, idle, max_tokens=1)
+    assert retry["n_tokens"] == 1, retry
 
 
 def test_fork_after_text_inject_snapshots_cache(base, make_session):

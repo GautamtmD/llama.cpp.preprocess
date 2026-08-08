@@ -54,7 +54,10 @@ Expected:
   (audio -> text suffix) is fully forkable. (Media inject clears the tracked
   last token, so a later fork never re-decodes a stale token at a media cell.)
 - The source session's cache is unchanged by the fork, and later mutations to
-  the source do NOT appear in the fork (true snapshot independence).
+  either peer do NOT appear in the other (true snapshot independence). For an
+  empty fork family, generating or cancelling from either peer leaves the idle
+  peer at `cache_size:0`, `boundary_token:-1`; deleting the active peer still
+  leaves the idle peer generation-ready.
 - Unknown source session -> 404.
 
 Latency / performance budget:
@@ -67,9 +70,12 @@ Latency / performance budget:
   memory measurement.
 
 Test:
-- tests/test_fork.py (correctness + latency against the live server)
-- src/fork_bench.cpp (the M2.0 copy-cost measurement gate; cross-context-size
-  perf + VRAM footprint)
+- `tests/test_fork.py` (snapshot correctness, empty-family generation in both
+  orders, delete/survivor reuse, and latency against the live server)
+- `tests/test_cancel.py` (empty source/fork cancellation and exact checkpoint
+  restoration in both generation orders)
+- `src/fork_bench.cpp` (the M2.0 copy-cost measurement gate; cross-context-size
+  performance and VRAM footprint)
 
 ---
 
