@@ -103,6 +103,53 @@ def test_cancel_unknown_session_404(base):
     assert "error" in response.json()
 
 
+def test_malformed_session_id_cannot_miss_active_cancellation(base, make_session):
+    sid = make_session()
+    number = sid.removeprefix("s_")
+    alias = f"s_0{number}"
+    second_token = threading.Event()
+    outcome: dict[str, list[dict]] = {}
+
+    def generate() -> None:
+        response = requests.post(
+            f"{base}/sessions/{sid}/generate",
+            json={
+                "stream": True,
+                "max_tokens": 256,
+                "temperature": 0.0,
+                "ignore_eos": True,
+            },
+            stream=True,
+            timeout=120,
+        )
+        assert response.status_code == 200, response.text
+        events = []
+        token_count = 0
+        for event in _parse_sse(response):
+            events.append(event)
+            if event.get("type") == "token":
+                token_count += 1
+                if token_count == 2:
+                    second_token.set()
+        outcome["events"] = events
+
+    worker = threading.Thread(target=generate, daemon=True)
+    worker.start()
+    assert second_token.wait(30), "stream did not produce two tokens"
+    try:
+        malformed = requests.post(f"{base}/sessions/{alias}/cancel", timeout=30)
+    finally:
+        canonical = _cancel(base, sid)
+    worker.join(30)
+
+    assert malformed.status_code == 404, malformed.text
+    assert canonical == {"session_id": sid, "cancelled": True}
+    assert not worker.is_alive(), "canonical cancellation did not halt generation"
+    events = outcome["events"]
+    assert len([event for event in events if event.get("type") == "done"]) == 1
+    _assert_empty_checkpoint(base, sid)
+
+
 @pytest.mark.parametrize("generate_source_first", [False, True], ids=["fork-first", "source-first"])
 def test_cancel_empty_fork_generation_preserves_both_empty_checkpoints(
     base, make_session, generate_source_first

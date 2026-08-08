@@ -86,16 +86,30 @@ static void test_extract_session_id() {
 }
 
 static void test_parse_session_id_num() {
-    CHECK(parse_session_id_num("s_1") == 1);
     CHECK(parse_session_id_num("s_0") == 0);
+    CHECK(parse_session_id_num("s_1") == 1);
     CHECK(parse_session_id_num("s_12345") == 12345);
-    // missing prefix
-    CHECK(parse_session_id_num("1") == -1);
-    CHECK(parse_session_id_num("xyz") == -1);
-    // empty number
-    CHECK(parse_session_id_num("s_") == -1);
-    // overflow
-    CHECK(parse_session_id_num("s_9999999999999999999999") == -1);
+    CHECK(parse_session_id_num("s_9223372036854775807") == 9223372036854775807LL);
+
+    const std::vector<std::string> malformed = {
+        "",
+        "1",
+        "xyz",
+        "s_",
+        "s_00",
+        "s_01",
+        "s_1junk",
+        "s_+1",
+        "s_-1",
+        "s_ 1",
+        "s_1 ",
+        "s_\t1",
+        "s_9223372036854775808",
+        "s_9999999999999999999999",
+    };
+    for (const auto & id : malformed) {
+        CHECK(parse_session_id_num(id) == -1);
+    }
 }
 
 static void test_error_body() {

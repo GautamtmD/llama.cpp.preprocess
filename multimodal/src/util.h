@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -66,12 +67,23 @@ inline std::string extract_session_id(const std::string & path, const std::strin
     return id;
 }
 
-// "s_<n>" -> n, or -1 on bad format/overflow.
+// Canonical "s_<n>" -> n, or -1 on bad format/overflow. Only ASCII decimal
+// digits are accepted; zero is "s_0", while positive values have no leading zero.
 inline int64_t parse_session_id_num(const std::string & id) {
-    const std::string pfx = "s_";
-    if (id.rfind(pfx, 0) != 0) return -1;
-    try { return std::stoll(id.substr(pfx.size())); }
-    catch (...) { return -1; }
+    constexpr std::string_view prefix = "s_";
+    if (id.size() <= prefix.size() || id.compare(0, prefix.size(), prefix) != 0) return -1;
+
+    const std::string_view digits{id.data() + prefix.size(), id.size() - prefix.size()};
+    if (digits.size() > 1 && digits.front() == '0') return -1;
+
+    int64_t value = 0;
+    for (const char c : digits) {
+        if (c < '0' || c > '9') return -1;
+        const int64_t digit = c - '0';
+        if (value > (std::numeric_limits<int64_t>::max() - digit) / 10) return -1;
+        value = value * 10 + digit;
+    }
+    return value;
 }
 
 // Standard JSON error body: {"error": msg, "code": code}.

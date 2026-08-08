@@ -15,6 +15,37 @@ import requests
 pytestmark = pytest.mark.usefixtures("base", "make_session")
 
 
+def _leading_zero_alias(sid: str) -> str:
+    prefix, number = sid.split("_", maxsplit=1)
+    return f"{prefix}_0{number}"
+
+
+def _request_session_operation(base: str, sid: str, operation: str):
+    if operation == "status":
+        return requests.get(f"{base}/sessions/{sid}", timeout=30)
+    if operation == "delete":
+        return requests.delete(f"{base}/sessions/{sid}", timeout=30)
+    body = None
+    if operation == "inject":
+        body = {"text": "must not reach the canonical session"}
+    elif operation == "generate":
+        body = {"max_tokens": 1, "temperature": 0.0}
+    return requests.post(
+        f"{base}/sessions/{sid}/{operation}",
+        json=body,
+        timeout=120,
+    )
+
+
+MALFORMED_SESSION_IDS = [
+    pytest.param(lambda number: f"s_0{number}", id="leading-zero"),
+    pytest.param(lambda number: f"s_+{number}", id="plus-sign"),
+    pytest.param(lambda number: f"s_ {number}", id="whitespace"),
+    pytest.param(lambda number: f"s_{number}junk", id="suffix"),
+    pytest.param(lambda _number: "s_9223372036854775808", id="overflow"),
+]
+
+
 # ------------------------------- health -------------------------------------
 
 
@@ -31,6 +62,55 @@ def test_create_session_returns_id(make_session):
     sid = make_session()
     assert isinstance(sid, str)
     assert sid.startswith("s_")
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["status", "fork", "inject", "generate", "cancel", "offload", "load", "delete"],
+)
+def test_leading_zero_session_id_cannot_alias_any_session_route(base, make_session, operation):
+    sid = make_session()
+    alias = _leading_zero_alias(sid)
+    before = requests.get(f"{base}/sessions/{sid}", timeout=30).json()
+
+    response = _request_session_operation(base, alias, operation)
+    if operation == "fork" and response.status_code == 200:
+        requests.delete(
+            f"{base}/sessions/{response.json()['session_id']}",
+            timeout=30,
+        )
+
+    assert response.status_code == 404, (operation, response.status_code, response.text)
+    canonical = requests.get(f"{base}/sessions/{sid}", timeout=30)
+    assert canonical.status_code == 200, (operation, canonical.text)
+    assert canonical.json() == before, (operation, canonical.json(), before)
+
+
+@pytest.mark.parametrize("malformed_id", MALFORMED_SESSION_IDS)
+def test_malformed_session_id_spellings_cannot_read_canonical_session(
+    base, make_session, malformed_id
+):
+    sid = make_session()
+    number = sid.removeprefix("s_")
+    alias = malformed_id(number)
+    before = requests.get(f"{base}/sessions/{sid}", timeout=30).json()
+
+    response = requests.get(f"{base}/sessions/{alias}", timeout=30)
+
+    assert response.status_code == 404, (alias, response.status_code, response.text)
+    assert requests.get(f"{base}/sessions/{sid}", timeout=30).json() == before
+
+
+def test_malformed_session_id_cannot_delete_canonical_session(base, make_session):
+    sid = make_session()
+    before = requests.get(f"{base}/sessions/{sid}", timeout=30).json()
+
+    response = requests.delete(f"{base}/sessions/{sid}junk", timeout=30)
+
+    assert response.status_code == 404, response.text
+    canonical = requests.get(f"{base}/sessions/{sid}", timeout=30)
+    assert canonical.status_code == 200, canonical.text
+    assert canonical.json() == before
 
 
 # ------------------------------- inject -------------------------------------

@@ -145,6 +145,9 @@ Expected:
 - Multipart media requests own every decoded bitmap with RAII until request
   completion. A later decode/parser/template error or mtmd injection failure
   releases earlier media and leaves the target sequence unchanged.
+- Every ID-bearing session route accepts only canonical ASCII-decimal IDs.
+  Leading-zero, signed, whitespace-bearing, suffixed, and overflow spellings
+  return 404 before any session or active-generation lookup.
 
 Latency / performance budget (implemented and measured):
 - Fork (`seq_cp`) in a pooled context: **< 5 ms, < 10 MiB** (~0 in practice; vs
@@ -163,6 +166,9 @@ Test:
   lineage-cache reclamation, current-boundary replay, repeated
   cancellation/output isolation, atomic delete/snapshot races, truthful
   ownership/GPU telemetry, and shared-prefix lifecycle)
+- `tests/test_session_api.py` and `tests/test_cancel.py` (canonical external IDs,
+  malformed-alias rejection across every session route, active cancellation, and
+  delete/source preservation)
 - `tests/test_context_limits.py` (small `--n-batch` text/multimodal chunking,
   small-context generation partial-success and boundary parity, plus atomic
   multimodal preflight/retry invariants)
