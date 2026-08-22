@@ -70,8 +70,10 @@ drifts, rebuild ggml-cuda from source with a CUDA-supported host compiler.
 ## Model reasoning configuration
 
 `reasoning_effort` is available only when the loaded model has a complete
-reasoning configuration. Gemma 4 metadata auto-detection installs the shipped
-mapping. An explicit model JSON config can declare another model's equivalent:
+reasoning configuration. Automatic configuration requires exact GGUF
+`general.architecture: gemma4`; description matches and other Gemma generations
+do not qualify. An explicit model JSON config can declare another model's
+equivalent:
 
 ```json
 {
@@ -93,6 +95,11 @@ mapping. An explicit model JSON config can declare another model's equivalent:
 larger than `medium` or `-1` for unrestricted reasoning. Missing markers,
 budgets, or invalid ordering make the capability unavailable, so every explicit
 effort request fails with HTTP 400 rather than becoming a no-op.
+
+Per-session generated replay restores `common/`'s reasoning marker/budget state
+when chunked `/generate` calls rebuild the sampler. It is cleared by successful
+inject, copied by fork, retained through offload/load, and unchanged by
+cancellation rewind.
 
 ## Run
 

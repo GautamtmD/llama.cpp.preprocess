@@ -215,8 +215,11 @@ Expected:
   unrestricted (`-1`). Omission retains the prior unrestricted/default path.
   `none` uses `common/`'s reasoning-budget sampler to force `<channel|>`
   immediately after `<|channel>thought`, admits no sampled thought payload, and
-  then continues normal answer generation. Unsupported values/models fail with
-  JSON HTTP 400 before generation/SSE and leave the session reusable.
+  then continues normal answer generation across arbitrarily short `/generate`
+  requests. Partial-marker and finite-budget state survives fork and offload/load
+  but never advances on cancelled/rewound tokens. Automatic configuration
+  requires exact `general.architecture: gemma4`; unsupported values/models fail
+  with JSON HTTP 400 before generation/SSE and leave the session reusable.
 
 Latency / performance budget:
 - Grammar-sampler overhead per decode step: **≤ ~10% of decode time** (the
@@ -225,10 +228,13 @@ Latency / performance budget:
 - TTFT with grammar/tools must NOT regress US-5's target (< 300 ms; ~900 ms today).
 - Reasoning-effort request resolution averages **< 5 µs** over 100,000
   model-free iterations.
+- Warming aside, a `none` response continued exclusively through one-token
+  requests reaches answer text in **< 2 s per session**, including after
+  fork/offload/load state transfer.
 - Across five paired warmed Gemma 4 12B fork trials, `none` must reach the first
   answer-channel text token **≥ 2x faster by median wall clock** than omission
   and admit zero thought payload tokens. Measured on RTX 5070 Ti:
-  6755.866 ms omitted vs 146.577 ms `none` median (**46.091x**); the answer began
+  7322.436 ms omitted vs 146.715 ms `none` median (**49.909x**); the answer began
   at token event 4 in every `none` trial.
 
 Test:
@@ -242,8 +248,10 @@ Test:
   effort mapping plus request-resolution latency, model-free generation
   validation, and incremental stop matching/order/empty-input defenses)
 - `tests/test_reasoning_effort.py` (strict JSON/SSE validation and post-error
-  reuse, JSON/SSE budget-zero marker behavior, cancellation/continuation,
-  constrained generation, and the opt-in five-pair real-Gemma latency gate)
+  reuse, JSON/SSE budget-zero marker behavior, one-token `none` continuation
+  through fork/offload, finite-budget one-token continuation, cancellation
+  rewind, constrained generation, and the opt-in five-pair real-Gemma latency
+  gate)
 
 The functional suite is implemented. The numeric grammar-overhead/final-parse
 budgets above still require a dedicated benchmark before they can become

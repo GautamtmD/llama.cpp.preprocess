@@ -125,10 +125,17 @@ static ModelConfig load_config_for_model(const std::string & model_path, const s
         char desc[512] = "";
         llama_model_desc(model, desc, sizeof(desc));
         std::string desc_str(desc);
+        char architecture_buf[128] = "";
+        const int32_t architecture_length = llama_model_meta_val_str(
+            model, "general.architecture", architecture_buf,
+            sizeof(architecture_buf));
+        const std::string architecture =
+            architecture_length >= 0 ? architecture_buf : "";
 
         std::cerr << "info: no config file loaded, auto-detecting model properties from GGUF metadata...\n";
         std::cerr << "  model embedding length: " << n_embd << "\n";
         std::cerr << "  model description: " << desc_str << "\n";
+        std::cerr << "  model architecture: " << architecture << "\n";
 
         if (n_embd == 2560 || desc_str.find("E4B") != std::string::npos || desc_str.find("4B") != std::string::npos) {
             cfg.audio_frame_size = 1; // E4B / gemma4a models do not require a divisor constraint in server
@@ -137,10 +144,9 @@ static ModelConfig load_config_for_model(const std::string & model_path, const s
             cfg.audio_frame_size = 640; // Default Gemma 4 12B audio frame size
             std::cerr << "  defaulting to Gemma 4 12B model. Setting audio_frame_size = 640.\n";
         }
-        if (desc_str.find("Gemma") != std::string::npos ||
-            desc_str.find("gemma") != std::string::npos) {
+        if (has_builtin_gemma4_reasoning(architecture)) {
             cfg.enable_gemma4_reasoning();
-            std::cerr << "  detected Gemma 4 reasoning markers and effort budgets.\n";
+            std::cerr << "  detected exact gemma4 architecture; enabling reasoning control.\n";
         }
     }
 
@@ -168,6 +174,7 @@ struct OffloadedState {
     int                  cache_size = 0;              // tokens at offload time
     size_t               state_bytes = 0;             // == state.size(); symmetric offload/load
     bool                 loading = false;             // RAM -> loading -> VRAM reservation
+    std::shared_ptr<std::string> reasoning_replay = std::make_shared<std::string>();
 };
 
 struct LiveSession {
@@ -176,6 +183,7 @@ struct LiveSession {
     bool busy = false;
     uint32_t readers = 0;
     bool releasing = false;
+    std::shared_ptr<std::string> reasoning_replay = std::make_shared<std::string>();
 };
 
 // One model and one explicitly sized pooled context. External sessions map to
@@ -269,6 +277,7 @@ struct GenParams {
 
 struct GenResult {
     std::string text;
+    std::string reasoning_replay_delta;
     std::vector<int64_t> ids;
     double gen_s = 0.0;
     double rewind_s = 0.0;
@@ -371,18 +380,36 @@ common_params_sampling build_sampling_params(const AppState & app, const GenPara
 }
 
 
-int64_t register_session(AppState & app, llama_seq_id seq_id,
-                         llama_token last_token = LLAMA_TOKEN_NULL) {
+int64_t register_session(
+    AppState & app, llama_seq_id seq_id,
+    llama_token last_token = LLAMA_TOKEN_NULL,
+    std::shared_ptr<std::string> reasoning_replay = {}) {
     const int64_t n = app.next_id.fetch_add(1);
+    LiveSession session{seq_id, last_token, false};
+    if (reasoning_replay) session.reasoning_replay = std::move(reasoning_replay);
     std::lock_guard<std::mutex> lk(app.mu);
-    app.sessions[n] = LiveSession{seq_id, last_token, false};
+    app.sessions[n] = std::move(session);
     return n;
 }
 
-void set_last_token(AppState & app, int64_t n, llama_token token) {
+void set_injected_boundary(AppState & app, int64_t n, llama_token token) {
     std::lock_guard<std::mutex> lk(app.mu);
     auto it = app.sessions.find(n);
-    if (it != app.sessions.end()) it->second.last_token = token;
+    if (it == app.sessions.end()) return;
+    it->second.last_token = token;
+    it->second.reasoning_replay->clear();
+}
+
+void commit_generation_boundary(
+    AppState & app, int64_t n, llama_token token,
+    const std::string & reasoning_replay_delta) {
+    std::lock_guard<std::mutex> lk(app.mu);
+    auto it = app.sessions.find(n);
+    if (it == app.sessions.end()) return;
+    it->second.last_token = token;
+    if (app.model_cfg.reasoning.complete()) {
+        it->second.reasoning_replay->append(reasoning_replay_delta);
+    }
 }
 
 std::optional<LiveSession> reserve_live_session(
@@ -547,9 +574,14 @@ struct PreparedGeneration {
     uint8_t canonical_greedy_policy = 0;
 };
 
-PreparedGeneration prepare_generation(AppState & app, const GenParams & p) {
+PreparedGeneration prepare_generation(
+    AppState & app, const GenParams & p,
+    const std::string & reasoning_replay) {
     PreparedGeneration prepared;
     common_params_sampling sparams = build_sampling_params(app, p);
+    if (p.reasoning_budget_tokens.has_value()) {
+        sparams.generation_prompt = reasoning_replay;
+    }
 
     if (p.tools.is_array() && !p.tools.empty() && app.chat_templates) {
         // Tool-calling path (ADR 0006): derive the grammar, lazy triggers,
@@ -588,8 +620,9 @@ PreparedGeneration prepare_generation(AppState & app, const GenParams & p) {
         prepared.parser_params = common_chat_parser_params(cp);
         if (!cp.parser.empty()) prepared.parser_params.parser.load(cp.parser);
         prepared.tool_calling_active = true;
-        // generation_prompt intentionally stays empty: the injected assistant
-        // turn marker is consumed by the grammar's optional start rule.
+        // On a first request generation_prompt is empty and the injected
+        // assistant marker satisfies the optional start rule. An explicit-effort
+        // continuation replays committed output to restore common sampler state.
     } else if (p.response_format.is_object()) {
         const std::string rf_type = p.response_format.at("type").get<std::string>();
         if (rf_type == "json_object") {
@@ -765,6 +798,9 @@ GenResult run_generation(
             common_sampler_accept(smpl, id, true);
             boundary_token = id;
             r.ids.push_back(static_cast<int64_t>(id));
+            if (app.model_cfg.reasoning.complete()) {
+                r.reasoning_replay_delta += piece;
+            }
 
             const size_t safe_size_before = acc.size();
             const StopMatchResult stop =
@@ -849,6 +885,9 @@ GenResult run_generation(
             common_sampler_accept(smpl, id, true);
             boundary_token = id;
             r.ids.push_back(static_cast<int64_t>(id));
+            if (app.model_cfg.reasoning.complete()) {
+                r.reasoning_replay_delta += piece;
+            }
             emitted_token_id = static_cast<int64_t>(id);
 
             const StopMatchResult stop =
@@ -1202,7 +1241,7 @@ int main(int argc, char ** argv) {
     warm_params.max_tokens = 5;
     warm_params.temp = 0.0f;
     warm_params.seed = 0;
-    PreparedGeneration warm_prepared = prepare_generation(app, warm_params);
+    PreparedGeneration warm_prepared = prepare_generation(app, warm_params, {});
     run_generation(app, warm_seq, warm_params, warm_prepared, nullptr);
     if (auto warm_fork = app.scheduler->fork_sequence(warm_seq, LLAMA_TOKEN_NULL)) {
         app.scheduler->release_sequence(*warm_fork);
@@ -1295,7 +1334,9 @@ int main(int argc, char ** argv) {
         }
         const double dt = now_s() - t0;
 
-        const int64_t new_n = register_session(app, *destination, src->last_token);
+        const int64_t new_n = register_session(
+            app, *destination, src->last_token,
+            std::make_shared<std::string>(*src->reasoning_replay));
         const int dst_size = app.scheduler->invoke_preserving_logits([seq = *destination](llama_context * ctx) {
             return llama_memory_seq_pos_max(llama_get_memory(ctx), seq) + 1;
         });
@@ -1481,7 +1522,7 @@ int main(int argc, char ** argv) {
                     if (return_prompt) body["prompt"] = text;
                     // Text-ending rendered prompts are generation-ready. A
                     // media-ending prompt retains ADR 0004's explicit caveat.
-                    set_last_token(app, sid_num, inject_result.last_token);
+                    set_injected_boundary(app, sid_num, inject_result.last_token);
                     res.set_content(body.dump(), "application/json");
                     return;
                 }
@@ -1606,7 +1647,7 @@ int main(int argc, char ** argv) {
                 // any stale last token so a later fork doesn't re-decode it at the
                 // wrong (media) position. The chat protocol follows audio with a
                 // text turn-close, which sets a valid last token again.
-                set_last_token(app, sid_num, LLAMA_TOKEN_NULL);
+                set_injected_boundary(app, sid_num, LLAMA_TOKEN_NULL);
                 res.set_content(body.dump(), "application/json");
                 return;
             } else {
@@ -1666,7 +1707,9 @@ int main(int argc, char ** argv) {
         }
         const double dt = now_s() - t0;
         app.scheduler->complete_text_mutation(seq_id, mutation_parent, used, toks);
-        if (!toks.empty()) set_last_token(app, sid_num, toks.back());  // for fork logits refresh
+        if (!toks.empty()) {
+            set_injected_boundary(app, sid_num, toks.back());
+        }
         const int new_size = app.scheduler->invoke_preserving_logits([seq_id](llama_context * ctx) {
             return llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) + 1;
         });
@@ -1776,7 +1819,7 @@ int main(int argc, char ** argv) {
         std::shared_ptr<PreparedGeneration> prepared;
         try {
             prepared = std::make_shared<PreparedGeneration>(
-                prepare_generation(app, gp));
+                prepare_generation(app, gp, *session->reasoning_replay));
         } catch (const std::bad_alloc &) {
             res.status = 500;
             res.set_content(
@@ -1837,7 +1880,11 @@ int main(int argc, char ** argv) {
                 res.set_content(error_body(r.error, res.status).dump(), "application/json");
                 return;
             }
-            if (!r.cancelled && !r.ids.empty()) set_last_token(app, sid_num, (llama_token) r.ids.back());
+            if (!r.cancelled && !r.ids.empty()) {
+                commit_generation_boundary(
+                    app, sid_num, static_cast<llama_token>(r.ids.back()),
+                    r.reasoning_replay_delta);
+            }
             if (r.cancelled) {
                 std::cerr << "generation cancelled for " << sid << "; rewind=" << r.rewind_s * 1000.0 << " ms\n";
             }
@@ -1908,8 +1955,9 @@ int main(int argc, char ** argv) {
                         },
                         generation.get(), pre_generation_last);
                     if (!r.cancelled && !r.ids.empty()) {
-                        set_last_token(
-                            app, sid_num, static_cast<llama_token>(r.ids.back()));
+                        commit_generation_boundary(
+                            app, sid_num, static_cast<llama_token>(r.ids.back()),
+                            r.reasoning_replay_delta);
                     }
                     if (r.cancelled) {
                         std::cerr << "generation cancelled for " << sid
@@ -2130,6 +2178,7 @@ int main(int argc, char ** argv) {
             result.last_token = last;
             return result;
         });
+        state.reasoning_replay = live->reasoning_replay;
         app.scheduler->release_sequence(live->seq_id);
         {
             std::lock_guard<std::mutex> lk(app.mu);
@@ -2217,7 +2266,9 @@ int main(int argc, char ** argv) {
         {
             std::lock_guard<std::mutex> lk(app.mu);
             app.offloaded_sessions.erase(sid_num);
-            app.sessions[sid_num] = LiveSession{seq_id, state.last_token, false};
+            app.sessions[sid_num] = LiveSession{
+                seq_id, state.last_token, false, 0, false,
+                state.reasoning_replay};
         }
         const double elapsed_ms = (now_s() - t0) * 1000.0;
         res.set_content(json{{"session_id", sid}, {"location", "vram"},

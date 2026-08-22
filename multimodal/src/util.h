@@ -221,6 +221,10 @@ inline std::string sse_event(const nlohmann::ordered_json & j) {
     return os.str();
 }
 
+inline bool has_builtin_gemma4_reasoning(std::string_view architecture) {
+    return architecture == "gemma4";
+}
+
 struct ReasoningConfig {
     static constexpr int32_t unset_budget = -2;
 

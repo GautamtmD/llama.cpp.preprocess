@@ -173,6 +173,77 @@ def test_none_json_closes_reasoning_without_payload_and_continues_answer(base, m
     assert continuation.status_code == 200, continuation.text
 
 
+def test_none_survives_one_token_requests_fork_and_offload(base, make_session):
+    sid = make_session()
+    _inject_chat(base, sid, PERF_PROMPT)
+
+    first = requests.post(
+        f"{base}/sessions/{sid}/generate",
+        json={"reasoning_effort": "none", "max_tokens": 1, "temperature": 0.0},
+        timeout=60,
+    )
+    assert first.status_code == 200, first.text
+    prefix = first.json()["text"]
+    fork = _fork(base, sid)
+    offload = requests.post(f"{base}/sessions/{fork}/offload", timeout=120)
+    assert offload.status_code == 200, offload.text
+    load = requests.post(f"{base}/sessions/{fork}/load", timeout=120)
+    assert load.status_code == 200, load.text
+
+    outputs = []
+    continuation_ms = []
+    for target in (sid, fork):
+        raw = prefix
+        started = time.perf_counter()
+        for _ in range(15):
+            if _answer_text(raw):
+                break
+            chunk = requests.post(
+                f"{base}/sessions/{target}/generate",
+                json={
+                    "reasoning_effort": "none",
+                    "max_tokens": 1,
+                    "temperature": 0.0,
+                },
+                timeout=60,
+            )
+            assert chunk.status_code == 200, chunk.text
+            raw += chunk.json()["text"]
+        assert _thought_payload(raw) == ""
+        assert _answer_text(raw), raw
+        outputs.append(raw)
+        continuation_ms.append((time.perf_counter() - started) * 1000.0)
+
+    assert outputs[0] == outputs[1]
+    assert max(continuation_ms) < 2000.0
+    print(f"one-token none continuation_ms={continuation_ms}")
+
+
+def test_minimal_budget_counts_across_one_token_requests(base, make_session):
+    sid = make_session()
+    _inject_chat(base, sid, PERF_PROMPT)
+
+    raw = ""
+    for _ in range(96):
+        chunk = requests.post(
+            f"{base}/sessions/{sid}/generate",
+            json={
+                "reasoning_effort": "minimal",
+                "max_tokens": 1,
+                "temperature": 0.0,
+            },
+            timeout=60,
+        )
+        assert chunk.status_code == 200, chunk.text
+        raw += chunk.json()["text"]
+        if _answer_text(raw):
+            break
+
+    thought = _thought_payload(raw)
+    assert thought is not None and thought.strip()
+    assert _answer_text(raw), raw
+
+
 def test_none_sse_closes_reasoning_and_completes(base, make_session):
     sid = make_session()
     _inject_chat(base, sid, PERF_PROMPT)
@@ -184,6 +255,13 @@ def test_none_sse_closes_reasoning_and_completes(base, make_session):
 def test_none_cancellation_rewinds_and_session_continues(base, make_session):
     sid = make_session()
     _inject_chat(base, sid, PERF_PROMPT)
+    prefix_response = requests.post(
+        f"{base}/sessions/{sid}/generate",
+        json={"reasoning_effort": "none", "max_tokens": 1, "temperature": 0.0},
+        timeout=60,
+    )
+    assert prefix_response.status_code == 200, prefix_response.text
+    prefix = prefix_response.json()["text"]
     checkpoint = requests.get(f"{base}/sessions/{sid}", timeout=30).json()
     fourth_token = threading.Event()
     finished = threading.Event()
@@ -238,8 +316,9 @@ def test_none_cancellation_rewinds_and_session_continues(base, make_session):
         timeout=120,
     )
     assert retry.status_code == 200, retry.text
-    assert _thought_payload(retry.json()["text"]) == ""
-    assert _answer_text(retry.json()["text"])
+    accumulated = prefix + retry.json()["text"]
+    assert _thought_payload(accumulated) == ""
+    assert _answer_text(accumulated)
 
 
 def test_none_composes_with_nonlazy_grammar(base, make_session):

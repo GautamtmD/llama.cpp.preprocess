@@ -154,6 +154,18 @@ static void test_gpu_execution_policy() {
     CHECK(bench_error.find("--allow-cpu") != std::string::npos);
 }
 
+static void test_builtin_reasoning_architecture_detection() {
+    CHECK(has_builtin_gemma4_reasoning("gemma4"));
+    CHECK(!has_builtin_gemma4_reasoning(""));
+    CHECK(!has_builtin_gemma4_reasoning("gemma"));
+    CHECK(!has_builtin_gemma4_reasoning("gemma2"));
+    CHECK(!has_builtin_gemma4_reasoning("gemma3"));
+    CHECK(!has_builtin_gemma4_reasoning("gemma3n"));
+    CHECK(!has_builtin_gemma4_reasoning("gemma4-assistant"));
+    CHECK(!has_builtin_gemma4_reasoning("Gemma4"));
+    CHECK(!has_builtin_gemma4_reasoning("custom-gemma4"));
+}
+
 static void test_model_config() {
     // Default constructor
     ModelConfig c1;
@@ -410,6 +422,7 @@ int main() {
     test_error_body();
     test_sse_event();
     test_gpu_execution_policy();
+    test_builtin_reasoning_architecture_detection();
     test_server_argument_validation();
     test_model_config();
     test_generation_constraint_validation();
