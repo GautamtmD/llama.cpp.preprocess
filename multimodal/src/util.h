@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <limits>
 #include <sstream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -220,12 +221,44 @@ inline std::string sse_event(const nlohmann::ordered_json & j) {
     return os.str();
 }
 
+struct ReasoningConfig {
+    static constexpr int32_t unset_budget = -2;
+
+    std::string start_marker;
+    std::string end_marker;
+    int32_t none_budget = unset_budget;
+    int32_t minimal_budget = unset_budget;
+    int32_t low_budget = unset_budget;
+    int32_t medium_budget = unset_budget;
+    int32_t high_budget = unset_budget;
+
+    bool complete() const {
+        const bool ordered_finite =
+            none_budget == 0 && minimal_budget >= 0 &&
+            minimal_budget < low_budget && low_budget < medium_budget;
+        const bool valid_high =
+            high_budget == -1 || high_budget > medium_budget;
+        return !start_marker.empty() && !end_marker.empty() &&
+               ordered_finite && valid_high;
+    }
+
+    std::optional<int32_t> budget_for(std::string_view effort) const {
+        if (effort == "none") return none_budget;
+        if (effort == "minimal") return minimal_budget;
+        if (effort == "low") return low_budget;
+        if (effort == "medium") return medium_budget;
+        if (effort == "high") return high_budget;
+        return std::nullopt;
+    }
+};
+
 struct ModelConfig {
     int32_t audio_frame_size = 640;
     float temperature = 0.8f;
     float top_p = 0.95f;
     int32_t top_k = 40;
     float min_p = 0.05f;
+    ReasoningConfig reasoning;
     // Declared modalities (text/image/audio in; text out). When empty, the
     // server infers them at runtime from the loaded projector (backward compat).
     // When authored (model_config.json `modalities` block), they are the source
@@ -233,6 +266,16 @@ struct ModelConfig {
     // capability (e.g. skip audio tests on a vision+text model).
     std::vector<std::string> input_modalities;
     std::vector<std::string> output_modalities;
+
+    void enable_gemma4_reasoning() {
+        reasoning.start_marker = "<|channel>thought";
+        reasoning.end_marker = "<channel|>";
+        reasoning.none_budget = 0;
+        reasoning.minimal_budget = 64;
+        reasoning.low_budget = 256;
+        reasoning.medium_budget = 1024;
+        reasoning.high_budget = -1;
+    }
 
     static ModelConfig from_json(const nlohmann::ordered_json & j) {
         ModelConfig cfg;
@@ -252,6 +295,33 @@ struct ModelConfig {
         if (j.contains("top_p"))       cfg.top_p       = j["top_p"].get<float>();
         if (j.contains("top_k"))       cfg.top_k       = j["top_k"].get<int32_t>();
         if (j.contains("min_p"))       cfg.min_p       = j["min_p"].get<float>();
+        if (j.contains("reasoning") && j["reasoning"].is_object()) {
+            const auto & r = j["reasoning"];
+            if (r.contains("start_marker")) {
+                cfg.reasoning.start_marker = r["start_marker"].get<std::string>();
+            }
+            if (r.contains("end_marker")) {
+                cfg.reasoning.end_marker = r["end_marker"].get<std::string>();
+            }
+            if (r.contains("effort_budgets") && r["effort_budgets"].is_object()) {
+                const auto & budgets = r["effort_budgets"];
+                if (budgets.contains("none")) {
+                    cfg.reasoning.none_budget = budgets["none"].get<int32_t>();
+                }
+                if (budgets.contains("minimal")) {
+                    cfg.reasoning.minimal_budget = budgets["minimal"].get<int32_t>();
+                }
+                if (budgets.contains("low")) {
+                    cfg.reasoning.low_budget = budgets["low"].get<int32_t>();
+                }
+                if (budgets.contains("medium")) {
+                    cfg.reasoning.medium_budget = budgets["medium"].get<int32_t>();
+                }
+                if (budgets.contains("high")) {
+                    cfg.reasoning.high_budget = budgets["high"].get<int32_t>();
+                }
+            }
+        }
         if (j.contains("modalities")) {
             const auto & m = j["modalities"];
             if (m.is_object()) {
@@ -268,3 +338,40 @@ struct ModelConfig {
         return cfg;
     }
 };
+
+struct ReasoningEffortResolution {
+    bool supplied = false;
+    int32_t budget_tokens = -1;
+    std::string error;
+};
+
+inline ReasoningEffortResolution resolve_reasoning_effort(
+    const nlohmann::ordered_json & request,
+    const ModelConfig & config) {
+    const auto value = request.find("reasoning_effort");
+    if (value == request.end()) return {};
+
+    ReasoningEffortResolution result;
+    result.supplied = true;
+    if (!value->is_string()) {
+        result.error = "reasoning_effort must be a string";
+        return result;
+    }
+
+    const std::string & effort = value->get_ref<const std::string &>();
+    const auto budget = config.reasoning.budget_for(effort);
+    if (!budget.has_value()) {
+        result.error =
+            "unsupported reasoning_effort '" + effort +
+            "' (expected none, minimal, low, medium, or high)";
+        return result;
+    }
+    if (!config.reasoning.complete()) {
+        result.error =
+            "loaded model does not support controllable reasoning; configure "
+            "reasoning start_marker, end_marker, and all effort_budgets";
+        return result;
+    }
+    result.budget_tokens = *budget;
+    return result;
+}

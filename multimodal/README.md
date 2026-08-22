@@ -67,6 +67,33 @@ The startup guard also catches an ABI-incompatible `ggml-cuda.dll` that fails to
 register a GPU device. Use a backend built for the pinned ggml ABI; if the fork
 drifts, rebuild ggml-cuda from source with a CUDA-supported host compiler.
 
+## Model reasoning configuration
+
+`reasoning_effort` is available only when the loaded model has a complete
+reasoning configuration. Gemma 4 metadata auto-detection installs the shipped
+mapping. An explicit model JSON config can declare another model's equivalent:
+
+```json
+{
+  "reasoning": {
+    "start_marker": "<think>",
+    "end_marker": "</think>",
+    "effort_budgets": {
+      "none": 0,
+      "minimal": 64,
+      "low": 256,
+      "medium": 1024,
+      "high": -1
+    }
+  }
+}
+```
+
+`none` must be `0`; finite budgets must increase strictly; `high` is either
+larger than `medium` or `-1` for unrestricted reasoning. Missing markers,
+budgets, or invalid ordering make the capability unavailable, so every explicit
+effort request fails with HTTP 400 rather than becoming a no-op.
+
 ## Run
 
 ```bash

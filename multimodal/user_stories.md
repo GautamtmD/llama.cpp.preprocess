@@ -189,7 +189,8 @@ hand-rolled `make_sampler`.
 
 Input / trigger:
 - `/generate` with sampling params (`temperature`, `top_k`, `min_p`, …),
-  `response_format` XOR `grammar`, and/or `tools` + `tool_choice`.
+  optional OpenAI-compatible `reasoning_effort`, `response_format` XOR
+  `grammar`, and/or `tools` + `tool_choice`.
 
 Expected:
 - Full `common_params_sampling` applied (no hand-rolled sampler).
@@ -209,12 +210,26 @@ Expected:
   registration: JSON HTTP 400 for both streaming and non-streaming requests, no
   SSE headers, and the unchanged session remains reusable. Once a stream starts,
   runtime failures produce exactly one terminal `error` event.
+- `reasoning_effort` is strictly one of `none`, `minimal`, `low`, `medium`, or
+  `high`. Gemma 4 maps these to reasoning budgets `0`, `64`, `256`, `1024`, and
+  unrestricted (`-1`). Omission retains the prior unrestricted/default path.
+  `none` uses `common/`'s reasoning-budget sampler to force `<channel|>`
+  immediately after `<|channel>thought`, admits no sampled thought payload, and
+  then continues normal answer generation. Unsupported values/models fail with
+  JSON HTTP 400 before generation/SSE and leave the session reusable.
 
-Latency / performance budget (retained acceptance targets; functional path implemented):
+Latency / performance budget:
 - Grammar-sampler overhead per decode step: **≤ ~10% of decode time** (the
   constraint must not dominate; measure on Gemma 4 12B).
 - Final tool-call parse: **< 5 ms**.
 - TTFT with grammar/tools must NOT regress US-5's target (< 300 ms; ~900 ms today).
+- Reasoning-effort request resolution averages **< 5 µs** over 100,000
+  model-free iterations.
+- Across five paired warmed Gemma 4 12B fork trials, `none` must reach the first
+  answer-channel text token **≥ 2x faster by median wall clock** than omission
+  and admit zero thought payload tokens. Measured on RTX 5070 Ti:
+  6755.866 ms omitted vs 146.577 ms `none` median (**46.091x**); the answer began
+  at token event 4 in every `none` trial.
 
 Test:
 - `tests/test_common_sampler.py` (JSON object/schema constraints, raw GBNF,
@@ -223,8 +238,12 @@ Test:
   assertions, stop/ignore-EOS behavior, and greedy fork parity)
 - `tests/test_streaming.py` (SSE stop buffering, terminal counts/cache boundary,
   and deterministic continuation)
-- `tests/test_util.cpp` (model-config defaults, parsing, model-free generation
+- `tests/test_util.cpp` (model-config defaults/parsing, complete ordered reasoning
+  effort mapping plus request-resolution latency, model-free generation
   validation, and incremental stop matching/order/empty-input defenses)
+- `tests/test_reasoning_effort.py` (strict JSON/SSE validation and post-error
+  reuse, JSON/SSE budget-zero marker behavior, cancellation/continuation,
+  constrained generation, and the opt-in five-pair real-Gemma latency gate)
 
 The functional suite is implemented. The numeric grammar-overhead/final-parse
 budgets above still require a dedicated benchmark before they can become

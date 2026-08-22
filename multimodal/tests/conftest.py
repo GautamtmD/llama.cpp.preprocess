@@ -170,7 +170,8 @@ def _ensure_server():
         except Exception:
             out = ""
         pytest.exit(
-            f"self-booted server did not become healthy at {url}\n{out[-4000:]}", returncode=5
+            f"self-booted server did not become healthy at {url}\n{out[-4000:]}",
+            returncode=5,
         )
     BASE = url
 
@@ -294,6 +295,10 @@ def pytest_configure(config):
         "markers",
         "requires(modality): skip unless the running model supports this input "
         "modality (text | image | audio), per GET /info input_modalities",
+    )
+    config.addinivalue_line(
+        "markers",
+        "reasoning_perf: opt-in paired real-Gemma reasoning latency gate",
     )
 
 

@@ -7,6 +7,7 @@
 
 #include "util.h"
 #include "server_cli.h"
+#include <chrono>
 
 #include <iostream>
 #include <string>
@@ -189,6 +190,87 @@ static void test_model_config() {
     CHECK(std::abs(c4.min_p - 0.01f) < 1e-5f);
 }
 
+static void test_reasoning_effort_resolution_and_latency() {
+    using json = nlohmann::ordered_json;
+
+    ModelConfig gemma;
+    gemma.enable_gemma4_reasoning();
+    CHECK(gemma.reasoning.complete());
+    CHECK_EQ(gemma.reasoning.start_marker, std::string("<|channel>thought"));
+    CHECK_EQ(gemma.reasoning.end_marker, std::string("<channel|>"));
+
+    const struct {
+        const char * effort;
+        int32_t budget;
+    } expected[] = {
+        {"none", 0},
+        {"minimal", 64},
+        {"low", 256},
+        {"medium", 1024},
+        {"high", -1},
+    };
+    for (const auto & item : expected) {
+        const auto resolved = resolve_reasoning_effort(
+            json{{"reasoning_effort", item.effort}}, gemma);
+        CHECK(resolved.supplied);
+        CHECK(resolved.error.empty());
+        CHECK_EQ(resolved.budget_tokens, item.budget);
+    }
+
+    const auto omitted = resolve_reasoning_effort(json::object(), gemma);
+    CHECK(!omitted.supplied);
+    CHECK(omitted.error.empty());
+
+    const auto non_string =
+        resolve_reasoning_effort(json{{"reasoning_effort", 1}}, gemma);
+    CHECK(non_string.error.find("must be a string") != std::string::npos);
+    const auto unknown =
+        resolve_reasoning_effort(json{{"reasoning_effort", "extreme"}}, gemma);
+    CHECK(unknown.error.find("unsupported reasoning_effort") != std::string::npos);
+
+    ModelConfig unsupported;
+    const auto unsupported_result =
+        resolve_reasoning_effort(json{{"reasoning_effort", "none"}}, unsupported);
+    CHECK(unsupported_result.error.find("does not support controllable reasoning") !=
+          std::string::npos);
+
+    const auto parsed = ModelConfig::from_json(json{
+        {"reasoning", {
+            {"start_marker", "<think>"},
+            {"end_marker", "</think>"},
+            {"effort_budgets", {
+                {"none", 0},
+                {"minimal", 8},
+                {"low", 16},
+                {"medium", 32},
+                {"high", 64},
+            }},
+        }},
+    });
+    CHECK(parsed.reasoning.complete());
+    CHECK_EQ(resolve_reasoning_effort(
+                 json{{"reasoning_effort", "high"}}, parsed).budget_tokens,
+             64);
+
+    ModelConfig incomplete = parsed;
+    incomplete.reasoning.end_marker.clear();
+    CHECK(!incomplete.reasoning.complete());
+    CHECK(!resolve_reasoning_effort(
+               json{{"reasoning_effort", "low"}}, incomplete).error.empty());
+
+    constexpr int iterations = 100000;
+    const json request{{"reasoning_effort", "none"}};
+    const auto started = std::chrono::steady_clock::now();
+    int64_t budget_sum = 0;
+    for (int i = 0; i < iterations; ++i) {
+        budget_sum += resolve_reasoning_effort(request, gemma).budget_tokens;
+    }
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
+    CHECK_EQ(budget_sum, 0);
+    CHECK(elapsed_ms < 500.0);
+}
+
 static void test_generation_constraint_validation() {
     using json = nlohmann::ordered_json;
 
@@ -331,6 +413,7 @@ int main() {
     test_server_argument_validation();
     test_model_config();
     test_generation_constraint_validation();
+    test_reasoning_effort_resolution_and_latency();
     test_stop_sequence_matcher();
 
     if (g_failures) {

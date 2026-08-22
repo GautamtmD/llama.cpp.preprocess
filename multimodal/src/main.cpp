@@ -137,6 +137,11 @@ static ModelConfig load_config_for_model(const std::string & model_path, const s
             cfg.audio_frame_size = 640; // Default Gemma 4 12B audio frame size
             std::cerr << "  defaulting to Gemma 4 12B model. Setting audio_frame_size = 640.\n";
         }
+        if (desc_str.find("Gemma") != std::string::npos ||
+            desc_str.find("gemma") != std::string::npos) {
+            cfg.enable_gemma4_reasoning();
+            std::cerr << "  detected Gemma 4 reasoning markers and effort budgets.\n";
+        }
     }
 
     // Guard audio_frame_size against invalid non-positive values
@@ -192,6 +197,8 @@ struct AppState {
     std::map<std::string, std::string>   chat_template_kwargs;
     std::string                          system_prompt;
     ModelConfig                          model_cfg;
+    std::vector<llama_token> reasoning_start_tokens;
+    std::vector<llama_token> reasoning_end_tokens;
     int max_sequences = 8;
     size_t pool_footprint_bytes = 0;
     size_t model_gpu_bytes = 0;
@@ -250,6 +257,7 @@ struct GenParams {
     int   top_k      = 40;
     float min_p      = 0.05f;
     int   seed       = -1;
+    std::optional<int32_t> reasoning_budget_tokens;
     bool  ignore_eos = false;
     std::vector<std::string> stop;
     json response_format;          // {type: json_object|json_schema|text, ...}
@@ -336,6 +344,12 @@ common_params_sampling build_sampling_params(const AppState & app, const GenPara
     sparams.ignore_eos = p.ignore_eos;
     sparams.no_perf    = true;
     if (p.sampling.is_object()) apply_sampling_overrides(sparams, p.sampling);
+    if (p.reasoning_budget_tokens.has_value()) {
+        sparams.reasoning_budget_tokens = *p.reasoning_budget_tokens;
+        sparams.reasoning_budget_start = app.reasoning_start_tokens;
+        sparams.reasoning_budget_end = app.reasoning_end_tokens;
+        sparams.reasoning_budget_forced = app.reasoning_end_tokens;
+    }
 
     // Pre-compute the EOG logit-bias table once (-INFINITY on every EOG token),
     // mirroring common/common.cpp. When ignore_eos is set, fold it into the
@@ -616,7 +630,8 @@ PreparedGeneration prepare_generation(AppState & app, const GenParams & p) {
         throw std::runtime_error("failed to initialize sampler");
     }
     const bool canonical_greedy =
-        p.temp <= 0.0f && p.grammar.empty() && p.response_format.is_null() &&
+        p.temp <= 0.0f && !p.reasoning_budget_tokens.has_value() &&
+        p.grammar.empty() && p.response_format.is_null() &&
         (!p.tools.is_array() || p.tools.empty()) &&
         (!p.sampling.is_object() || p.sampling.empty());
     prepared.canonical_greedy_policy =
@@ -1066,6 +1081,25 @@ int main(int argc, char ** argv) {
               << (cfg.allow_cpu ? " (--allow-cpu enabled)" : "") << ".\n";
     app.model_cfg = load_config_for_model(cfg.model_path, cfg.config_path, app.model);
     app.vocab = llama_model_get_vocab(app.model);
+    if (app.model_cfg.reasoning.complete()) {
+        app.reasoning_start_tokens = common_tokenize(
+            app.vocab, app.model_cfg.reasoning.start_marker, false, true);
+        app.reasoning_end_tokens = common_tokenize(
+            app.vocab, app.model_cfg.reasoning.end_marker, false, true);
+        if (app.reasoning_start_tokens.empty() ||
+            app.reasoning_end_tokens.empty()) {
+            std::cerr << "warning: configured reasoning markers did not tokenize; "
+                         "reasoning_effort will be unavailable.\n";
+            app.model_cfg.reasoning = ReasoningConfig{};
+            app.reasoning_start_tokens.clear();
+            app.reasoning_end_tokens.clear();
+        } else {
+            std::cerr << "reasoning control configured: start_tokens="
+                      << app.reasoning_start_tokens.size()
+                      << ", end_tokens=" << app.reasoning_end_tokens.size()
+                      << ".\n";
+        }
+    }
     app.chat_templates = common_chat_templates_init(app.model, /* override */ cfg.chat_template);
     app.use_jinja            = cfg.use_jinja;
     app.enable_chat_template = cfg.enable_chat_template;
@@ -1712,6 +1746,14 @@ int main(int argc, char ** argv) {
             if (j.contains("tools"))           gp.tools           = j["tools"];
             if (j.contains("tool_choice"))     gp.tool_choice     = j["tool_choice"].get<std::string>();
             if (j.contains("sampling"))        gp.sampling        = j["sampling"];
+            const ReasoningEffortResolution reasoning =
+                resolve_reasoning_effort(j, app.model_cfg);
+            if (!reasoning.error.empty()) {
+                throw std::invalid_argument(reasoning.error);
+            }
+            if (reasoning.supplied) {
+                gp.reasoning_budget_tokens = reasoning.budget_tokens;
+            }
         } catch (const std::exception & e) {
             res.status = 400;
             res.set_content(error_body(std::string("bad request: ") + e.what(), 400).dump(), "application/json");
