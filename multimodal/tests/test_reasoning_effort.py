@@ -224,6 +224,7 @@ def test_minimal_budget_counts_across_one_token_requests(base, make_session):
     _inject_chat(base, sid, PERF_PROMPT)
 
     raw = ""
+    token_pieces = []
     for _ in range(96):
         chunk = requests.post(
             f"{base}/sessions/{sid}/generate",
@@ -235,13 +236,26 @@ def test_minimal_budget_counts_across_one_token_requests(base, make_session):
             timeout=60,
         )
         assert chunk.status_code == 200, chunk.text
-        raw += chunk.json()["text"]
+        piece = chunk.json()["text"]
+        token_pieces.append(piece)
+        raw += piece
         if _answer_text(raw):
             break
 
     thought = _thought_payload(raw)
     assert thought is not None and thought.strip()
     assert _answer_text(raw), raw
+    thought_start = raw.index(START_MARKER) + len(START_MARKER)
+    thought_end = raw.index(END_MARKER, thought_start)
+    offset = 0
+    thought_payload_events = 0
+    for piece in token_pieces:
+        next_offset = offset + len(piece)
+        if max(offset, thought_start) < min(next_offset, thought_end):
+            thought_payload_events += 1
+        offset = next_offset
+    assert 0 < thought_payload_events <= 64
+    print(f"minimal one-token thought_payload_events={thought_payload_events}")
 
 
 def test_none_sse_closes_reasoning_and_completes(base, make_session):
