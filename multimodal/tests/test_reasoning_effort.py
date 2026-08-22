@@ -151,6 +151,92 @@ def test_invalid_reasoning_effort_is_json_400_and_session_reusable(
     assert retry.status_code == 200, retry.text
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("initial_effort", [None, "high"], ids=["omitted", "high"])
+def test_mid_turn_effective_effort_change_is_json_400(base, make_session, stream, initial_effort):
+    sid = make_session()
+    _inject_chat(base, sid, PERF_PROMPT)
+    initial_body = {"max_tokens": 8, "temperature": 0.0}
+    if initial_effort is not None:
+        initial_body["reasoning_effort"] = initial_effort
+    initial = requests.post(
+        f"{base}/sessions/{sid}/generate",
+        json=initial_body,
+        timeout=120,
+    )
+    assert initial.status_code == 200, initial.text
+    assert START_MARKER in initial.json()["text"]
+    assert END_MARKER not in initial.json()["text"]
+    checkpoint = requests.get(f"{base}/sessions/{sid}", timeout=30).json()
+
+    changed = requests.post(
+        f"{base}/sessions/{sid}/generate",
+        json={
+            "reasoning_effort": "none",
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "stream": stream,
+        },
+        stream=stream,
+        timeout=60,
+    )
+    assert changed.status_code == 400
+    assert changed.headers["Content-Type"].startswith("application/json")
+    error = changed.json()
+    assert error["code"] == 400
+    assert "locked" in error["error"]
+    assert "inject" in error["error"]
+    after = requests.get(f"{base}/sessions/{sid}", timeout=30).json()
+    assert after["cache_size"] == checkpoint["cache_size"]
+    assert after["boundary_token"] == checkpoint["boundary_token"]
+
+    equivalent_body = {"max_tokens": 1, "temperature": 0.0}
+    if initial_effort is None:
+        equivalent_body["reasoning_effort"] = "high"
+    equivalent = requests.post(
+        f"{base}/sessions/{sid}/generate",
+        json=equivalent_body,
+        timeout=60,
+    )
+    assert equivalent.status_code == 200, equivalent.text
+
+
+def test_effective_effort_lock_survives_fork_and_offload_then_inject_resets(base, make_session):
+    sid = make_session()
+    _inject_chat(base, sid, PERF_PROMPT)
+    initial = requests.post(
+        f"{base}/sessions/{sid}/generate",
+        json={"max_tokens": 8, "temperature": 0.0},
+        timeout=120,
+    )
+    assert initial.status_code == 200, initial.text
+    fork = _fork(base, sid)
+    assert requests.post(f"{base}/sessions/{fork}/offload", timeout=120).status_code == 200
+    assert requests.post(f"{base}/sessions/{fork}/load", timeout=120).status_code == 200
+
+    for target in (sid, fork):
+        changed = requests.post(
+            f"{base}/sessions/{target}/generate",
+            json={"reasoning_effort": "none", "max_tokens": 1},
+            timeout=60,
+        )
+        assert changed.status_code == 400, changed.text
+        assert "locked" in changed.json()["error"]
+
+    injected = requests.post(
+        f"{base}/sessions/{fork}/inject",
+        json={"text": "\n<channel|>answer\n<turn|>\n"},
+        timeout=60,
+    )
+    assert injected.status_code == 200, injected.text
+    reset = requests.post(
+        f"{base}/sessions/{fork}/generate",
+        json={"reasoning_effort": "none", "max_tokens": 0},
+        timeout=60,
+    )
+    assert reset.status_code == 200, reset.text
+
+
 def test_none_json_closes_reasoning_without_payload_and_continues_answer(base, make_session):
     sid = make_session()
     _inject_chat(base, sid, PERF_PROMPT)

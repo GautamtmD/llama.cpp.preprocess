@@ -175,6 +175,7 @@ struct OffloadedState {
     size_t               state_bytes = 0;             // == state.size(); symmetric offload/load
     bool                 loading = false;             // RAM -> loading -> VRAM reservation
     std::shared_ptr<std::string> reasoning_replay = std::make_shared<std::string>();
+    std::optional<int32_t> reasoning_budget_lock;
 };
 
 struct LiveSession {
@@ -184,6 +185,7 @@ struct LiveSession {
     uint32_t readers = 0;
     bool releasing = false;
     std::shared_ptr<std::string> reasoning_replay = std::make_shared<std::string>();
+    std::optional<int32_t> reasoning_budget_lock;
 };
 
 // One model and one explicitly sized pooled context. External sessions map to
@@ -383,10 +385,12 @@ common_params_sampling build_sampling_params(const AppState & app, const GenPara
 int64_t register_session(
     AppState & app, llama_seq_id seq_id,
     llama_token last_token = LLAMA_TOKEN_NULL,
-    std::shared_ptr<std::string> reasoning_replay = {}) {
+    std::shared_ptr<std::string> reasoning_replay = {},
+    std::optional<int32_t> reasoning_budget_lock = std::nullopt) {
     const int64_t n = app.next_id.fetch_add(1);
     LiveSession session{seq_id, last_token, false};
     if (reasoning_replay) session.reasoning_replay = std::move(reasoning_replay);
+    session.reasoning_budget_lock = reasoning_budget_lock;
     std::lock_guard<std::mutex> lk(app.mu);
     app.sessions[n] = std::move(session);
     return n;
@@ -398,17 +402,22 @@ void set_injected_boundary(AppState & app, int64_t n, llama_token token) {
     if (it == app.sessions.end()) return;
     it->second.last_token = token;
     it->second.reasoning_replay->clear();
+    it->second.reasoning_budget_lock.reset();
 }
 
 void commit_generation_boundary(
     AppState & app, int64_t n, llama_token token,
-    const std::string & reasoning_replay_delta) {
+    const std::string & reasoning_replay_delta,
+    int32_t effective_reasoning_budget) {
     std::lock_guard<std::mutex> lk(app.mu);
     auto it = app.sessions.find(n);
     if (it == app.sessions.end()) return;
     it->second.last_token = token;
     if (app.model_cfg.reasoning.complete()) {
         it->second.reasoning_replay->append(reasoning_replay_delta);
+        if (!it->second.reasoning_budget_lock.has_value()) {
+            it->second.reasoning_budget_lock = effective_reasoning_budget;
+        }
     }
 }
 
@@ -1336,7 +1345,8 @@ int main(int argc, char ** argv) {
 
         const int64_t new_n = register_session(
             app, *destination, src->last_token,
-            std::make_shared<std::string>(*src->reasoning_replay));
+            std::make_shared<std::string>(*src->reasoning_replay),
+            src->reasoning_budget_lock);
         const int dst_size = app.scheduler->invoke_preserving_logits([seq = *destination](llama_context * ctx) {
             return llama_memory_seq_pos_max(llama_get_memory(ctx), seq) + 1;
         });
@@ -1813,6 +1823,20 @@ int main(int argc, char ** argv) {
                 error_body(validation_error, 400).dump(), "application/json");
             return;
         }
+        const int32_t effective_reasoning_budget =
+            gp.reasoning_budget_tokens.value_or(-1);
+        if (app.model_cfg.reasoning.complete() &&
+            session->reasoning_budget_lock.has_value() &&
+            *session->reasoning_budget_lock != effective_reasoning_budget) {
+            res.status = 400;
+            res.set_content(
+                error_body(
+                    "reasoning_effort is locked for the active generated turn; "
+                    "inject before changing it",
+                    400).dump(),
+                "application/json");
+            return;
+        }
 
         // Derive and parse every client-selected constraint, then construct the
         // RAII-owned sampler before registering generation state or SSE headers.
@@ -1883,7 +1907,7 @@ int main(int argc, char ** argv) {
             if (!r.cancelled && !r.ids.empty()) {
                 commit_generation_boundary(
                     app, sid_num, static_cast<llama_token>(r.ids.back()),
-                    r.reasoning_replay_delta);
+                    r.reasoning_replay_delta, effective_reasoning_budget);
             }
             if (r.cancelled) {
                 std::cerr << "generation cancelled for " << sid << "; rewind=" << r.rewind_s * 1000.0 << " ms\n";
@@ -1957,7 +1981,8 @@ int main(int argc, char ** argv) {
                     if (!r.cancelled && !r.ids.empty()) {
                         commit_generation_boundary(
                             app, sid_num, static_cast<llama_token>(r.ids.back()),
-                            r.reasoning_replay_delta);
+                            r.reasoning_replay_delta,
+                            gp.reasoning_budget_tokens.value_or(-1));
                     }
                     if (r.cancelled) {
                         std::cerr << "generation cancelled for " << sid
@@ -2179,6 +2204,7 @@ int main(int argc, char ** argv) {
             return result;
         });
         state.reasoning_replay = live->reasoning_replay;
+        state.reasoning_budget_lock = live->reasoning_budget_lock;
         app.scheduler->release_sequence(live->seq_id);
         {
             std::lock_guard<std::mutex> lk(app.mu);
@@ -2268,7 +2294,7 @@ int main(int argc, char ** argv) {
             app.offloaded_sessions.erase(sid_num);
             app.sessions[sid_num] = LiveSession{
                 seq_id, state.last_token, false, 0, false,
-                state.reasoning_replay};
+                state.reasoning_replay, state.reasoning_budget_lock};
         }
         const double elapsed_ms = (now_s() - t0) * 1000.0;
         res.set_content(json{{"session_id", sid}, {"location", "vram"},

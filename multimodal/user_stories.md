@@ -216,10 +216,13 @@ Expected:
   `none` uses `common/`'s reasoning-budget sampler to force `<channel|>`
   immediately after `<|channel>thought`, admits no sampled thought payload, and
   then continues normal answer generation across arbitrarily short `/generate`
-  requests. Partial-marker and finite-budget state survives fork and offload/load
-  but never advances on cancelled/rewound tokens. Automatic configuration
-  requires exact `general.architecture: gemma4`; unsupported values/models fail
-  with JSON HTTP 400 before generation/SSE and leave the session reusable.
+  requests. The effective budget locks when the first output token commits;
+  omission and `high` are equivalent unrestricted budgets, while any other
+  mid-turn change fails with JSON HTTP 400 before generation/SSE. Partial-marker,
+  finite-budget, and effort-lock state survives fork and offload/load but never
+  advances on cancelled/rewound tokens; successful inject starts a new turn.
+  Automatic configuration requires exact `general.architecture: gemma4`;
+  unsupported values/models fail with JSON HTTP 400 and leave the session reusable.
 
 Latency / performance budget:
 - Grammar-sampler overhead per decode step: **≤ ~10% of decode time** (the

@@ -101,6 +101,10 @@ when chunked `/generate` calls rebuild the sampler. It is cleared by successful
 inject, copied by fork, retained through offload/load, and unchanged by
 cancellation rewind.
 
+The effective budget locks when a turn first commits generated output. Omission
+and `high` are equivalent unrestricted budgets; any other mid-turn budget change
+returns HTTP 400. Successful inject clears the lock for the next turn.
+
 ## Run
 
 ```bash
