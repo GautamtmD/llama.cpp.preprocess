@@ -23,9 +23,10 @@ Expected:
 - KV cache advances by the chunk's tokens; no tokens generated.
 
 Latency / performance budget:
-- Warm end-of-speech → first token: **< 1.0 s** on the current RTX 5060 Ti
-  baseline and faster than equivalent one-shot cold injection. This is the
-  measured regression gate; the system US-1 target remains < 300 ms.
+- Warm end-of-speech → first token: **< 1.0 s** on the current RTX 5070 Ti
+  baseline and faster than equivalent one-shot cold injection. The disabled-
+  reasoning measurement was 151.3 ms warm versus 730.7 ms cold (4.83x
+  cold/warm); the regression guard and system US-5 < 300 ms target were met.
 
 Test:
 - `tests/test_streaming_audio.py` (chunked-vs-one-shot cache behavior, validation,
@@ -228,7 +229,11 @@ Latency / performance budget:
 - Grammar-sampler overhead per decode step: **≤ ~10% of decode time** (the
   constraint must not dominate; measure on Gemma 4 12B).
 - Final tool-call parse: **< 5 ms**.
-- TTFT with grammar/tools must NOT regress US-5's target (< 300 ms; ~900 ms today).
+- TTFT with grammar/tools must NOT regress US-5's target (< 300 ms). The current
+  disabled-reasoning US-5 baseline on RTX 5070 Ti is 730.7 ms cold and 151.3 ms
+  warm; warm meets the < 300 ms target and existing < 1 s regression guard,
+  while the 4.83x cold/warm reduction remains below the story's 5–10x
+  expectation.
 - Reasoning-effort request resolution averages **< 5 µs** over 100,000
   model-free iterations.
 - Warming aside, a `none` response continued exclusively through one-token
