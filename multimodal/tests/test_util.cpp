@@ -547,8 +547,8 @@ static void test_readout_compute() {
             std::min(best_no_top_ms, std::chrono::duration<double, std::milli>(t1 - t0).count());
     }
     // Gate recipe shape (ADR 0010 GO-B readout overhead <= 1 ms): 4 candidates,
-    // top_k 8. Best-of-5 host compute must fit the gate itself (measured ~0.75 ms
-    // here; the server adds the logit-row fetch, see test_readout.py).
+    // top_k 8. Best-of-5 host compute must stay well under the gate itself
+    // (<= 0.5 ms, measured ~0.28 ms; the server adds the logit-row fetch, see test_readout.py).
     const std::vector<int32_t> gate_cands = {10, 20, 30, 40};
     double best_gate_ms = 1e9;
     for (int rep = 0; rep < 5; ++rep) {
@@ -581,11 +581,69 @@ static void test_readout_compute() {
     const ReadoutResult pk = compute_readout(peaked.data(), n_vocab, {1234, 5}, 2);
     CHECK(std::fabs(pk.log_normalizer - (28.0 + std::log(pk_sum))) < 1e-5);
     CHECK_EQ(pk.top[0].token, 1234);
+    // Fast-exp accuracy against a double reference on three row shapes.
+    // Deterministic LCG so the rows are identical on every run/platform.
+    auto ref_log_normalizer = [](const std::vector<float> & r) {
+        double ref_max = -1e300;
+        for (float v : r) ref_max = std::max(ref_max, double(v));
+        double ref_sum = 0.0;
+        for (float v : r) ref_sum += std::exp(double(v) - ref_max);
+        return ref_max + std::log(ref_sum);
+    };
+    uint32_t lcg = 12345u;
+    auto next_u01 = [&lcg]() {
+        lcg = lcg * 1664525u + 1013904223u;
+        return float((lcg >> 8) & 0xFFFFFFu) * (1.0f / 16777216.0f);
+    };
+    double fast_err_max = 0.0;
+    {
+        // (a) uniform-random row in [-20, 20]
+        std::vector<float> uni(n_vocab);
+        for (int32_t i = 0; i < n_vocab; ++i) uni[i] = -20.0f + 40.0f * next_u01();
+        const ReadoutResult u = compute_readout(uni.data(), n_vocab, gate_cands, 8);
+        const double err = std::fabs(u.log_normalizer - ref_log_normalizer(uni));
+        fast_err_max = std::max(fast_err_max, err);
+        CHECK(err < 1e-5);
+        for (const auto & cand : u.candidates) CHECK(std::isfinite(cand.logprob));
+        std::cout << "readout fast-exp |log_normalizer - reference|: uniform[-20,20] " << err;
+    }
+    {
+        // (b) peaked row: one logit at +30, bulk around 0 with spread 5
+        // (sum of 12 uniforms is approximately normal with unit variance).
+        std::vector<float> pk2(n_vocab);
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            float s = 0.0f;
+            for (int j = 0; j < 12; ++j) s += next_u01();
+            pk2[i] = (s - 6.0f) * 5.0f;
+        }
+        pk2[999] = 30.0f;
+        const ReadoutResult p = compute_readout(pk2.data(), n_vocab, {999, 5}, 8);
+        const double err = std::fabs(p.log_normalizer - ref_log_normalizer(pk2));
+        fast_err_max = std::max(fast_err_max, err);
+        CHECK(err < 1e-5);
+        for (const auto & cand : p.candidates) CHECK(std::isfinite(cand.logprob));
+        CHECK_EQ(p.top[0].token, 999);
+        std::cout << ", peaked(+30, spread 5) " << err;
+    }
+    {
+        // (c) row containing -inf entries and one +40 entry
+        const float neg_inf = -std::numeric_limits<float>::infinity();
+        std::vector<float> sparse(n_vocab, 0.0f);
+        for (int32_t i = 0; i < n_vocab; i += 3) sparse[i] = neg_inf;
+        sparse[42] = 40.0f;
+        const ReadoutResult s = compute_readout(sparse.data(), n_vocab, {42, 1, 2}, 8);
+        const double err = std::fabs(s.log_normalizer - ref_log_normalizer(sparse));
+        fast_err_max = std::max(fast_err_max, err);
+        CHECK(err < 1e-5);
+        for (const auto & cand : s.candidates) CHECK(std::isfinite(cand.logprob));
+        CHECK_EQ(s.top[0].token, 42);
+        std::cout << ", -inf/+40 " << err << " (max " << fast_err_max << ")\n";
+    }
     std::cout << "readout compute (262144 vocab, 64 candidates): top_k 16 best " << best_ms
               << " ms, top_k 0 best " << best_no_top_ms << " ms; gate shape (4 cand, top_k 8) "
               << "best " << best_gate_ms << " ms\n";
     CHECK(best_ms < 5.0);
-    CHECK(best_gate_ms < 1.0);
+    CHECK(best_gate_ms <= 0.5);
 }
 
 int main() {

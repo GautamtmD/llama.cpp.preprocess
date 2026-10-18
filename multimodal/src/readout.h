@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <map>
@@ -97,41 +98,108 @@ struct ReadoutResult {
     double log_normalizer = 0.0;           // full-vocab logsumexp
 };
 
+// Fast exp() for the logsumexp sum only (never for candidate/top logprobs,
+// which stay `logit - log_normalizer` in double). The argument is max-shifted
+// (x <= 0); values below -87 are clamped (exp(-87) < 2^-126, so a clamped
+// entry contributes < 1e-37 against a sum that is >= 1). Range reduction
+// x * log2(e) -> integer part via the magic-number rounding trick, a degree-6
+// polynomial for 2^f on f in [-0.5, 0.5], and the 2^n scale assembled from
+// the exponent bits. Everything is plain float arithmetic; the caller stores
+// the polynomial and the scale bits in separate buffers (two loops) because
+// MSVC does not auto-vectorize the single-loop bit-cast form, while the
+// two-loop form vectorizes. Truncation error of the polynomial is < 2e-7
+// relative; with float rounding the per-element relative error stays in the
+// low 1e-6 range on [-87, 0] (worst in the deep tail, whose weight in the
+// sum is negligible), keeping |log_normalizer - double reference| << 1e-5.
+inline float readout_fast_exp_poly(float x, uint32_t & scale_bits) {
+    const float xc = x < -87.0f ? -87.0f : x;
+    const float t = xc * 1.4426950408889634f;  // x * log2(e)
+    const float nf = (t + 12582912.0f) - 12582912.0f;  // round(t), |t| < 2^22
+    const float f = t - nf;                            // [-0.5, 0.5]
+    scale_bits = static_cast<uint32_t>(static_cast<int32_t>(nf) + 127) << 23;
+    return 1.0f + f * (0.6931471805599453f +
+           f * (0.2402265069591007f +
+           f * (0.05550410866482158f +
+           f * (0.009618129107628477f +
+           f * (0.0013333558146428443f +
+           f * 0.00015403430350607636f)))));
+}
+
 // Raw-logit statistics for one output row: full-vocab logsumexp (max-shifted),
 // candidate logits/logprobs, and the top-k entries. `candidates` must be valid
 // ids in [0, n_vocab) and distinct (parse_readout_request guarantees both).
 inline ReadoutResult compute_readout(const float * logits, int32_t n_vocab,
                                      const std::vector<int32_t> & candidates, int top_k) {
     ReadoutResult result;
-    // Three branch-light passes (max, exp-sum, top-k) so the first two
-    // auto-vectorize; the top-k pass rejects almost every entry with one compare.
+    const int k = std::max(0, std::min<int>(std::min<int>(top_k, n_vocab), kReadoutMaxTopK));
+    // One blocked pass: a vectorizable per-block max scan (which also gates
+    // the scalar top-k scan: a block whose max cannot beat the current k-th
+    // best holds no top-k entry), an online rescale of the double sum when a
+    // block raises the running max, and the fast-exp sum. Float partial sums
+    // within a block, double across blocks, as before. Top-k semantics are
+    // unchanged: logit desc, ties by token id asc (strict `>` on an ascending
+    // scan, and a block is skipped only when no entry can satisfy it).
+    int32_t best[kReadoutMaxTopK];  // indices, sorted by (logit desc, id asc)
+    int nb = 0;
+    float thresh = -std::numeric_limits<float>::infinity();  // logits[best[k-1]] once full
     float maximum = -std::numeric_limits<float>::infinity();
-    for (int32_t i = 0; i < n_vocab; ++i) maximum = logits[i] > maximum ? logits[i] : maximum;
-    if (std::isfinite(maximum)) {
-        double sum = 0.0;
-        constexpr int32_t kBlock = 4096;  // float partial sums, double across blocks
-        for (int32_t b = 0; b < n_vocab; b += kBlock) {
-            const int32_t e = std::min(n_vocab, b + kBlock);
-            float partial = 0.0f;
-            for (int32_t i = b; i < e; ++i) partial += std::exp(logits[i] - maximum);
-            sum += partial;
+    double sum = 0.0;
+    constexpr int32_t kBlock = 4096;  // float partial sums, double across blocks
+    constexpr int32_t kChunk = 1024;  // fast-exp scratch chunk (fits L1 with the source chunk)
+    float exps[kChunk];
+    uint32_t exp_bits[kChunk];
+    float scales[kChunk];
+    for (int32_t b = 0; b < n_vocab; b += kBlock) {
+        const int32_t e = std::min(n_vocab, b + kBlock);
+        float block_max = -std::numeric_limits<float>::infinity();
+        for (int32_t i = b; i < e; ++i) block_max = logits[i] > block_max ? logits[i] : block_max;
+        if (k > 0 && (nb < k || block_max > thresh)) {
+            for (int32_t i = b; i < e; ++i) {
+                const float value = logits[i];
+                if (nb == k && !(value > thresh)) continue;
+                int at = nb;
+                while (at > 0 && value > logits[best[at - 1]]) --at;
+                const int lim = std::min(nb, k - 1);
+                for (int j = lim; j > at; --j) best[j] = best[j - 1];
+                if (at < k) {
+                    best[at] = i;
+                    if (nb < k) ++nb;
+                }
+                thresh = nb == k ? logits[best[k - 1]] : -std::numeric_limits<float>::infinity();
+            }
         }
-        result.log_normalizer = double(maximum) + std::log(sum);
-    } else {
-        result.log_normalizer = double(maximum);
+        if (block_max > maximum) {
+            if (std::isfinite(maximum) && std::isfinite(block_max)) {
+                sum *= std::exp(double(maximum) - double(block_max));
+            }
+            maximum = block_max;
+        }
+        if (!std::isfinite(block_max) || !std::isfinite(maximum)) continue;
+        float partial = 0.0f;
+        for (int32_t c = b; c < e; c += kChunk) {
+            const int32_t m = std::min<int32_t>(kChunk, e - c);
+            const float * src = logits + c;
+            for (int32_t i = 0; i < m; ++i) {
+                exps[i] = readout_fast_exp_poly(src[i] - maximum, exp_bits[i]);
+            }
+            // Exponent bits -> float scales via memcpy (no strict-aliasing
+            // violation; the whole-chunk copy is what MSVC vectorizes).
+            std::memcpy(scales, exp_bits, static_cast<size_t>(m) * sizeof(float));
+            for (int32_t i = 0; i < m; ++i) exps[i] *= scales[i];
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            float s4 = 0.0f, s5 = 0.0f, s6 = 0.0f, s7 = 0.0f;
+            int32_t i = 0;
+            for (; i + 8 <= m; i += 8) {
+                s0 += exps[i]; s1 += exps[i + 1]; s2 += exps[i + 2]; s3 += exps[i + 3];
+                s4 += exps[i + 4]; s5 += exps[i + 5]; s6 += exps[i + 6]; s7 += exps[i + 7];
+            }
+            for (; i < m; ++i) s0 += exps[i];
+            partial += ((s0 + s4) + (s1 + s5)) + ((s2 + s6) + (s3 + s7));
+        }
+        sum += partial;
     }
-    const size_t k = static_cast<size_t>(std::max(0, std::min<int>(top_k, n_vocab)));
-    std::vector<int32_t> best;  // indices, sorted by (logit desc, id asc)
-    best.reserve(k + 1);
-    for (int32_t i = 0; k > 0 && i < n_vocab; ++i) {
-        const float value = logits[i];
-        if (best.size() == k && !(value > logits[best.back()])) continue;
-        // Strict comparison while scanning ascending ids keeps lower ids first on ties.
-        size_t at = best.size();
-        while (at > 0 && value > logits[best[at - 1]]) --at;
-        best.insert(best.begin() + static_cast<std::ptrdiff_t>(at), i);
-        if (best.size() > k) best.pop_back();
-    }
+    result.log_normalizer = std::isfinite(maximum) ? double(maximum) + std::log(sum)
+                                                   : double(maximum);
     auto entry = [&](int32_t token) {
         ReadoutEntry e;
         e.token = token;
@@ -144,6 +212,6 @@ inline ReadoutResult compute_readout(const float * logits, int32_t n_vocab,
         result.candidate_mass += std::exp(result.candidates.back().logprob);
     }
     if (result.candidate_mass > 1.0) result.candidate_mass = 1.0;  // rounding guard
-    for (int32_t token : best) result.top.push_back(entry(token));
+    for (int j = 0; j < nb; ++j) result.top.push_back(entry(best[j]));
     return result;
 }
