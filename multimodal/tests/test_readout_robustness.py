@@ -26,6 +26,7 @@ from test_readout import (
     _create,
     _fork,
     _ok,
+    _on_gpu,
     _pool,
     _post,
     _readout,
@@ -173,6 +174,12 @@ def test_client_timeout_during_queued_readout_leaks_nothing(base, base300):
 def test_client_timeout_during_prefilling_readout_leaks_nothing(base, base300):
     if _free(base) < 1:
         pytest.skip("needs >= 1 free sequence for the fork")
+    if not _on_gpu(base):
+        # On CPU the 1500-token prefill runs for minutes and, as a priority
+        # request, holds the lane, so the status poll below cannot complete
+        # within its timeout. The no-leak-after-timeout property is covered
+        # on CPU by the queued-readout test above.
+        pytest.skip("GPU only: CPU prefill of the long suffix outlasts the status poll")
     initial = _free(base)
     base_size = _status(base, base300)["cache_size"]
     suffix_tokens = _token_count(base, LONG_SUFFIX)
