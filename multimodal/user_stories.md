@@ -359,17 +359,32 @@ Expected:
   a 409 returns no `readout`; no pooled slot leaks after fork -> readout ->
   delete, including after a 400.
 - A priority inject sent while N = 3 normal injects are queued completes before
-  all but at most one of them (behind only the executing decode).
+  all but at most one of them (behind only the executing decode); the same
+  holds behind a running generation, whose stream keeps delivering tokens.
+- A client that times out on a queued or long-prefilling readout leaves the
+  fork intact: the request finishes server-side, the fork is deletable, no
+  pooled slot leaks; 100 rapid fork -> readout -> delete cycles leave the
+  pool unchanged.
 - `/info` advertises `readout` and `priority_inject`.
 
 Latency / performance budget:
-- **GPU (GO-B, not yet measured):** readout overhead <= 1 ms over a plain inject
-  of the same suffix; full recipe p95 <= 100 ms warm at <= 128 suffix tokens.
+- **GPU (GO-B, measured 2026-10-19, RTX 5060 Ti, pool 4):** engine
+  `readout_ms` p95 <= 1 ms over >= 600 warm Gate-shape calls (measured p95
+  0.43 ms, median 0.30 ms); the critical-path priority inject-with-readout
+  on a pre-forked standby session p95 <= 100 ms warm at <= 128 suffix tokens
+  (measured 63.5 ms at 127 tokens; 75.7-88.1 ms idle at the 148-token Gate
+  suffix; 123 ms alongside eager generation, see ADR 0010 "GO-B results").
+  Fork and delete are off the critical path (reported, not gated).
 - **CPU (GO-A, recorded):** `readout_ms` <= 5 ms per inject (64 candidates,
   top_k 16, 262144-token vocab). The pure compute is also gated in the util
-  tests (< 5 ms; measured ~0.84 ms, ~0.59 ms with top_k 0).
+  tests (Gate shape <= 0.5 ms; measured ~0.28 ms after the vectorizable
+  logsumexp, was ~0.84 ms).
 
 Test:
 - `tests/test_readout.py` (correctness, 400 paths, slot leaks, priority
-  ordering, CPU overhead record)
-- `tests/test_util.cpp` (`readout.h` validation, statistics, compute timing)
+  ordering, readout overhead median on GPU / record on CPU)
+- `tests/test_readout_robustness.py` (client timeouts on queued and
+  prefilling readouts, priority behind a running generation, rapid cycles)
+- `tests/test_util.cpp` (`readout.h` validation, statistics, fast-exp
+  accuracy vs a double reference, compute timing)
+- GO-B latency: parent `scripts/gate_latency.py --recipe standby`
