@@ -332,3 +332,44 @@ Test:
 > Design survives [EUS-4](../../../docs/decisions/0004-fork-copy-semantics.md)
 > slice-5 shared KV (`llama_memory_seq_cp`) — the sequence-scoped serialize
 > primitive (`llama_state_seq_*`) won't corrupt another session's shared cells.
+
+---
+
+### EUS-7: Decision readout + priority on inject (ADR 0010)
+A quick decision is the app recipe fork -> inject-with-`readout` -> delete. The
+engine returns the raw last-row logits of the inject's final decode for 1–64
+single-token candidates (plus optional top-k), and a `priority` flag puts the
+request's scheduler work ahead of queued normal work. No prompt text, turn
+semantics or selection in the engine.
+
+Input / trigger:
+- `POST /sessions/{fork}/inject` with `text` or `messages` and
+  `readout: {candidates, top_k}`; optional `priority: true`.
+
+Expected:
+- The readout row equals a reference decode of the same tokens on a fresh
+  sequence (logit tolerance 0.05 on CPU), including while another sequence is
+  mid-generation; `top[0]` equals greedy `/generate`'s first token on an
+  identical fork; the source session is unchanged.
+- Finite logprobs, `candidate_mass` in [0, 1], sum exp(logprob) over `top` <= 1,
+  `position` = `cache_size` - 1, `semantics: "raw_last_row_pre_sampler_v1"`.
+- Every readout 400 (malformed/unknown key, 0 or > 64 candidates, empty,
+  multi-token or duplicate-token candidate, `top_k` outside 0–16, non-boolean
+  `priority`, `audio` body, media-ending prompt) leaves `cache_size` unchanged;
+  a 409 returns no `readout`; no pooled slot leaks after fork -> readout ->
+  delete, including after a 400.
+- A priority inject sent while N = 3 normal injects are queued completes before
+  all but at most one of them (behind only the executing decode).
+- `/info` advertises `readout` and `priority_inject`.
+
+Latency / performance budget:
+- **GPU (GO-B, not yet measured):** readout overhead <= 1 ms over a plain inject
+  of the same suffix; full recipe p95 <= 100 ms warm at <= 128 suffix tokens.
+- **CPU (GO-A, recorded):** `readout_ms` <= 5 ms per inject (64 candidates,
+  top_k 16, 262144-token vocab). The pure compute is also gated in the util
+  tests (< 5 ms; measured ~0.84 ms, ~0.59 ms with top_k 0).
+
+Test:
+- `tests/test_readout.py` (correctness, 400 paths, slot leaks, priority
+  ordering, CPU overhead record)
+- `tests/test_util.cpp` (`readout.h` validation, statistics, compute timing)

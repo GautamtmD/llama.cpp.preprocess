@@ -34,6 +34,7 @@
 #include "nlohmann/json.hpp"
 
 #include "inference_scheduler.h"
+#include "readout.h"
 #include "server_cli.h"
 #include "util.h"
 
@@ -1051,6 +1052,52 @@ static MtmdInjectResult mtmd_inject(mtmd_context * mtmd_ctx, llama_context * ctx
     return {InjectStatus::ok, last_token};
 }
 
+// ADR 0010 readout: raw last-row logits after an inject's final decode, read
+// outside common_sampler (no grammar/penalties/temperature). Must run inside
+// the same scheduler command as that decode, before anything else can touch
+// the context's output buffer.
+struct InjectReadout {
+    ReadoutResult result;
+    llama_pos position = -1;
+    double readout_ms = 0.0;
+};
+
+static bool read_inject_readout(llama_context * ctx, const llama_vocab * vocab,
+                                llama_seq_id seq_id, const ReadoutRequest & request,
+                                InjectReadout & out) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const float * row = llama_get_logits_ith(ctx, -1);
+    if (!row) return false;
+    out.result = compute_readout(row, llama_vocab_n_tokens(vocab), request.tokens, request.top_k);
+    out.position = llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id);
+    out.readout_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    return true;
+}
+
+static json inject_readout_json(const llama_vocab * vocab, const ReadoutRequest & request,
+                                const InjectReadout & readout) {
+    auto entry = [](const std::string & text, const ReadoutEntry & e) {
+        return json{{"text", text}, {"token", e.token}, {"logit", e.logit}, {"logprob", e.logprob}};
+    };
+    json candidates = json::array();
+    for (size_t i = 0; i < readout.result.candidates.size(); ++i) {
+        candidates.push_back(entry(request.texts[i], readout.result.candidates[i]));
+    }
+    json top = json::array();
+    for (const auto & e : readout.result.top) {
+        top.push_back(entry(common_token_to_piece(vocab, e.token, true), e));
+    }
+    return json{
+        {"position", readout.position},
+        {"candidates", candidates},
+        {"candidate_mass", readout.result.candidate_mass},
+        {"top", top},
+        {"semantics", kReadoutSemantics},
+        {"readout_ms", readout.readout_ms},
+    };
+}
+
 int main(int argc, char ** argv) {
     ServerCliResult cli = parse_server_arguments(argc, argv);
     if (cli.show_help) {
@@ -1301,6 +1348,13 @@ int main(int argc, char ** argv) {
             {"audio_sample_rate", app.audio_sample_rate},
             {"input_modalities", in_arr},
             {"output_modalities", out_arr},
+            {"readout", {
+                {"supported", true},
+                {"max_candidates", kReadoutMaxCandidates},
+                {"max_top_k", kReadoutMaxTopK},
+                {"semantics", kReadoutSemantics},
+            }},
+            {"priority_inject", true},
         };
         res.set_content(body.dump(), "application/json");
     });
@@ -1372,8 +1426,51 @@ int main(int argc, char ** argv) {
         bool used_template = false;
         bool used_multimodal = false;
         bool return_prompt = false;  // opt-in: echo the rendered prompt (chat-template parity tests)
+        json j;
         try {
-            auto j = json::parse(req.body);
+            j = json::parse(req.body);
+        } catch (const std::exception & e) {
+            res.status = 400;
+            res.set_content(error_body(std::string("bad request: ") + e.what(), 400).dump(), "application/json");
+            return;
+        }
+        // ADR 0010: `priority` and `readout` are validated here, before any
+        // scheduler command or mutation; invalid requests leave the session as is.
+        auto reject = [&res](const std::string & message) {
+            res.status = 400;
+            res.set_content(error_body(message, 400).dump(), "application/json");
+        };
+        bool priority = false;
+        std::optional<ReadoutRequest> readout;
+        if (j.is_object()) {
+            if (j.contains("priority")) {
+                if (!j["priority"].is_boolean()) return reject("priority must be a boolean");
+                priority = j["priority"].get<bool>();
+            }
+            if (j.contains("readout")) {
+                if (!j.contains("messages") && j.contains("audio")) {
+                    return reject("readout is not supported with an 'audio' body "
+                                  "(it has no discrete last token); use 'text' or 'messages'");
+                }
+                ReadoutRequest parsed;
+                const std::string error = parse_readout_request(
+                    j["readout"],
+                    [&app](const std::string & candidate, std::vector<int32_t> & out) {
+                        const int n = -llama_tokenize(app.vocab, candidate.c_str(), static_cast<int32_t>(candidate.size()),
+                                                      nullptr, 0, false, true);
+                        if (n < 0) return false;
+                        out.assign(static_cast<size_t>(n), 0);
+                        return n == 0 || llama_tokenize(app.vocab, candidate.c_str(), static_cast<int32_t>(candidate.size()),
+                                                        out.data(), n, false, true) == n;
+                    },
+                    parsed);
+                if (!error.empty()) return reject(error);
+                readout = std::move(parsed);
+            }
+        }
+        InferenceScheduler::PriorityLane lane(*app.scheduler, priority);
+        std::optional<InjectReadout> readout_result;
+        try {
             if (j.contains("messages")) {
                 if (!app.enable_chat_template) {
                     res.status = 400;
@@ -1498,12 +1595,56 @@ int main(int argc, char ** argv) {
                 // If we have media, run the mtmd tokenize+eval path instead of the
                 // plain text tokenize+decode below.
                 if (used_multimodal) {
+                    if (readout) {
+                        // Preflight (no mutation): a readout needs a discrete last
+                        // token, so the rendered prompt must end in a text chunk.
+                        // A tokenize failure is left to the inject itself (500), not reported here.
+                        const bool media_ending = app.scheduler->invoke_preserving_logits([&](llama_context *) {
+                            mtmd_input_text input_text;
+                            input_text.text          = text.c_str();
+                            input_text.add_special   = true;
+                            input_text.parse_special = true;
+                            mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+                            std::vector<const mtmd_bitmap *> bptrs;
+                            for (const auto & bitmap : bitmaps) bptrs.push_back(bitmap.get());
+                            bool ends_in_media = false;
+                            if (mtmd_tokenize(app.mtmd_ctx, chunks, &input_text,
+                                              bptrs.data(), bptrs.size()) == 0) {
+                                const size_t n_chunks = mtmd_input_chunks_size(chunks);
+                                if (n_chunks > 0) {
+                                    const mtmd_input_chunk * last = mtmd_input_chunks_get(chunks, n_chunks - 1);
+                                    size_t n_tokens = 0;
+                                    ends_in_media = mtmd_input_chunk_get_type(last) != MTMD_INPUT_CHUNK_TYPE_TEXT ||
+                                                    !mtmd_input_chunk_get_tokens_text(last, &n_tokens) ||
+                                                    n_tokens == 0;
+                                }
+                            }
+                            mtmd_input_chunks_free(chunks);
+                            return ends_in_media;
+                        });
+                        if (media_ending) {
+                            return reject("readout requires the rendered prompt to end in a text "
+                                          "token; this 'messages' prompt ends in a media chunk");
+                        }
+                    }
+                    lane.hold();
                     double t0 = now_s();
                     const uint64_t mutation_parent =
                         app.scheduler->prepare_sequence_mutation(seq_id);
                     MtmdInjectResult inject_result = app.scheduler->invoke_invalidating_logits([&](llama_context * ctx) {
-                        const auto result = mtmd_inject(
+                        llama_memory_t memory = llama_get_memory(ctx);
+                        const llama_pos before = llama_memory_seq_pos_max(memory, seq_id) + 1;
+                        auto result = mtmd_inject(
                             app.mtmd_ctx, ctx, seq_id, text, bitmaps, app.n_ctx_per_session);
+                        if (result.status == InjectStatus::ok && readout) {
+                            InjectReadout r;
+                            if (result.last_token == LLAMA_TOKEN_NULL ||
+                                !read_inject_readout(ctx, app.vocab, seq_id, *readout, r)) {
+                                llama_memory_seq_rm(memory, seq_id, before, -1);
+                                return MtmdInjectResult{InjectStatus::decode_failed, LLAMA_TOKEN_NULL};
+                            }
+                            readout_result = std::move(r);
+                        }
                         return result;
                     });
                     const double dt = now_s() - t0;
@@ -1530,6 +1671,7 @@ int main(int argc, char ** argv) {
                         {"n_media", bitmaps.size()},
                     };
                     if (return_prompt) body["prompt"] = text;
+                    if (readout_result) body["readout"] = inject_readout_json(app.vocab, *readout, *readout_result);
                     // Text-ending rendered prompts are generation-ready. A
                     // media-ending prompt retains ADR 0004's explicit caveat.
                     set_injected_boundary(app, sid_num, inject_result.last_token);
@@ -1571,6 +1713,7 @@ int main(int argc, char ** argv) {
                     return;
                 }
 
+                lane.hold();
                 const uint64_t mutation_parent =
                     app.scheduler->prepare_sequence_mutation(seq_id);
                 InjectStatus status = app.scheduler->invoke_invalidating_logits([&](llama_context * ctx) {
@@ -1674,6 +1817,7 @@ int main(int argc, char ** argv) {
             res.set_content(error_body("'text' or 'messages' is required", 400).dump(), "application/json");
             return;
         }
+        lane.hold();
         const int used = app.scheduler->invoke_preserving_logits([seq_id](llama_context * ctx) {
             return llama_memory_seq_pos_max(llama_get_memory(ctx), seq_id) + 1;
         });
@@ -1702,7 +1846,12 @@ int main(int argc, char ** argv) {
         const uint64_t mutation_parent =
             app.scheduler->prepare_sequence_mutation(seq_id);
         const bool decoded = app.scheduler->invoke_invalidating_logits([&](llama_context * ctx) {
-            const bool result = decode_tokens_in_chunks(ctx, seq_id, used, toks);
+            bool result = decode_tokens_in_chunks(ctx, seq_id, used, toks);
+            if (result && readout) {
+                InjectReadout r;
+                result = read_inject_readout(ctx, app.vocab, seq_id, *readout, r);
+                if (result) readout_result = std::move(r);
+            }
             if (!result) {
                 llama_memory_seq_rm(llama_get_memory(ctx), seq_id, used, -1);
             }
@@ -1731,6 +1880,7 @@ int main(int argc, char ** argv) {
             {"chat_template_applied", used_template},
         };
         if (return_prompt) body["prompt"] = text;
+        if (readout_result) body["readout"] = inject_readout_json(app.vocab, *readout, *readout_result);
         res.set_content(body.dump(), "application/json");
     });
 

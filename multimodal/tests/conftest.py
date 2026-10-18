@@ -13,7 +13,9 @@ The server can be provided in three ways (first that applies):
 2. **Self-boot, model as a parameter** (reuses the test_chat_template.py pattern):
    set ``MULTIMODAL_MODEL`` (gguf path) and pytest boots a fresh server on a free
    port for the session. Optional ``MULTIMODAL_MMPROJ``, ``MULTIMODAL_SERVER_EXE``,
-   ``MULTIMODAL_CUDA_VISIBLE_DEVICES``. This is what makes the suite
+   ``MULTIMODAL_CUDA_VISIBLE_DEVICES``, and
+   ``MULTIMODAL_SERVER_ARGS`` (extra CLI flags, e.g. ``--allow-cpu`` for a CPU
+   build). This is what makes the suite
    **model-agnostic** — the same tests run on any model the engine can load::
 
        MULTIMODAL_MODEL="C:/ML Models/MiniCPM-V-4.6/MiniCPM-V-4_6-Q8_0.gguf" \
@@ -39,6 +41,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import shlex
 import socket
 import subprocess
 import tempfile
@@ -60,6 +63,8 @@ EXE = os.environ.get(
     str(_REPO / "engine" / "multimodal" / "build" / "bin" / "Release" / "multimodal-server.exe"),
 )
 CUDA_GPU = os.environ.get("MULTIMODAL_CUDA_VISIBLE_DEVICES", "1")
+# Extra self-boot CLI flags, shell-split (e.g. "--allow-cpu" for a CPU-only build).
+SERVER_ARGS = shlex.split(os.environ.get("MULTIMODAL_SERVER_ARGS", ""))
 
 # Self-managed modules manage their own server lifecycles and must not be gated.
 SELF_BOOT = os.environ.get("MULTIMODAL_SELF_BOOT", "") == "1"
@@ -145,6 +150,7 @@ def _ensure_server():
     cmd = [EXE, "--model", MODEL, "--port", str(port)]
     if MMPROJ:
         cmd += ["--mmproj", MMPROJ]
+    cmd += SERVER_ARGS
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = CUDA_GPU
     print(f"[conftest] self-booting multimodal-server on port {port}: {MODEL}")

@@ -59,6 +59,32 @@ public:
     InferenceScheduler(const InferenceScheduler &) = delete;
     InferenceScheduler & operator=(const InferenceScheduler &) = delete;
 
+    // ADR 0010 priority lane. While a PriorityLane is alive on a thread, every
+    // command that thread submits through any invoke_* variant (including the
+    // ones inside prepare/complete/abort_sequence_mutation) is queued at the
+    // front of the command queue, FIFO among priority commands, behind only the
+    // command or generation cadence already executing. hold() additionally keeps
+    // the worker from starting normal commands, deferred commands or a new
+    // generation cadence in the microsecond gaps between this request's
+    // consecutive commands, so a multi-command request (inject = position query,
+    // mutation prepare, decode, mutation complete, size query) is not
+    // interleaved with queued work. Holds last one request and are released by
+    // the destructor. A held thread must not submit deferred
+    // (invoke_when_no_generation) work; that would wait on itself, so it throws.
+    class PriorityLane {
+    public:
+        PriorityLane(InferenceScheduler & scheduler, bool enabled);
+        ~PriorityLane();
+        PriorityLane(const PriorityLane &) = delete;
+        PriorityLane & operator=(const PriorityLane &) = delete;
+        void hold();
+
+    private:
+        InferenceScheduler & scheduler_;
+        bool enabled_;
+        bool held_ = false;
+    };
+
     // Opaque context commands conservatively invalidate logits because llama
     // state APIs may overwrite the output buffer even when they do not decode.
     template <typename Fn>
@@ -143,7 +169,7 @@ private:
         if constexpr (DeferForGeneration) {
             enqueue_deferred_command(std::move(command));
         } else {
-            enqueue_command(std::move(command));
+            enqueue_command(std::move(command), priority_lane_active());
         }
         return future.get();
     }
@@ -157,7 +183,12 @@ private:
         std::promise<SchedulerStepResult> promise;
     };
 
-    void enqueue_command(std::function<void()> command);
+    // front=true queues behind other priority commands but ahead of all normal
+    // commands and generation cadences (ADR 0010).
+    void enqueue_command(std::function<void()> command, bool front = false);
+    bool priority_lane_active() const;
+    // Requires mu_. True when the worker may start normal (non-priority) work.
+    bool normal_work_allowed() const { return priority_holds_ == 0; }
     void enqueue_deferred_command(std::function<void()> command);
     void worker_loop();
     void process_steps(std::vector<std::shared_ptr<StepRequest>> requests);
@@ -179,6 +210,8 @@ private:
     std::condition_variable cv_;
     bool stopping_ = false;
     std::deque<std::function<void()>> commands_;
+    std::deque<std::function<void()>> priority_commands_;
+    int priority_holds_ = 0;  // guarded by mu_
     std::deque<std::function<void()>> deferred_commands_;
     std::deque<std::shared_ptr<StepRequest>> steps_;
     int active_generations_ = 0;  // guarded by mu_

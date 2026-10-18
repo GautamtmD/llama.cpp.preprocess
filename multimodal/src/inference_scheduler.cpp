@@ -40,18 +40,69 @@ InferenceScheduler::~InferenceScheduler() {
     llama_free(ctx_);
 }
 
-void InferenceScheduler::enqueue_command(std::function<void()> command) {
+namespace {
+// Priority-lane membership is per submitting thread and per scheduler.
+thread_local const InferenceScheduler * t_priority_owner = nullptr;
+thread_local int t_priority_depth = 0;
+thread_local int t_priority_held = 0;
+}  // namespace
+
+InferenceScheduler::PriorityLane::PriorityLane(InferenceScheduler & scheduler, bool enabled)
+    : scheduler_(scheduler), enabled_(enabled) {
+    if (!enabled_) return;
+    if (t_priority_depth > 0 && t_priority_owner != &scheduler_) {
+        throw std::logic_error("nested priority lanes across schedulers");
+    }
+    t_priority_owner = &scheduler_;
+    ++t_priority_depth;
+}
+
+InferenceScheduler::PriorityLane::~PriorityLane() {
+    if (!enabled_) return;
+    if (held_) {
+        {
+            std::lock_guard<std::mutex> lock(scheduler_.mu_);
+            --scheduler_.priority_holds_;
+        }
+        --t_priority_held;
+        scheduler_.cv_.notify_all();
+    }
+    if (--t_priority_depth == 0) t_priority_owner = nullptr;
+}
+
+void InferenceScheduler::PriorityLane::hold() {
+    if (!enabled_ || held_) return;
+    {
+        std::lock_guard<std::mutex> lock(scheduler_.mu_);
+        ++scheduler_.priority_holds_;
+    }
+    held_ = true;
+    ++t_priority_held;
+}
+
+bool InferenceScheduler::priority_lane_active() const {
+    return t_priority_depth > 0 && t_priority_owner == this;
+}
+
+void InferenceScheduler::enqueue_command(std::function<void()> command, bool front) {
     {
         std::lock_guard<std::mutex> lock(mu_);
         if (stopping_) {
             throw std::runtime_error("inference scheduler is stopping");
         }
-        commands_.push_back(std::move(command));
+        if (front) {
+            priority_commands_.push_back(std::move(command));
+        } else {
+            commands_.push_back(std::move(command));
+        }
     }
     cv_.notify_one();
 }
 
 void InferenceScheduler::enqueue_deferred_command(std::function<void()> command) {
+    if (t_priority_held > 0 && t_priority_owner == this) {
+        throw std::logic_error("deferred scheduler work submitted while holding the priority lane");
+    }
     {
         std::lock_guard<std::mutex> lock(mu_);
         if (stopping_) {
@@ -458,35 +509,60 @@ void InferenceScheduler::worker_loop() {
         std::vector<std::shared_ptr<StepRequest>> requests;
         {
             std::unique_lock<std::mutex> lock(mu_);
-            cv_.wait(lock, [this] {
-                return stopping_ || !commands_.empty() || !steps_.empty() ||
-                       (!deferred_commands_.empty() && active_generations_ == 0);
+            // Priority commands always run first. While a priority request holds
+            // the lane, no normal command, deferred command or new cadence starts
+            // (shutdown drains everything regardless).
+            auto normal = [this] { return stopping_ || normal_work_allowed(); };
+            auto command_ready = [&] {
+                return !priority_commands_.empty() || (normal() && !commands_.empty());
+            };
+            auto take_command = [&]() -> bool {
+                if (!priority_commands_.empty()) {
+                    command = std::move(priority_commands_.front());
+                    priority_commands_.pop_front();
+                    return true;
+                }
+                if (normal() && !commands_.empty()) {
+                    command = std::move(commands_.front());
+                    commands_.pop_front();
+                    return true;
+                }
+                return false;
+            };
+            cv_.wait(lock, [&] {
+                return stopping_ || command_ready() ||
+                       (normal() && (!steps_.empty() ||
+                                     (!deferred_commands_.empty() && active_generations_ == 0)));
             });
-            if (stopping_ && commands_.empty() && deferred_commands_.empty() && steps_.empty()) {
+            if (stopping_ && priority_commands_.empty() && commands_.empty() &&
+                deferred_commands_.empty() && steps_.empty()) {
                 return;
             }
-            if (!commands_.empty()) {
-                command = std::move(commands_.front());
-                commands_.pop_front();
-            } else if (!steps_.empty()) {
+            if (take_command()) {
+                // command selected
+            } else if (!steps_.empty() && normal()) {
                 const auto deadline = std::chrono::steady_clock::now() + batching_window_;
                 if (!generation_cohort_started_) {
-                    cv_.wait_until(
-                        lock, deadline, [this] { return stopping_ || !commands_.empty(); });
+                    cv_.wait_until(lock, deadline, [&] {
+                        return stopping_ || command_ready() || !normal();
+                    });
                 }
-                if (commands_.empty() &&
+                if (!command_ready() && normal() &&
                     steps_.size() < static_cast<size_t>(active_generations_)) {
                     // Ready work may wait briefly for peers, but a client blocked
                     // on streaming I/O or tool parsing must never become an
                     // unbounded barrier for unrelated generations.
-                    cv_.wait_until(lock, deadline, [this] {
-                        return stopping_ || !commands_.empty() ||
+                    cv_.wait_until(lock, deadline, [&] {
+                        return stopping_ || command_ready() || !normal() ||
                                steps_.size() >= static_cast<size_t>(active_generations_);
                     });
                 }
-                if (!commands_.empty()) {
-                    command = std::move(commands_.front());
-                    commands_.pop_front();
+                if (take_command()) {
+                    // command selected
+                } else if (!normal()) {
+                    // A priority request took the lane while this cadence was
+                    // forming; re-evaluate so its next command runs first.
+                    continue;
                 } else {
                     std::set<llama_seq_id> seen;
                     while (!steps_.empty()) {
@@ -502,7 +578,7 @@ void InferenceScheduler::worker_loop() {
                     generation_cohort_started_ = active_generations_ > 0;
                 }
             } else if (!deferred_commands_.empty() &&
-                       (stopping_ || active_generations_ == 0)) {
+                       (stopping_ || (normal() && active_generations_ == 0))) {
                 command = std::move(deferred_commands_.front());
                 deferred_commands_.pop_front();
             }
