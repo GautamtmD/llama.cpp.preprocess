@@ -13,8 +13,20 @@ the ADR's CPU-runnable "correctness tests first":
 - every 400 path leaves the session unchanged (validation precedes mutation);
 - a priority inject queued behind N normal injects completes first;
 - no pooled slot leaks after fork -> readout -> delete, including after a 400;
-- readout overhead is recorded. CPU gate: ``readout_ms`` <= 5 ms. The ADR's
-  <= 1 ms overhead gate is a GPU (GO-B) gate and is NOT claimed here.
+- readout overhead: ``readout_ms`` (measured after the decode is synchronized,
+  so it is the readout alone) <= 5 ms on CPU; on a GPU build the ADR 0010 GO-B
+  gate ``readout_ms`` <= 1 ms applies to the Gate recipe's readout shape.
+
+Numerics: on CPU a fork's row matches a reference decode on another sequence
+within 0.05 logit. On CUDA the row is bit-identical to a reference decoded
+under the same cache state (same resident sequences), but moves by up to 0.59
+logit / 0.60 logprob when other sequences' KV is resident or a generation runs
+concurrently (unified-KV layout changes the kernels' reduction order; measured
+over 18 layouts, worklog 2026-10-01-decide-gate Step 15). So the reference is
+decoded before ``base_session`` exists (same state as the forks -> strict
+tolerance), and only the concurrent-generation test, whose cache state cannot
+be reproduced, uses ``GPU_LAYOUT_TOLERANCE`` plus strict top-1 and candidate
+ranking assertions.
 
 Run (CPU-only binary, self-booted)::
 
@@ -52,8 +64,15 @@ NORMAL_TEXT = (
     "<|turn>user\nList, in order, the planets of the solar system and one short fact "
     "about each of them, starting from Mercury.<turn|>\n"
 )
-LOGIT_TOLERANCE = 0.05  # CPU numerics: same tokens, different sequence ids
-READOUT_MS_CPU_GATE = 5.0  # GPU gate (<= 1 ms overhead) is GO-B, not this test
+LOGIT_TOLERANCE = 0.05  # same tokens, same cache state (CPU: also any state)
+# CUDA, cache state not reproducible (concurrent generation): measured spread
+# max 0.591 logit / 0.599 logprob over 18 layouts; 1.0 = 1.7x that, still far
+# below this prompt's A-B logit gap (4.1) and top0-top1 gap (13.7).
+GPU_LAYOUT_TOLERANCE = 1.0
+READOUT_MS_CPU_GATE = 5.0
+READOUT_MS_GPU_GATE = 1.0  # ADR 0010 GO-B: readout overhead <= 1 ms
+GATE_CANDIDATES = ["A", " A", "B", " B"]  # the Gate recipe's readout shape
+GATE_TOP_K = 8
 
 
 def _post(base, path, body=None, timeout=300):
@@ -100,17 +119,33 @@ def _by_token(readout):
     return {c["token"]: c for c in readout["candidates"]}
 
 
+def _rank(row):
+    return sorted(range(len(row["candidates"])), key=lambda i: -row["candidates"][i]["logit"])
+
+
 def _assert_same_row(got, ref, tolerance=LOGIT_TOLERANCE):
     assert got["position"] == ref["position"]
     assert [c["token"] for c in got["candidates"]] == [c["token"] for c in ref["candidates"]]
     for g, r in zip(got["candidates"], ref["candidates"], strict=True):
         assert abs(g["logit"] - r["logit"]) <= tolerance, (g, r)
         assert abs(g["logprob"] - r["logprob"]) <= tolerance, (g, r)
+    # Strict regardless of tolerance: same greedy token, same candidate ranking.
     assert got["top"][0]["token"] == ref["top"][0]["token"]
+    assert _rank(got) == _rank(ref)
+
+
+def _pool(base):
+    return _ok(requests.get(f"{base}/sessions/usage", timeout=30))["pool"]
+
+
+def _on_gpu(base):
+    return _pool(base)["model_gpu_bytes"] > 0
 
 
 @pytest.fixture(scope="module")
-def base_session(base):
+def base_session(base, reference):
+    # Depends on `reference` so the reference is decoded first, under the same
+    # cache state the forks of this session see (see the module docstring).
     sid = _create(base)
     _inject(base, sid, {"text": BASE_TEXT})
     yield sid
@@ -120,7 +155,8 @@ def base_session(base):
 @pytest.fixture(scope="module")
 def reference(base):
     """Reference decode: a fresh sequence fed the same two injects (same tokens,
-    same chunk structure) with no fork involved."""
+    same chunk structure) with no fork involved, decoded before `base_session`
+    exists so the cache state matches the forks'."""
     sid = _create(base)
     try:
         _inject(base, sid, {"text": BASE_TEXT})
@@ -396,16 +432,45 @@ def test_readout_during_concurrent_generation_reads_own_row(base, base_session, 
         f"tokens_after_readout={tokens_after}"
     )
     assert generation_still_running and tokens_after > 0
-    _assert_same_row(readout, reference)
+    # The concurrent cache state (growing generator KV, shared decode batches)
+    # cannot be reproduced for a reference; GPU numerics move with it.
+    tolerance = GPU_LAYOUT_TOLERANCE if _on_gpu(base) else LOGIT_TOLERANCE
+    _assert_same_row(readout, reference, tolerance=tolerance)
 
 
-PRIORITY_N = 3
+PRIORITY_MAX_N = 3
+PRIORITY_MIN_NORMAL_S = 0.4  # each queued normal inject must outlast the send delay
 
 
-def _priority_round(base, priority):
-    """N normal injects on N sessions start together; once they are queued and
+def _timed_inject_s(base, text):
+    """Wall time of one inject of `text`, synchronized (a readout makes the
+    decode finish before the response, also on an async GPU backend)."""
+    sid = _create(base)
+    try:
+        t0 = time.perf_counter()
+        _inject(base, sid, {"text": text, "readout": {"candidates": CANDIDATES}})
+        return time.perf_counter() - t0
+    finally:
+        _delete(base, sid)
+
+
+def _priority_load(base):
+    """Normal-inject text sized so one inject takes >= PRIORITY_MIN_NORMAL_S on
+    this device (NORMAL_TEXT once on CPU, repeated on GPU)."""
+    unit_tokens = 40  # NORMAL_TEXT is ~35 tokens
+    cap = max(1, (_pool(base)["ctx_size_per_sequence"] - 256) // unit_tokens)
+    k = 1
+    elapsed = _timed_inject_s(base, NORMAL_TEXT)
+    while elapsed < PRIORITY_MIN_NORMAL_S and k < cap:
+        k = min(cap, max(k * 2, math.ceil(k * PRIORITY_MIN_NORMAL_S / max(elapsed, 1e-3))))
+        elapsed = _timed_inject_s(base, NORMAL_TEXT * k)
+    return NORMAL_TEXT * k, k, elapsed
+
+
+def _priority_round(base, priority, n, text, delay_s):
+    """n normal injects on n sessions start together; once they are queued and
     the first decode is running, one short inject is sent with `priority`."""
-    sids = [_create(base) for _ in range(PRIORITY_N + 1)]
+    sids = [_create(base) for _ in range(n + 1)]
     finished: dict[str, float] = {}
     errors: list[str] = []
 
@@ -418,14 +483,11 @@ def _priority_round(base, priority):
             finished[sid] = time.perf_counter()
 
     try:
-        normal = [
-            threading.Thread(target=run, args=(sid, {"text": NORMAL_TEXT}))
-            for sid in sids[:PRIORITY_N]
-        ]
+        normal = [threading.Thread(target=run, args=(sid, {"text": text})) for sid in sids[:n]]
         start = time.perf_counter()
         for t in normal:
             t.start()
-        time.sleep(0.5)  # all normal injects queued; one decode executing
+        time.sleep(delay_s)  # all normal injects queued; the first one executing
         sent = time.perf_counter()
         urgent = threading.Thread(
             target=run,
@@ -446,23 +508,36 @@ def _priority_round(base, priority):
             _delete(base, sid)
     assert not errors, errors
     urgent_done = finished[sids[-1]]
-    ahead = sum(1 for sid in sids[:PRIORITY_N] if finished[sid] < urgent_done)
-    normal_ms = sorted((finished[s] - start) * 1000 for s in sids[:PRIORITY_N])
+    ahead = sum(1 for sid in sids[:n] if finished[sid] < urgent_done)
+    normal_ms = sorted((finished[s] - start) * 1000 for s in sids[:n])
     return ahead, (urgent_done - sent) * 1000, normal_ms
 
 
 def test_priority_inject_overtakes_queued_normal_injects(base):
-    ahead, urgent_ms, normal_ms = _priority_round(base, priority=True)
-    c_ahead, c_ms, c_normal = _priority_round(base, priority=False)
+    # Each round needs n normal sessions + 1 urgent; read capacity, do not assume it.
+    n = min(PRIORITY_MAX_N, _pool(base)["free_sequences"] - 1)
+    if n < 2:
+        pytest.skip(f"needs >= 3 free sequences for an ordering check, have {n + 1}")
+    text, repeats, normal_s = _priority_load(base)
+    delay_s = min(0.5, normal_s / 3)
+    ahead, urgent_ms, normal_ms = _priority_round(base, True, n, text, delay_s)
+    c_ahead, c_ms, c_normal = _priority_round(base, False, n, text, delay_s)
     print(
-        f"\n[priority] priority=true: finished after {ahead}/{PRIORITY_N} normal, "
+        f"\n[priority] load: {n} normal injects of NORMAL_TEXT x{repeats} "
+        f"({normal_s * 1000:.0f} ms each), urgent sent after {delay_s * 1000:.0f} ms"
+        f"\n[priority] priority=true: finished after {ahead}/{n} normal, "
         f"{urgent_ms:.0f} ms from send; normal done at {[round(x) for x in normal_ms]} ms"
-        f"\n[priority] control priority=false: finished after {c_ahead}/{PRIORITY_N} "
+        f"\n[priority] control priority=false: finished after {c_ahead}/{n} "
         f"normal, {c_ms:.0f} ms from send; normal done at {[round(x) for x in c_normal]} ms"
     )
-    # Behind only the decode already executing when it was sent.
+    # With priority it waits only for the decode already executing.
     assert ahead <= 1
+    # The control proves the load really was queued when the short inject was
+    # sent: without priority it waits behind more normal injects (it can tie
+    # with the last one, whose commands interleave with its own) and finishes
+    # at least half a normal inject later than the priority request.
     assert c_ahead > ahead
+    assert c_ms - urgent_ms >= 500 * normal_s, (c_ms, urgent_ms, normal_s)
 
 
 def test_readout_overhead_vs_plain_inject(base, base_session):
@@ -483,11 +558,22 @@ def test_readout_overhead_vs_plain_inject(base, base_session):
             readout_ms.append(body["readout"]["readout_ms"])
         finally:
             _delete(base, fork)
+    gate_ms = []
+    for _ in range(9):
+        body = _fork_readout(base, base_session, candidates=GATE_CANDIDATES, top_k=GATE_TOP_K)
+        gate_ms.append(body["readout"]["readout_ms"])
+    gpu = _on_gpu(base)
     delta = statistics.median(readout_wall_ms) - statistics.median(plain_ms)
     print(
-        f"\n[readout] CPU overhead: readout_ms median={statistics.median(readout_ms):.3f} "
-        f"max={max(readout_ms):.3f}; client wall plain median="
+        f"\n[readout] {'GPU' if gpu else 'CPU'} overhead: 64 candidates/top_k 16 "
+        f"readout_ms median={statistics.median(readout_ms):.3f} max={max(readout_ms):.3f}; "
+        f"Gate shape (4 candidates/top_k 8) median={statistics.median(gate_ms):.3f} "
+        f"max={max(gate_ms):.3f}; client wall plain median="
         f"{statistics.median(plain_ms):.1f} ms, with readout median="
         f"{statistics.median(readout_wall_ms):.1f} ms (delta {delta:+.1f} ms, decode noise)"
     )
     assert max(readout_ms) <= READOUT_MS_CPU_GATE
+    if gpu:
+        # Typical-call check; the p95 gate over >= 100 warm calls is the GO-B
+        # run (scripts/gate_latency.py), not this 9-sample correctness test.
+        assert statistics.median(gate_ms) <= READOUT_MS_GPU_GATE

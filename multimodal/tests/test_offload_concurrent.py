@@ -254,6 +254,9 @@ def test_offload_load_does_not_degrade_concurrent_generation(base, make_session)
     _inject_chat(base, source)
     control = _fork(base, source)["session_id"]
     text_baseline, times_baseline = _stream_generate(base, control, max_tokens=80)
+    # Release the baseline fork (make_session does not own forks): the run below
+    # needs source + b + c + subject, which fits the default 4-sequence pool.
+    requests.delete(f"{base}/sessions/{control}", timeout=30)
     assert text_baseline, "baseline produced no text"
     n_baseline = len(times_baseline)
     gaps_baseline = _inter_token_gaps_ms(times_baseline)

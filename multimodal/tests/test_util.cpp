@@ -8,6 +8,7 @@
 #include "util.h"
 #include "readout.h"
 #include "server_cli.h"
+#include <algorithm>
 #include <chrono>
 
 #include <iostream>
@@ -387,6 +388,13 @@ static void test_server_argument_validation() {
     CHECK_EQ(valid.config.max_sequences, 8);
     CHECK_EQ(valid.config.chat_template_kwargs.at("custom"), "\"value\"");
 
+    // Default pool: 4 live sequences (4 x 4096 full-size SWA KV fits a 16 GB
+    // card next to Gemma 4 12B Q4; 8 spills to system memory, worklog Step 14).
+    const ServerCliResult defaults = parse_server_arguments({"--model", "model.gguf"});
+    CHECK(defaults.error.empty());
+    CHECK_EQ(defaults.config.max_sequences, 4);
+    CHECK_EQ(defaults.config.ctx_size, 4096);
+
     const ServerCliResult help = parse_server_arguments({"--help"});
     CHECK(help.error.empty());
     CHECK(help.show_help);
@@ -538,9 +546,46 @@ static void test_readout_compute() {
         best_no_top_ms =
             std::min(best_no_top_ms, std::chrono::duration<double, std::milli>(t1 - t0).count());
     }
+    // Gate recipe shape (ADR 0010 GO-B readout overhead <= 1 ms): 4 candidates,
+    // top_k 8. Best-of-5 host compute must fit the gate itself (measured ~0.75 ms
+    // here; the server adds the logit-row fetch, see test_readout.py).
+    const std::vector<int32_t> gate_cands = {10, 20, 30, 40};
+    double best_gate_ms = 1e9;
+    for (int rep = 0; rep < 5; ++rep) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const ReadoutResult p = compute_readout(row.data(), n_vocab, gate_cands, 8);
+        const auto t1 = std::chrono::steady_clock::now();
+        CHECK_EQ(p.top.size(), size_t(8));
+        best_gate_ms =
+            std::min(best_gate_ms, std::chrono::duration<double, std::milli>(t1 - t0).count());
+    }
+    // Accuracy on the big row: logsumexp and top-k against a double reference.
+    double ref_max = -1e300;
+    for (int32_t i = 0; i < n_vocab; ++i) ref_max = std::max(ref_max, double(row[i]));
+    double ref_sum = 0.0;
+    for (int32_t i = 0; i < n_vocab; ++i) ref_sum += std::exp(double(row[i]) - ref_max);
+    const ReadoutResult big = compute_readout(row.data(), n_vocab, gate_cands, 8);
+    CHECK(std::fabs(big.log_normalizer - (ref_max + std::log(ref_sum))) < 1e-5);
+    std::vector<int32_t> order(n_vocab);
+    for (int32_t i = 0; i < n_vocab; ++i) order[i] = i;
+    std::partial_sort(order.begin(), order.begin() + 8, order.end(), [&](int32_t a, int32_t b) {
+        return row[a] > row[b] || (row[a] == row[b] && a < b);
+    });
+    for (size_t i = 0; i < 8; ++i) CHECK_EQ(big.top[i].token, order[i]);
+    // A peaked, Gemma-like row (one dominant logit, bulk far below it).
+    std::vector<float> peaked(n_vocab);
+    for (int32_t i = 0; i < n_vocab; ++i) peaked[i] = float((i * 40503u) % 2000) / 200.0f - 5.0f;
+    peaked[1234] = 28.0f;
+    double pk_sum = 0.0;
+    for (int32_t i = 0; i < n_vocab; ++i) pk_sum += std::exp(double(peaked[i]) - 28.0);
+    const ReadoutResult pk = compute_readout(peaked.data(), n_vocab, {1234, 5}, 2);
+    CHECK(std::fabs(pk.log_normalizer - (28.0 + std::log(pk_sum))) < 1e-5);
+    CHECK_EQ(pk.top[0].token, 1234);
     std::cout << "readout compute (262144 vocab, 64 candidates): top_k 16 best " << best_ms
-              << " ms, top_k 0 best " << best_no_top_ms << " ms\n";
+              << " ms, top_k 0 best " << best_no_top_ms << " ms; gate shape (4 cand, top_k 8) "
+              << "best " << best_gate_ms << " ms\n";
     CHECK(best_ms < 5.0);
+    CHECK(best_gate_ms < 1.0);
 }
 
 int main() {

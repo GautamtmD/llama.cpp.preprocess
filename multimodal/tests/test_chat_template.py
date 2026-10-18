@@ -29,6 +29,7 @@ What this proves (the M1 success criteria):
 from __future__ import annotations
 
 import os
+import shlex
 import socket
 import subprocess
 import tempfile
@@ -52,6 +53,8 @@ MODEL = os.environ.get(
     r"C:\ML Models\Gemma4 12b\gemma-4-12b-it-qat-q4_0.gguf",
 )
 CUDA_GPU = os.environ.get("MULTIMODAL_CUDA_VISIBLE_DEVICES", "1")
+# Extra CLI flags for every booted server, as in conftest (e.g. "--allow-cpu").
+SERVER_ARGS = shlex.split(os.environ.get("MULTIMODAL_SERVER_ARGS", ""))
 
 # Deterministic, model-independent Jinja template. It does NOT reference
 # bos_token/eos_token, so its rendered output depends only on messages,
@@ -105,7 +108,7 @@ def _boot(extra_args: list[str], timeout: int = 45) -> str:
     if not os.path.exists(MODEL):
         pytest.skip(f"model not found at {MODEL} (set MULTIMODAL_MODEL)")
 
-    # A capacity-8 pool nearly fills the benchmark GPU. Configuration groups
+    # A full pool nearly fills the benchmark GPU. Configuration groups
     # run sequentially, so retire the previous group's server before loading the
     # next instead of overlapping multiple fixed pools.
     _stop_servers()
@@ -113,7 +116,8 @@ def _boot(extra_args: list[str], timeout: int = 45) -> str:
     url = f"http://127.0.0.1:{port}"
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = CUDA_GPU
-    cmd = [EXE, "--model", MODEL, "--port", str(port), "--n-gpu-layers", "99", *extra_args]
+    cmd = [EXE, "--model", MODEL, "--port", str(port), "--n-gpu-layers", "99"]
+    cmd += [*SERVER_ARGS, *extra_args]
     log = tempfile.TemporaryFile(mode="w+b")
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
     _PROCS.append(proc)

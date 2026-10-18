@@ -19,7 +19,6 @@ upstream merges stay clean.
 multimodal/
   src/          our C++ (session API, KV-cache management, HTTP server)
   tests/        perf + correctness tests (written first, per TDD)
-  scripts/      fetch_cuda_dlls.sh — get the CUDA backend DLLs in place
   user_stories.md   engine-side acceptance criteria + latency budgets
 ```
 
@@ -30,11 +29,12 @@ in via `add_subdirectory(../ ...)` with `LLAMA_STANDALONE=OFF`, linking
 `llama` + `llama-common` + the vendored `cpp-httplib`. No upstream files are
 modified.
 
-```bat
-:: from the parent repo root, in a VS x64 Developer Prompt
- cmake -S engine/multimodal -B engine/multimodal/build ^
-   -G "Visual Studio 18 2026" -A x64 -DCMAKE_BUILD_TYPE=Release
- cmake --build engine/multimodal/build --config Release --target multimodal-server
+Use the parent repo's `scripts/build_engine.sh` (Ninja + shared ccache; it
+loads vcvars and copies the DLLs next to the exe):
+
+```bash
+bash scripts/build_engine.sh --cuda   # GPU build (ggml-cuda from source)
+bash scripts/build_engine.sh          # CPU-only build
 ```
 
 The exe lands in `engine/multimodal/build/bin/Release/` (co-located with the
@@ -42,30 +42,26 @@ runtime DLLs so `ggml_backend_load_all()` can find the backends).
 
 ### Enabling CUDA (GPU offload)
 
-The CPU-only build runs the 12B model at ~1.2 tok/s. For real perf (~46 tok/s on
-an RTX 5070 Ti) you need the `ggml-cuda` backend.
+`build_engine.sh --cuda` compiles the `ggml-cuda` backend from source
+(`-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120`, RTX 50xx) and copies the
+CUDA runtime DLLs (`cudart64_13`, `cublas64_13`, `cublasLt64_13`) from the
+toolkit next to the exe. nvcc 12.9 / 13.0 rejects VS 2026's default MSVC 19.5x
+(`cudafe++` crashes), so the script loads the **VS 2022 v143 toolset (MSVC
+14.4x)** with `vcvars64.bat -vcvars_ver=14.44`; VS 2026 installs it as the
+"MSVC v143 build tools" component. Overrides: `CUDA_PATH_V`, `CUDA_ARCHS`,
+`MSVC_TOOLSET`. The old prebuilt-DLL route (`fetch_cuda_dlls.sh`) is
+**removed**: a `ggml-cuda.dll` from another llama.cpp build does not register
+against this fork's `ggml-base` and the server saw 0 GPUs.
 
-**Compiling ggml-cuda from source currently fails** on this machine: the
-installed VS 2026 (MSVC 14.4x+) is too new for CUDA 12.9 / 13.0's `nvcc` —
-`cudafe++` crashes with `0xC0000005` even with `-allow-unsupported-compiler`.
-Until a CUDA-supported VS (2019/2022) is installed, **reuse a prebuilt,
-known-compatible `ggml-cuda.dll`** plus the CUDA 13 runtime DLLs it depends on:
+Run with `--n-gpu-layers 99` (the default). GPU execution is fail-closed: the
+server and performance benchmarks exit nonzero if no model layer is assigned
+to a GPU. Pass `--allow-cpu` only for an intentional CPU-only run. The error
+names that opt-in so a CPU fallback cannot be mistaken for a GPU benchmark.
 
-```bash
-bash engine/multimodal/scripts/fetch_cuda_dlls.sh
-# copies ggml-cuda.dll + cudart64_13/cublas64_13/cublasLt64_13.dll
-# from C:/Programming/llamacpp into engine/multimodal/build/bin/Release/
-```
-
-Then run with `--n-gpu-layers 99`. GPU execution is fail-closed: the server and
-performance benchmarks exit nonzero if no model layer is assigned to a GPU.
-Pass `--allow-cpu` only for an intentional CPU-only run. The error names that
-opt-in so a CPU fallback cannot be mistaken for a GPU benchmark.
-
-Validated empirically: 38× speedup, 11/11 tests still pass, output is coherent.
-The startup guard also catches an ABI-incompatible `ggml-cuda.dll` that fails to
-register a GPU device. Use a backend built for the pinned ggml ABI; if the fork
-drifts, rebuild ggml-cuda from source with a CUDA-supported host compiler.
+**Pool size on 16 GB GPUs.** The default pool is `--max-sequences 4` x
+`--ctx-size 4096`. The scheduler needs the full-size SWA cache, so 8 x 4096
+with Gemma 4 12B Q4 fills a 16 GB card and spills into system memory (WDDM
+fallback, ~5x slower decodes); 4 uses ~12.6 GB.
 
 ## Model reasoning configuration
 

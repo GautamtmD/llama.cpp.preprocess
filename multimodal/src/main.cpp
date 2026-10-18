@@ -210,7 +210,7 @@ struct AppState {
     ModelConfig                          model_cfg;
     std::vector<llama_token> reasoning_start_tokens;
     std::vector<llama_token> reasoning_end_tokens;
-    int max_sequences = 8;
+    int max_sequences = 4;
     size_t pool_footprint_bytes = 0;
     size_t model_gpu_bytes = 0;
     std::unique_ptr<InferenceScheduler> scheduler;
@@ -1065,6 +1065,10 @@ struct InjectReadout {
 static bool read_inject_readout(llama_context * ctx, const llama_vocab * vocab,
                                 llama_seq_id seq_id, const ReadoutRequest & request,
                                 InjectReadout & out) {
+    // llama_decode is asynchronous on GPU backends and llama_get_logits_ith
+    // synchronizes. Wait for the decode first so readout_ms times only the
+    // readout (logit row fetch + compute_readout), not the pending decode.
+    llama_synchronize(ctx);
     const auto t0 = std::chrono::steady_clock::now();
     const float * row = llama_get_logits_ith(ctx, -1);
     if (!row) return false;

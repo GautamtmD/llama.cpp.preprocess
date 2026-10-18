@@ -3,6 +3,11 @@
 Run against the live GPU server. These tests intentionally assert scheduler and
 pool telemetry, not throughput alone, so six independent contexts cannot pass by
 merely running concurrently.
+
+The job width follows the server's pool: ``N_SEQUENCES = min(6, free - 1)``
+(the source needs one slot). With the default ``--max-sequences 4`` that is a
+3-way batch; run with ``MULTIMODAL_SERVER_ARGS="--max-sequences 8"`` for the
+full six-way coverage (and the tests that need more slots than 4).
 """
 
 from __future__ import annotations
@@ -24,7 +29,8 @@ import requests
 
 pytestmark = [pytest.mark.usefixtures("base", "make_session"), pytest.mark.requires("text")]
 
-N_SEQUENCES = 6
+MAX_JOBS = 6
+N_SEQUENCES = MAX_JOBS  # resized to the live pool by _size_jobs_to_pool
 N_STEPS = 32
 FORK_SAMPLES = 50
 FORK_P95_MS = 5.0
@@ -111,6 +117,24 @@ def _hist_delta(before: dict, after: dict, width: int) -> int:
     )
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _size_jobs_to_pool(base):
+    """Read the pool capacity instead of assuming 8 sequences."""
+    global N_SEQUENCES
+    free = _usage(base)["pool"]["free_sequences"]
+    N_SEQUENCES = min(MAX_JOBS, free - 1)
+    if N_SEQUENCES < 2:
+        pytest.skip(f"cross-session batching needs >= 3 free sequences, pool has {free}")
+    yield
+    N_SEQUENCES = MAX_JOBS
+
+
+def _require_free(base, needed: int) -> None:
+    free = _usage(base)["pool"]["free_sequences"]
+    if free < needed:
+        pytest.skip(f"needs {needed} free sequences, pool has {free} (use --max-sequences 8)")
+
+
 def _p95(values: list[float]) -> float:
     ordered = sorted(values)
     return ordered[math.ceil(0.95 * len(ordered)) - 1]
@@ -128,8 +152,12 @@ def test_pool_is_single_explicitly_sized_context(base, make_session):
         assert pool["free_sequences"] == pool["capacity"] - pool["active_sequences"]
         assert pool["ctx_size_per_sequence"] > 0
         assert pool["ctx_size_total"] >= pool["ctx_size_per_sequence"] * pool["capacity"]
-        assert pool["preallocated_bytes"] > 0
-        assert pool["model_gpu_bytes"] > 0
+        # Both are measured GPU allocations; an intentional CPU run (--allow-cpu)
+        # reports 0 for each.
+        if pool["model_gpu_bytes"] > 0:
+            assert pool["preallocated_bytes"] > 0
+        else:
+            assert pool["preallocated_bytes"] == 0
         assert pool["gpu_free_bytes"] >= 0
         assert pool["logical_owned_cells"] >= 0
         assert pool["sequence_capabilities_probed"] is True
@@ -368,7 +396,7 @@ def test_divergent_histories_never_merge_equal_position_token_rows(base, make_se
     sessions = [make_session() for _ in range(N_SEQUENCES)]
     injects = [
         _inject(base, sid, marker)
-        for sid, marker in zip(sessions, ("A", "B", "C", "D", "E", "F"), strict=True)
+        for sid, marker in zip(sessions, ("A", "B", "C", "D", "E", "F")[:N_SEQUENCES], strict=True)
     ]
     assert len({result["cache_size"] for result in injects}) == 1
     assert len({result["tokens_injected"] for result in injects}) == 1
@@ -424,8 +452,9 @@ def test_media_ending_job_error_is_isolated_from_valid_batch_jobs(
     )
     assert audio.status_code == 200, audio.text
 
-    sessions = [_fork(base, source)["session_id"] for _ in range(5)]
-    barrier = threading.Barrier(6)
+    n_valid = min(5, _usage(base)["pool"]["free_sequences"])
+    sessions = [_fork(base, source)["session_id"] for _ in range(n_valid)]
+    barrier = threading.Barrier(n_valid + 1)
     telemetry_before = _batching(base)
 
     def run_valid(sid: str) -> requests.Response:
@@ -460,7 +489,7 @@ def test_media_ending_job_error_is_isolated_from_valid_batch_jobs(
         return response, events
 
     try:
-        with ThreadPoolExecutor(max_workers=6) as executor:
+        with ThreadPoolExecutor(max_workers=n_valid + 1) as executor:
             valid_futures = [executor.submit(run_valid, sid) for sid in sessions]
             invalid_future = executor.submit(run_invalid)
             valid_responses = [future.result(timeout=30) for future in valid_futures]
@@ -493,7 +522,7 @@ def test_media_ending_job_error_is_isolated_from_valid_batch_jobs(
 
         telemetry_after = _batching(base)
         assert _hist_delta(telemetry_before, telemetry_after, len(sessions) + 1) >= 1, (
-            "the five valid jobs and their idle source did not initialize together",
+            "the valid jobs and their idle source did not initialize together",
             telemetry_before,
             telemetry_after,
         )
@@ -503,6 +532,7 @@ def test_media_ending_job_error_is_isolated_from_valid_batch_jobs(
 
 
 def test_completed_coalesced_siblings_keep_current_boundary_when_one_resumes(base, make_session):
+    _require_free(base, 6)  # source + 3 siblings + control + invalidator
     source = make_session()
     _inject(
         base,

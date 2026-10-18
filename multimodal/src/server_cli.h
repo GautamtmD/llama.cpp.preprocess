@@ -20,7 +20,7 @@ struct ServerConfig {
     int n_gpu_layers = 99;
     int ctx_size = 4096;
     int n_batch = 2048;
-    int max_sequences = 8;
+    int max_sequences = 4;  // fits a 16 GB GPU with Gemma 4 12B Q4 (full-size SWA KV)
     bool allow_cpu = false;
 
     std::string chat_template;
@@ -47,7 +47,7 @@ inline std::string server_help_text() {
         "  -ngl,--n-gpu-layers N     GPU layers; negative=all, 0=CPU (default 99)\n"
         "  -c, --ctx-size N          context tokens per sequence, >0 (default 4096)\n"
         "      --n-batch N           logical decode batch; must be >= --max-sequences (default 2048)\n"
-        "      --max-sequences N     pooled live-sequence capacity, >0 (default 8)\n"
+        "      --max-sequences N     pooled live-sequence capacity, >0 (default 4)\n"
         "      --allow-cpu           explicitly permit CPU-only execution (default: GPU required)\n"
         "      --chat-template TPL   Jinja chat template override (else model default)\n"
         "      --chat-template-file F  read Jinja chat template override from a file\n"

@@ -15,7 +15,8 @@ The server can be provided in three ways (first that applies):
    port for the session. Optional ``MULTIMODAL_MMPROJ``, ``MULTIMODAL_SERVER_EXE``,
    ``MULTIMODAL_CUDA_VISIBLE_DEVICES``, and
    ``MULTIMODAL_SERVER_ARGS`` (extra CLI flags, e.g. ``--allow-cpu`` for a CPU
-   build). This is what makes the suite
+   build; a CPU run of a CUDA build also needs ``MULTIMODAL_CUDA_VISIBLE_DEVICES=-1``,
+   an empty value deletes the variable on Windows). This is what makes the suite
    **model-agnostic** — the same tests run on any model the engine can load::
 
        MULTIMODAL_MODEL="C:/ML Models/MiniCPM-V-4.6/MiniCPM-V-4_6-Q8_0.gguf" \

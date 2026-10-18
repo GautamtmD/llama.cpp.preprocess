@@ -3,6 +3,12 @@
 This module self-boots a tiny-context server so over-limit generation and raw
 multimodal injection are fast to exercise without filling the normal 4096-token
 session allocation.
+
+The tiny servers are a second model instance next to the suite's shared server.
+One 16 GB GPU cannot hold two Gemma 4 12B instances, so by default they run as
+an explicit CPU run (``CUDA_VISIBLE_DEVICES=-1``, ``--allow-cpu``); context limits are
+device-independent. ``MULTIMODAL_TINY_CUDA_VISIBLE_DEVICES`` selects a GPU for
+them instead (e.g. when no shared server is running).
 """
 
 from __future__ import annotations
@@ -33,7 +39,8 @@ EXE = Path(
 )
 MODEL = os.environ.get("MULTIMODAL_MODEL", "")
 MMPROJ = os.environ.get("MULTIMODAL_MMPROJ", "")
-CUDA_GPU = os.environ.get("MULTIMODAL_CUDA_VISIBLE_DEVICES", "1")
+# "-1" hides every GPU (an empty value would delete the variable on Windows).
+TINY_CUDA_GPU = os.environ.get("MULTIMODAL_TINY_CUDA_VISIBLE_DEVICES", "-1")
 CTX_SIZE = 32
 
 
@@ -66,8 +73,10 @@ def _running_server(n_batch: int, max_sequences: int) -> Iterator[str]:
         "--n-batch",
         str(n_batch),
     ]
+    if TINY_CUDA_GPU in ("", "-1"):
+        command.append("--allow-cpu")
     env = dict(os.environ)
-    env["CUDA_VISIBLE_DEVICES"] = CUDA_GPU
+    env["CUDA_VISIBLE_DEVICES"] = TINY_CUDA_GPU
     log = tempfile.TemporaryFile(mode="w+b")
     process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)
     base = f"http://127.0.0.1:{port}"
