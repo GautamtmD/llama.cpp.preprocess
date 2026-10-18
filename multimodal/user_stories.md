@@ -373,7 +373,8 @@ Latency / performance budget:
   0.43 ms, median 0.30 ms); the critical-path priority inject-with-readout
   on a pre-forked standby session p95 <= 100 ms warm at <= 128 suffix tokens
   (measured 63.5 ms at 127 tokens; 75.7-88.1 ms idle at the 148-token Gate
-  suffix; 123 ms alongside eager generation, see ADR 0010 "GO-B results").
+  suffix; 123 ms alongside eager generation; 129 ms with TTS synthesising on
+  the same GPU, 81 ms with TTS on the other GPU; see ADR 0010 "GO-B results").
   Fork and delete are off the critical path (reported, not gated).
 - **CPU (GO-A, recorded):** `readout_ms` <= 5 ms per inject (64 candidates,
   top_k 16, 262144-token vocab). The pure compute is also gated in the util
