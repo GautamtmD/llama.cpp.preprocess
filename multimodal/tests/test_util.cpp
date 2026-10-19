@@ -646,6 +646,39 @@ static void test_readout_compute() {
     CHECK(best_gate_ms <= 0.5);
 }
 
+static void test_readout_utf8_valid_prefix() {
+    CHECK_EQ(readout_utf8_valid_prefix("abc", 3), size_t(3));
+    const std::string hello = "h\xC3\xA9llo";  // "héllo"
+    CHECK_EQ(readout_utf8_valid_prefix(hello.data(), hello.size()), hello.size());
+    const std::string emoji = "\xF0\x9F\x98\x80";  // 4-byte emoji
+    CHECK_EQ(readout_utf8_valid_prefix(emoji.data(), emoji.size()), size_t(4));
+    CHECK_EQ(readout_utf8_valid_prefix("\xCD", 1), size_t(0));
+    CHECK_EQ(readout_utf8_valid_prefix("ab\xCD", 3), size_t(2));
+    CHECK_EQ(readout_utf8_valid_prefix("\xE2\x82", 2), size_t(0));
+    CHECK_EQ(readout_utf8_valid_prefix("x\xE2\x82", 3), size_t(1));
+    CHECK_EQ(readout_utf8_valid_prefix("\xFF", 1), size_t(0));
+    CHECK_EQ(readout_utf8_valid_prefix("\xC0\xAF", 2), size_t(0));
+    CHECK_EQ(readout_utf8_valid_prefix("\xED\xA0\x80", 3), size_t(0));
+    CHECK_EQ(readout_utf8_valid_prefix("\xC3\xA9\x80", 3), size_t(2));
+
+    // Perf: 100k calls on a 32-byte mixed valid piece in <= 50 ms total.
+    std::string piece;
+    while (piece.size() < 32) piece += "ab\xC3\xA9\xF0\x9F\x98\x80";  // 8 bytes
+    piece.resize(32);
+    CHECK_EQ(readout_utf8_valid_prefix(piece.data(), piece.size()), size_t(32));
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t total = 0;
+    for (int i = 0; i < 100000; ++i) {
+        total += readout_utf8_valid_prefix(piece.data(), piece.size());
+    }
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    CHECK_EQ(total, size_t(100000) * size_t(32));
+    std::cout << "readout_utf8_valid_prefix: 100000 calls on 32-byte piece in " << elapsed_ms
+              << " ms\n";
+    CHECK(elapsed_ms <= 50.0);
+}
+
 int main() {
     test_base64_decode();
     test_make_session_id();
@@ -662,6 +695,7 @@ int main() {
     test_stop_sequence_matcher();
     test_readout_request_validation();
     test_readout_compute();
+    test_readout_utf8_valid_prefix();
 
     if (g_failures) {
         std::cerr << g_failures << " util test check(s) FAILED\n";

@@ -371,6 +371,20 @@ Expected:
   operation is not cancelled. An idle delete stays synchronous
   (`deferred: false`). Three back-to-back client timeouts each followed by a
   delete leak nothing (owner decision 2026-10-19, replaces the earlier 409).
+- A fork may carry an idle time-to-live (`POST /fork {"ttl_ms": N}`): once it
+  has been idle (no running or queued operation, no reader) for longer than
+  N ms it answers 404 and the engine frees its slot at the next create, fork,
+  load or usage call; a busy fork never expires and reads never refresh the
+  idle clock. So a client that times out on the fork request itself and
+  never learns the id leaks nothing. Invalid `ttl_ms` is a 400 before any
+  allocation; a fork without `ttl_ms` never expires; a TTL fork costs no
+  measurable extra `fork_ms` (medians 0.08 ms either way) and a usage sweep
+  releasing 3 expired forks takes ~1.5 ms.
+- Top-k token pieces are JSON-safe: each `top` and `candidates` entry carries
+  `bytes` (the raw piece) and `text` is its longest valid-UTF-8 prefix, so a
+  byte-fallback token (e.g. after an unassigned code point) returns 200 with
+  the mutation intact instead of an empty 500; readout responses are
+  serialised with the replace error handler as a belt.
 - `/info` advertises `readout` and `priority_inject`.
 
 Latency / performance budget:
@@ -398,6 +412,12 @@ Test:
 - `tests/test_deferred_delete.py` (deferred DELETE during a prefilling or
   queued readout and a streaming generation, idle delete synchronous,
   score-shaped timeouts back to back)
+- `tests/test_fork_ttl.py` (no-TTL forks never expire, expired idle fork
+  reclaimed on the next allocation, busy fork never expires, fork timeout
+  without an id leaks nothing, 400 validation, TTL cost)
+- `tests/test_readout_bytes.py` (byte-fallback top-k returns 200 with
+  `bytes`, plain-text bytes match text, top_k 0) and the
+  `readout_utf8_valid_prefix` section of `tests/test_util.cpp`
 - `tests/test_util.cpp` (`readout.h` validation, statistics, fast-exp
   accuracy vs a double reference, compute timing)
 - GO-B latency: parent `scripts/gate_latency.py --recipe standby`

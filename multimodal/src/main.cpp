@@ -188,6 +188,8 @@ struct LiveSession {
     std::shared_ptr<std::string> reasoning_replay = std::make_shared<std::string>();
     std::optional<int32_t> reasoning_budget_lock;
     bool pending_delete = false;
+    std::optional<double> idle_ttl_s;
+    double idle_since_s = 0;
 };
 
 // One model and one explicitly sized pooled context. External sessions map to
@@ -388,14 +390,46 @@ int64_t register_session(
     AppState & app, llama_seq_id seq_id,
     llama_token last_token = LLAMA_TOKEN_NULL,
     std::shared_ptr<std::string> reasoning_replay = {},
-    std::optional<int32_t> reasoning_budget_lock = std::nullopt) {
+    std::optional<int32_t> reasoning_budget_lock = std::nullopt,
+    std::optional<double> idle_ttl_s = std::nullopt) {
     const int64_t n = app.next_id.fetch_add(1);
     LiveSession session{seq_id, last_token, false};
     if (reasoning_replay) session.reasoning_replay = std::move(reasoning_replay);
     session.reasoning_budget_lock = reasoning_budget_lock;
+    session.idle_ttl_s = idle_ttl_s;
+    session.idle_since_s = now_s();
     std::lock_guard<std::mutex> lk(app.mu);
     app.sessions[n] = std::move(session);
     return n;
+}
+
+// Idle time counts from the last busy->idle transition (inject, generate,
+// fork-as-source, offload). Reads (status/usage) do not refresh it, so a
+// client polling usage cannot keep a throwaway fork alive by accident.
+bool session_expired(const LiveSession & session, double now) {
+    return session.idle_ttl_s.has_value() && !session.busy && session.readers == 0 &&
+           !session.releasing && !session.pending_delete &&
+           now - session.idle_since_s > *session.idle_ttl_s;
+}
+
+// Reclaim idle forks whose TTL has elapsed. Entries are erased under app.mu;
+// sequences are released outside the lock (HTTP threads only).
+void reap_expired_sessions(AppState & app) {
+    std::vector<llama_seq_id> seq_ids;
+    {
+        std::lock_guard<std::mutex> lk(app.mu);
+        const double now = now_s();
+        for (auto it = app.sessions.begin(); it != app.sessions.end();) {
+            if (session_expired(it->second, now)) {
+                seq_ids.push_back(it->second.seq_id);
+                it = app.sessions.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (llama_seq_id seq_id : seq_ids) app.scheduler->release_sequence(seq_id);
+    if (!seq_ids.empty()) app.sessions_cv.notify_all();
 }
 
 void set_injected_boundary(AppState & app, int64_t n, llama_token token) {
@@ -445,6 +479,11 @@ std::optional<LiveSession> reserve_live_session(
         res.set_content(error_body("unknown session", 404).dump(), "application/json");
         return std::nullopt;
     }
+    if (session_expired(live->second, now_s())) {
+        res.status = 404;
+        res.set_content(error_body("unknown session", 404).dump(), "application/json");
+        return std::nullopt;
+    }
     if (live->second.busy || live->second.readers > 0) {
         res.status = 409;
         res.set_content(error_body("session already has an active operation", 409).dump(),
@@ -482,6 +521,7 @@ void clear_session_busy(AppState & app, int64_t n) {
         if (it != app.sessions.end()) {
             it->second.busy = false;
             it->second.releasing = false;
+            it->second.idle_since_s = now_s();
         }
     }
     app.sessions_cv.notify_all();
@@ -1109,16 +1149,28 @@ static bool read_inject_readout(llama_context * ctx, const llama_vocab * vocab,
 
 static json inject_readout_json(const llama_vocab * vocab, const ReadoutRequest & request,
                                 const InjectReadout & readout) {
-    auto entry = [](const std::string & text, const ReadoutEntry & e) {
-        return json{{"text", text}, {"token", e.token}, {"logit", e.logit}, {"logprob", e.logprob}};
+    auto bytes_of = [](const std::string & piece) {
+        json bytes = json::array();
+        for (unsigned char c : piece) bytes.push_back(static_cast<int>(c));
+        return bytes;
+    };
+    auto entry = [&](const std::string & text, const std::string & piece, const ReadoutEntry & e) {
+        return json{{"text", text},
+                    {"bytes", bytes_of(piece)},
+                    {"token", e.token},
+                    {"logit", e.logit},
+                    {"logprob", e.logprob}};
     };
     json candidates = json::array();
     for (size_t i = 0; i < readout.result.candidates.size(); ++i) {
-        candidates.push_back(entry(request.texts[i], readout.result.candidates[i]));
+        const auto & e = readout.result.candidates[i];
+        candidates.push_back(entry(request.texts[i], common_token_to_piece(vocab, e.token, true), e));
     }
     json top = json::array();
     for (const auto & e : readout.result.top) {
-        top.push_back(entry(common_token_to_piece(vocab, e.token, true), e));
+        const std::string piece = common_token_to_piece(vocab, e.token, true);
+        const size_t valid = readout_utf8_valid_prefix(piece.data(), piece.size());
+        top.push_back(entry(piece.substr(0, valid), piece, e));
     }
     return json{
         {"position", readout.position},
@@ -1393,6 +1445,7 @@ int main(int argc, char ** argv) {
 
     // ---- POST /sessions : create a session ----
     svr.Post("/sessions", [&](const httplib::Request &, httplib::Response &res) {
+        reap_expired_sessions(app);
         const int seq_id = app.scheduler->allocate_sequence();
         if (seq_id < 0) {
             res.status = 503;
@@ -1414,6 +1467,27 @@ int main(int argc, char ** argv) {
     // currently holds (after text/audio injection or generation) without
     // modifying the source.
     svr.Post(R"(/sessions/[^/]+/fork)", [&](const httplib::Request &req, httplib::Response &res) {
+        reap_expired_sessions(app);
+        std::optional<int64_t> ttl_ms;
+        if (!req.body.empty()) {
+            json j;
+            try {
+                j = json::parse(req.body);
+            } catch (const std::exception & e) {
+                res.status = 400;
+                res.set_content(error_body(std::string("bad request: ") + e.what(), 400).dump(), "application/json");
+                return;
+            }
+            if (j.is_object() && j.contains("ttl_ms")) {
+                const json & value = j["ttl_ms"];
+                if (value.is_boolean() || !value.is_number_integer() || value.get<int64_t>() < 0) {
+                    res.status = 400;
+                    res.set_content(error_body("bad request: ttl_ms must be a non-negative integer", 400).dump(), "application/json");
+                    return;
+                }
+                ttl_ms = value.get<int64_t>();
+            }
+        }
         std::string sid = extract_session_id(req.path, "fork");
         const int64_t sid_num = parse_session_id_num(sid);
         auto src = reserve_live_session(app, sid_num, res);
@@ -1429,10 +1503,12 @@ int main(int argc, char ** argv) {
         }
         const double dt = now_s() - t0;
 
+        const std::optional<double> idle_ttl_s =
+            ttl_ms ? std::optional<double>(static_cast<double>(*ttl_ms) / 1000.0) : std::nullopt;
         const int64_t new_n = register_session(
             app, *destination, src->last_token,
             std::make_shared<std::string>(*src->reasoning_replay),
-            src->reasoning_budget_lock);
+            src->reasoning_budget_lock, idle_ttl_s);
         const int dst_size = app.scheduler->invoke_preserving_logits([seq = *destination](llama_context * ctx) {
             return llama_memory_seq_pos_max(llama_get_memory(ctx), seq) + 1;
         });
@@ -1442,6 +1518,7 @@ int main(int argc, char ** argv) {
             {"cache_size", dst_size},
             {"fork_ms", (int)(dt * 1000)},
             {"fork_ms_precise", dt * 1000.0},
+            {"ttl_ms", ttl_ms ? json(*ttl_ms) : json(nullptr)},
         };
         res.set_content(body.dump(), "application/json");
     });
@@ -1707,7 +1784,8 @@ int main(int argc, char ** argv) {
                     // Text-ending rendered prompts are generation-ready. A
                     // media-ending prompt retains ADR 0004's explicit caveat.
                     set_injected_boundary(app, sid_num, inject_result.last_token);
-                    res.set_content(body.dump(), "application/json");
+                    res.set_content(body.dump(-1, ' ', false, json::error_handler_t::replace),
+                                    "application/json");
                     return;
                 }
             } else if (j.contains("audio")) {
@@ -1913,7 +1991,7 @@ int main(int argc, char ** argv) {
         };
         if (return_prompt) body["prompt"] = text;
         if (readout_result) body["readout"] = inject_readout_json(app.vocab, *readout, *readout_result);
-        res.set_content(body.dump(), "application/json");
+        res.set_content(body.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
     });
 
     // ---- POST /sessions/{id}/cancel : signal an active generation ----
@@ -2213,7 +2291,9 @@ int main(int argc, char ** argv) {
     // MUST be registered before GET /sessions/{id} so the literal "usage" is not
     // shadowed by the {id} regex (cpp-httplib matches in registration order).
     svr.Get("/sessions/usage", [&](const httplib::Request &, httplib::Response &res) {
+        reap_expired_sessions(app);
         std::vector<std::pair<int64_t, llama_seq_id>> live;
+        std::vector<std::pair<int64_t, json>> live_meta;
         std::vector<int64_t> live_reader_ids;
         json ram_sessions = json::array();
         size_t ram_total = 0;
@@ -2224,10 +2304,17 @@ int main(int argc, char ** argv) {
                     app.sessions.begin(), app.sessions.end(),
                     [](const auto & entry) { return entry.second.releasing; });
             });
+            const double now = now_s();
             for (auto & [n, session] : app.sessions) {
                 if (session.pending_delete) continue;
                 ++session.readers;
                 live.push_back({n, session.seq_id});
+                const int64_t idle_ms = session.busy
+                    ? 0
+                    : static_cast<int64_t>(std::max(0.0, now - session.idle_since_s) * 1000.0);
+                live_meta.push_back({n, {{"ttl_ms", session.idle_ttl_s
+                    ? json(static_cast<int64_t>(*session.idle_ttl_s * 1000.0 + 0.5)) : json(nullptr)},
+                                         {"idle_ms", idle_ms}}});
                 live_reader_ids.push_back(n);
             }
             for (const auto & [n, state] : app.offloaded_sessions) {
@@ -2246,7 +2333,9 @@ int main(int argc, char ** argv) {
         size_t vram_total = 0;
         for (size_t i = 0; i < live.size(); ++i) {
             vram_sessions.push_back({{"session_id", make_session_id(live[i].first)},
-                                     {"state_bytes", live_sizes[i]}});
+                                     {"state_bytes", live_sizes[i]},
+                                     {"ttl_ms", live_meta[i].second["ttl_ms"]},
+                                     {"idle_ms", live_meta[i].second["idle_ms"]}});
             vram_total += live_sizes[i];
         }
         const int active = app.scheduler->active_sequences();
@@ -2311,6 +2400,11 @@ int main(int argc, char ** argv) {
             auto live_it = app.sessions.find(sid_num);
             if (live_it != app.sessions.end()) {
                 if (live_it->second.pending_delete) {
+                    res.status = 404;
+                    res.set_content(error_body("unknown session", 404).dump(), "application/json");
+                    return;
+                }
+                if (session_expired(live_it->second, now_s())) {
                     res.status = 404;
                     res.set_content(error_body("unknown session", 404).dump(), "application/json");
                     return;
@@ -2408,6 +2502,7 @@ int main(int argc, char ** argv) {
     });
 
     svr.Post(R"(/sessions/[^/]+/load)", [&](const httplib::Request &req, httplib::Response &res) {
+        reap_expired_sessions(app);
         const std::string sid = extract_session_id(req.path, "load");
         const int64_t sid_num = parse_session_id_num(sid);
         std::optional<LiveSession> live;
@@ -2417,6 +2512,11 @@ int main(int argc, char ** argv) {
             auto live_it = app.sessions.find(sid_num);
             if (live_it != app.sessions.end()) {
                 if (live_it->second.pending_delete) {
+                    res.status = 404;
+                    res.set_content(error_body("unknown session", 404).dump(), "application/json");
+                    return;
+                }
+                if (session_expired(live_it->second, now_s())) {
                     res.status = 404;
                     res.set_content(error_body("unknown session", 404).dump(), "application/json");
                     return;
@@ -2489,7 +2589,8 @@ int main(int argc, char ** argv) {
             app.offloaded_sessions.erase(sid_num);
             app.sessions[sid_num] = LiveSession{
                 seq_id, state.last_token, false, 0, false,
-                state.reasoning_replay, state.reasoning_budget_lock};
+                state.reasoning_replay, state.reasoning_budget_lock, false,
+                std::nullopt, now_s()};
         }
         const double elapsed_ms = (now_s() - t0) * 1000.0;
         res.set_content(json{{"session_id", sid}, {"location", "vram"},
@@ -2512,6 +2613,11 @@ int main(int argc, char ** argv) {
             auto live = app.sessions.find(sid_num);
             if (live != app.sessions.end()) {
                 if (live->second.pending_delete) {
+                    res.status = 404;
+                    res.set_content(error_body("unknown session", 404).dump(), "application/json");
+                    return;
+                }
+                if (session_expired(live->second, now_s())) {
                     res.status = 404;
                     res.set_content(error_body("unknown session", 404).dump(), "application/json");
                     return;

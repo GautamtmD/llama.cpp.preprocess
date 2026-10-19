@@ -22,6 +22,42 @@ inline constexpr int kReadoutMaxCandidates = 64;
 inline constexpr int kReadoutMaxTopK = 16;
 inline constexpr const char * kReadoutSemantics = "raw_last_row_pre_sampler_v1";
 
+// Length of the longest prefix of `data[0, n)` that is well-formed UTF-8.
+// Truncated multi-byte sequences at the end are excluded. Pure, no allocation.
+inline size_t readout_utf8_valid_prefix(const char * data, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        const auto c = static_cast<unsigned char>(data[i]);
+        if (c < 0x80) { ++i; continue; }
+        size_t len = 0;
+        uint32_t lo = 0x80, hi = 0xBF;  // allowed range for the second byte
+        if (c >= 0xC2 && c <= 0xDF) {
+            len = 2;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            len = 3;
+            if (c == 0xE0) lo = 0xA0;       // reject overlong
+            else if (c == 0xED) hi = 0x9F;  // reject surrogates
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            len = 4;
+            if (c == 0xF0) lo = 0x90;       // reject overlong
+            else if (c == 0xF4) hi = 0x8F;  // reject > U+10FFFF
+        } else {
+            break;  // C0/C1, F5-FF, or a lone continuation byte
+        }
+        if (i + len > n) break;  // truncated sequence
+        const auto c1 = static_cast<unsigned char>(data[i + 1]);
+        if (c1 < lo || c1 > hi) break;
+        bool ok = true;
+        for (size_t j = 2; j < len; ++j) {
+            const auto cj = static_cast<unsigned char>(data[i + j]);
+            if (cj < 0x80 || cj > 0xBF) { ok = false; break; }
+        }
+        if (!ok) break;
+        i += len;
+    }
+    return i;
+}
+
 struct ReadoutRequest {
     std::vector<std::string> texts;   // candidate strings as supplied
     std::vector<int32_t> tokens;      // their single token ids (same order)
