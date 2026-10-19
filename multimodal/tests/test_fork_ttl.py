@@ -1,7 +1,8 @@
 """Idle TTL for throwaway forks (owner decision 2026-10-19).
 
 Each test proves one part of the contract:
-1. A fork without ``ttl_ms`` never expires and reports ``ttl_ms`` null.
+1. A fork without ``ttl_ms`` (absent or JSON null) never expires and
+   reports ``ttl_ms`` null.
 2. An expired idle fork answers 404 and is reclaimed by the next allocation,
    restoring ``pool.free_sequences`` with no DELETE for that fork.
 3. A busy fork never expires: expiry counts idle time only, so a fork whose
@@ -108,7 +109,9 @@ def test_fork_without_ttl_never_expires(base):
     try:
         base_sid = _make_simple_base(base)
         initial = _free(base)
-        fork = _fork_body(base, base_sid, {})["session_id"]
+        body = _fork_body(base, base_sid, {"ttl_ms": None})  # null == omitted
+        fork = body["session_id"]
+        assert body["ttl_ms"] is None, body
         time.sleep(1.5)
         assert _live_entry(base, fork)["ttl_ms"] is None
         extra = _create(base)

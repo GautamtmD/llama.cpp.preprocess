@@ -117,6 +117,11 @@ engine/multimodal/build/bin/Release/multimodal-server.exe \
 
 For deliberate CPU diagnosis only, add `--allow-cpu --n-gpu-layers 0`.
 
+Stop it with Ctrl-C, Ctrl-Break or SIGTERM: the server stops accepting
+connections, lets every in-flight request finish (queued injects, readouts and
+generations complete and answer their clients), frees the engine and exits 0.
+A second signal exits immediately.
+
 The pooled scheduler requires `--n-batch >= --max-sequences`; otherwise startup
 exits with an argument error explaining which value to increase or reduce.
 `--ctx-size`, `--n-batch`, and `--max-sequences` must be positive, their pooled

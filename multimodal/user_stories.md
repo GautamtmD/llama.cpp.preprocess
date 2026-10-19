@@ -380,6 +380,11 @@ Expected:
   allocation; a fork without `ttl_ms` never expires; a TTL fork costs no
   measurable extra `fork_ms` (medians 0.08 ms either way) and a usage sweep
   releasing 3 expired forks takes ~1.5 ms.
+- Shutdown is clean: on SIGINT, SIGTERM or Ctrl-Break (console close on
+  Windows) the server stops accepting connections, every in-flight request
+  finishes (a running normal inject and a priority readout queued behind it
+  both answer 200), the scheduler drains, and the process exits 0 (measured
+  0.84 s with that work pending, 0.31 s idle). A second signal exits at once.
 - Top-k token pieces are JSON-safe: each `top` and `candidates` entry carries
   `bytes` (the raw piece) and `text` is its longest valid-UTF-8 prefix, so a
   byte-fallback token (e.g. after an unassigned code point) returns 200 with
@@ -418,6 +423,8 @@ Test:
 - `tests/test_readout_bytes.py` (byte-fallback top-k returns 200 with
   `bytes`, plain-text bytes match text, top_k 0) and the
   `readout_utf8_valid_prefix` section of `tests/test_util.cpp`
+- `tests/test_shutdown.py` (self-managed, second GPU: Ctrl-Break with a running
+  inject and a queued priority readout drains both and exits 0; idle exit)
 - `tests/test_util.cpp` (`readout.h` validation, statistics, fast-exp
   accuracy vs a double reference, compute timing)
 - GO-B latency: parent `scripts/gate_latency.py --recipe standby`

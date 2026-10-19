@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -1182,6 +1183,31 @@ static json inject_readout_json(const llama_vocab * vocab, const ReadoutRequest 
     };
 }
 
+// Clean shutdown (SIGINT / SIGTERM, and Ctrl-Break / console close on Windows):
+// stop accepting connections and let every in-flight request finish, which
+// drains the scheduler queue (queued injects, readouts and generations
+// complete and answer their clients), then main() tears the engine down in
+// order. A second signal exits immediately. Async-signal-safe: atomics and
+// httplib::Server::stop() only (the pattern upstream llama-server uses).
+static httplib::Server * g_shutdown_server = nullptr;
+static std::atomic<bool> g_shutdown_requested{false};
+
+static void on_shutdown_signal(int) {
+    if (g_shutdown_requested.exchange(true)) {
+        std::_Exit(130);
+    }
+    if (g_shutdown_server) g_shutdown_server->stop();
+}
+
+static void install_shutdown_handlers(httplib::Server & svr) {
+    g_shutdown_server = &svr;
+    std::signal(SIGINT, on_shutdown_signal);
+    std::signal(SIGTERM, on_shutdown_signal);
+#ifdef SIGBREAK
+    std::signal(SIGBREAK, on_shutdown_signal);
+#endif
+}
+
 int main(int argc, char ** argv) {
     ServerCliResult cli = parse_server_arguments(argc, argv);
     if (cli.show_help) {
@@ -1478,7 +1504,8 @@ int main(int argc, char ** argv) {
                 res.set_content(error_body(std::string("bad request: ") + e.what(), 400).dump(), "application/json");
                 return;
             }
-            if (j.is_object() && j.contains("ttl_ms")) {
+            if (j.is_object() && j.contains("ttl_ms") && !j["ttl_ms"].is_null()) {
+                // null == omitted (never expires), as the contract allows.
                 const json & value = j["ttl_ms"];
                 if (value.is_boolean() || !value.is_number_integer() || value.get<int64_t>() < 0) {
                     res.status = 400;
@@ -2651,8 +2678,10 @@ int main(int argc, char ** argv) {
                         "application/json");
     });
 
+    install_shutdown_handlers(svr);
     std::cerr << "multimodal-server listening on 0.0.0.0:" << cfg.port << "\n";
-    if (!svr.listen("0.0.0.0", cfg.port)) {
+    const bool listened = svr.listen("0.0.0.0", cfg.port);
+    if (!listened && !g_shutdown_requested.load()) {
         std::cerr << "error: failed to listen on port " << cfg.port << "\n";
         app.scheduler.reset();
         if (app.mtmd_ctx) mtmd_free(app.mtmd_ctx);
@@ -2660,6 +2689,8 @@ int main(int argc, char ** argv) {
         llama_backend_free();
         return 1;
     }
+    // listen() returns only after every in-flight request has finished.
+    std::cerr << "multimodal-server shutting down: requests drained, freeing the engine\n";
 
     app.scheduler.reset();  // frees the pooled context before the model
     if (app.mtmd_ctx) mtmd_free(app.mtmd_ctx);
