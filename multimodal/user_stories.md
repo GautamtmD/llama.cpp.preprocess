@@ -384,10 +384,11 @@ Latency / performance budget:
   alongside eager generation; 129 ms with TTS synthesising on the same GPU,
   81 ms with TTS on the other GPU; see ADR 0010 "GO-B results". Fork and
   delete are off the critical path (reported, not gated).
-- **CPU (GO-A, recorded):** `readout_ms` <= 5 ms per inject (64 candidates,
-  top_k 16, 262144-token vocab). The pure compute is also gated in the util
-  tests (Gate shape <= 0.5 ms; measured ~0.28 ms after the vectorizable
-  logsumexp, was ~0.84 ms).
+- **CPU (dry check only, not a gate):** the LLM never runs on the CPU in
+  this application (owner, 2026-10-19); `readout_ms` on a CPU run is recorded
+  (~0.9 ms at 64 candidates, top_k 16, 262144-token vocab), never gated. The
+  pure compute is gated in the util tests on the host CPU (Gate shape
+  <= 0.5 ms; measured ~0.28 ms after the vectorizable logsumexp, was ~0.84 ms).
 
 Test:
 - `tests/test_readout.py` (correctness, 400 paths, slot leaks, priority
