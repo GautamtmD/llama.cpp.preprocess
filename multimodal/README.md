@@ -12,6 +12,9 @@ upstream merges stay clean.
   measures performance and latency, not just correctness. Write the failing test
   and its acceptance threshold first; implement until it passes.
 - Engine user stories / acceptance criteria live in [`user_stories.md`](user_stories.md).
+- **GPU only.** Acceptance criteria, perf thresholds and the test suite target
+  the GPU build. Do not add CPU test suites or CPU perf gates; `--allow-cpu`
+  exists for a deliberate dry check of one test, never as a validation target.
 
 ## Layout
 
