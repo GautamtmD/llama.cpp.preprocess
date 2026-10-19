@@ -14,8 +14,9 @@ the ADR's CPU-runnable "correctness tests first":
 - a priority inject queued behind N normal injects completes first;
 - no pooled slot leaks after fork -> readout -> delete, including after a 400;
 - readout overhead: ``readout_ms`` (measured after the decode is synchronized,
-  so it is the readout alone) <= 5 ms on CPU; on a GPU build the ADR 0010 GO-B
-  gate ``readout_ms`` <= 1 ms applies to the Gate recipe's readout shape.
+  so it is the readout alone) <= 1 ms for the Gate recipe's readout shape (ADR
+  0010 GO-B, GPU); the typical-call check here, the p95 gate is the GO-B run.
+  No CPU threshold exists: a CPU run only prints the numbers.
 
 Numerics: on CPU a fork's row matches a reference decode on another sequence
 within 0.05 logit. On CUDA the row is bit-identical to a reference decoded
@@ -28,11 +29,10 @@ tolerance), and only the concurrent-generation test, whose cache state cannot
 be reproduced, uses ``GPU_LAYOUT_TOLERANCE`` plus strict top-1 and candidate
 ranking assertions.
 
-Run (CPU-only binary, self-booted)::
+Run (self-booted on the GPU; see conftest.py for the env)::
 
     MULTIMODAL_MODEL="C:/ML Models/Gemma4 12b/gemma-4-12b-it-qat-q4_0.gguf" \\
     MULTIMODAL_MMPROJ="C:/ML Models/Gemma4 12b/mmproj-gemma-4-12b-it-qat-q4_0.gguf" \\
-    MULTIMODAL_SERVER_ARGS="--allow-cpu" \\
     pytest engine/multimodal/tests/test_readout.py -q -s
 
 Prompts use Gemma 4 turn markers (``<|turn>``/``<turn|>``); on another model the
@@ -69,8 +69,7 @@ LOGIT_TOLERANCE = 0.05  # same tokens, same cache state (CPU: also any state)
 # max 0.591 logit / 0.599 logprob over 18 layouts; 1.0 = 1.7x that, still far
 # below this prompt's A-B logit gap (4.1) and top0-top1 gap (13.7).
 GPU_LAYOUT_TOLERANCE = 1.0
-READOUT_MS_CPU_GATE = 5.0
-READOUT_MS_GPU_GATE = 1.0  # ADR 0010 GO-B: readout overhead <= 1 ms
+READOUT_MS_GPU_GATE = 1.0  # ADR 0010 GO-B: readout overhead <= 1 ms (the only threshold)
 GATE_CANDIDATES = ["A", " A", "B", " B"]  # the Gate recipe's readout shape
 GATE_TOP_K = 8
 
@@ -572,8 +571,8 @@ def test_readout_overhead_vs_plain_inject(base, base_session):
         f"{statistics.median(plain_ms):.1f} ms, with readout median="
         f"{statistics.median(readout_wall_ms):.1f} ms (delta {delta:+.1f} ms, decode noise)"
     )
-    assert max(readout_ms) <= READOUT_MS_CPU_GATE
-    if gpu:
-        # Typical-call check; the p95 gate over >= 100 warm calls is the GO-B
-        # run (scripts/gate_latency.py), not this 9-sample correctness test.
-        assert statistics.median(gate_ms) <= READOUT_MS_GPU_GATE
+    if not gpu:
+        pytest.skip("readout overhead is gated on the GPU only (numbers printed above)")
+    # Typical-call check; the p95 gate over >= 100 warm calls is the GO-B
+    # run (scripts/gate_latency.py), not this 9-sample correctness test.
+    assert statistics.median(gate_ms) <= READOUT_MS_GPU_GATE

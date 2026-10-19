@@ -5,10 +5,13 @@ multimodal injection are fast to exercise without filling the normal 4096-token
 session allocation.
 
 The tiny servers are a second model instance next to the suite's shared server.
-One 16 GB GPU cannot hold two Gemma 4 12B instances, so by default they run as
-an explicit CPU run (``CUDA_VISIBLE_DEVICES=-1``, ``--allow-cpu``); context limits are
-device-independent. ``MULTIMODAL_TINY_CUDA_VISIBLE_DEVICES`` selects a GPU for
-them instead (e.g. when no shared server is running).
+One 16 GB GPU cannot hold two Gemma 4 12B instances, so they run on a *second*
+GPU: ``MULTIMODAL_TINY_CUDA_VISIBLE_DEVICES`` names it, otherwise the first GPU
+that is not the suite's (``MULTIMODAL_CUDA_VISIBLE_DEVICES``, default ``1``) and
+has >= 9 GB free is picked from ``nvidia-smi``; with no such GPU the tests
+skip. They never fall back to the CPU on their own: the LLM is validated on
+the GPU only (AGENTS.md "No CPU test suites"). Setting the variable to ``-1``
+is an explicit CPU dry check (``--allow-cpu``) for debugging.
 """
 
 from __future__ import annotations
@@ -39,9 +42,37 @@ EXE = Path(
 )
 MODEL = os.environ.get("MULTIMODAL_MODEL", "")
 MMPROJ = os.environ.get("MULTIMODAL_MMPROJ", "")
-# "-1" hides every GPU (an empty value would delete the variable on Windows).
-TINY_CUDA_GPU = os.environ.get("MULTIMODAL_TINY_CUDA_VISIBLE_DEVICES", "-1")
+SUITE_CUDA_GPU = os.environ.get("MULTIMODAL_CUDA_VISIBLE_DEVICES", "1")
+TINY_MIN_FREE_MIB = 9000  # a tiny-context Gemma 4 12B instance needs ~8 GB
 CTX_SIZE = 32
+
+
+def _second_gpu() -> str | None:
+    """Index of a GPU other than the suite's with enough free memory, or None."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 2 and parts[0] != SUITE_CUDA_GPU and parts[1].isdigit():
+            if int(parts[1]) >= TINY_MIN_FREE_MIB:
+                return parts[0]
+    return None
+
+
+def _tiny_gpu() -> str | None:
+    """GPU for the tiny servers: explicit env, else a second GPU. "-1" = explicit
+    CPU dry check. None = no usable GPU (the tests skip)."""
+    explicit = os.environ.get("MULTIMODAL_TINY_CUDA_VISIBLE_DEVICES")
+    if explicit:
+        return explicit
+    return _second_gpu()
 
 
 def _free_port() -> int:
@@ -73,10 +104,16 @@ def _running_server(n_batch: int, max_sequences: int) -> Iterator[str]:
         "--n-batch",
         str(n_batch),
     ]
-    if TINY_CUDA_GPU in ("", "-1"):
-        command.append("--allow-cpu")
+    gpu = _tiny_gpu()
+    if gpu is None:
+        pytest.skip(
+            "tiny-context servers need a second GPU with >= 9 GB free "
+            "(or MULTIMODAL_TINY_CUDA_VISIBLE_DEVICES); no CPU fallback"
+        )
+    if gpu == "-1":
+        command.append("--allow-cpu")  # explicit CPU dry check only
     env = dict(os.environ)
-    env["CUDA_VISIBLE_DEVICES"] = TINY_CUDA_GPU
+    env["CUDA_VISIBLE_DEVICES"] = gpu
     log = tempfile.TemporaryFile(mode="w+b")
     process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)
     base = f"http://127.0.0.1:{port}"
