@@ -362,9 +362,15 @@ Expected:
   all but at most one of them (behind only the executing decode); the same
   holds behind a running generation, whose stream keeps delivering tokens.
 - A client that times out on a queued or long-prefilling readout leaves the
-  fork intact: the request finishes server-side, the fork is deletable, no
-  pooled slot leaks; 100 rapid fork -> readout -> delete cycles leave the
-  pool unchanged.
+  fork intact: the request finishes server-side, no pooled slot leaks; 100
+  rapid fork -> readout -> delete cycles leave the pool unchanged.
+- `DELETE` on a live session with an active operation (a running or queued
+  readout, a generation, a fork source, an offload) is accepted at once
+  (200, `deferred: true`, < 100 ms): the session answers 404 from then on
+  and the engine frees the slot itself when the operation ends; the
+  operation is not cancelled. An idle delete stays synchronous
+  (`deferred: false`). Three back-to-back client timeouts each followed by a
+  delete leak nothing (owner decision 2026-10-19, replaces the earlier 409).
 - `/info` advertises `readout` and `priority_inject`.
 
 Latency / performance budget:
@@ -388,6 +394,9 @@ Test:
   ordering, readout overhead median on GPU / record on CPU)
 - `tests/test_readout_robustness.py` (client timeouts on queued and
   prefilling readouts, priority behind a running generation, rapid cycles)
+- `tests/test_deferred_delete.py` (deferred DELETE during a prefilling or
+  queued readout and a streaming generation, idle delete synchronous,
+  score-shaped timeouts back to back)
 - `tests/test_util.cpp` (`readout.h` validation, statistics, fast-exp
   accuracy vs a double reference, compute timing)
 - GO-B latency: parent `scripts/gate_latency.py --recipe standby`

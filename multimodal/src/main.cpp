@@ -187,6 +187,7 @@ struct LiveSession {
     bool releasing = false;
     std::shared_ptr<std::string> reasoning_replay = std::make_shared<std::string>();
     std::optional<int32_t> reasoning_budget_lock;
+    bool pending_delete = false;
 };
 
 // One model and one explicitly sized pooled context. External sessions map to
@@ -439,6 +440,11 @@ std::optional<LiveSession> reserve_live_session(
         }
         return std::nullopt;
     }
+    if (live->second.pending_delete) {
+        res.status = 404;
+        res.set_content(error_body("unknown session", 404).dump(), "application/json");
+        return std::nullopt;
+    }
     if (live->second.busy || live->second.readers > 0) {
         res.status = 409;
         res.set_content(error_body("session already has an active operation", 409).dump(),
@@ -448,6 +454,25 @@ std::optional<LiveSession> reserve_live_session(
     live->second.busy = true;
     live->second.releasing = will_release_sequence;
     return live->second;
+}
+
+// Frees a session whose DELETE was deferred while it was busy, once the
+// last operation/reader has gone. Only called from HTTP-thread guard
+// destructors, never under app.mu and never on the scheduler thread.
+void finish_deferred_delete(AppState & app, int64_t n) {
+    std::optional<llama_seq_id> seq_id;
+    {
+        std::lock_guard<std::mutex> lk(app.mu);
+        auto it = app.sessions.find(n);
+        if (it == app.sessions.end() || !it->second.pending_delete ||
+            it->second.busy || it->second.readers > 0) {
+            return;
+        }
+        seq_id = it->second.seq_id;
+        app.sessions.erase(it);
+    }
+    app.scheduler->release_sequence(*seq_id);
+    app.sessions_cv.notify_all();
 }
 
 void clear_session_busy(AppState & app, int64_t n) {
@@ -460,6 +485,7 @@ void clear_session_busy(AppState & app, int64_t n) {
         }
     }
     app.sessions_cv.notify_all();
+    finish_deferred_delete(app, n);
 }
 
 void release_live_reader(AppState & app, int64_t n) {
@@ -469,6 +495,7 @@ void release_live_reader(AppState & app, int64_t n) {
         if (it != app.sessions.end() && it->second.readers > 0) --it->second.readers;
     }
     app.sessions_cv.notify_all();
+    finish_deferred_delete(app, n);
 }
 
 struct BusyGuard {
@@ -507,6 +534,7 @@ struct LiveReadersGuard {
             }
         }
         app.sessions_cv.notify_all();
+        for (int64_t session : sessions) finish_deferred_delete(app, session);
     }
 };
 
@@ -2197,6 +2225,7 @@ int main(int argc, char ** argv) {
                     [](const auto & entry) { return entry.second.releasing; });
             });
             for (auto & [n, session] : app.sessions) {
+                if (session.pending_delete) continue;
                 ++session.readers;
                 live.push_back({n, session.seq_id});
                 live_reader_ids.push_back(n);
@@ -2281,6 +2310,11 @@ int main(int argc, char ** argv) {
             std::lock_guard<std::mutex> lk(app.mu);
             auto live_it = app.sessions.find(sid_num);
             if (live_it != app.sessions.end()) {
+                if (live_it->second.pending_delete) {
+                    res.status = 404;
+                    res.set_content(error_body("unknown session", 404).dump(), "application/json");
+                    return;
+                }
                 if (live_it->second.releasing) {
                     res.status = 409;
                     res.set_content(error_body("session already has an active operation", 409).dump(),
@@ -2362,8 +2396,10 @@ int main(int argc, char ** argv) {
         app.scheduler->release_sequence(live->seq_id);
         {
             std::lock_guard<std::mutex> lk(app.mu);
+            auto live_it = app.sessions.find(sid_num);
+            const bool pending = live_it != app.sessions.end() && live_it->second.pending_delete;
             app.sessions.erase(sid_num);
-            app.offloaded_sessions[sid_num] = state;
+            if (!pending) app.offloaded_sessions[sid_num] = state;
         }
         const double elapsed_ms = (now_s() - t0) * 1000.0;
         res.set_content(json{{"session_id", sid}, {"location", "ram"},
@@ -2380,6 +2416,11 @@ int main(int argc, char ** argv) {
             std::lock_guard<std::mutex> lk(app.mu);
             auto live_it = app.sessions.find(sid_num);
             if (live_it != app.sessions.end()) {
+                if (live_it->second.pending_delete) {
+                    res.status = 404;
+                    res.set_content(error_body("unknown session", 404).dump(), "application/json");
+                    return;
+                }
                 if (live_it->second.busy || live_it->second.readers > 0) {
                     res.status = 409;
                     res.set_content(error_body("session already has an active operation", 409).dump(),
@@ -2470,9 +2511,14 @@ int main(int argc, char ** argv) {
             std::lock_guard<std::mutex> lk(app.mu);
             auto live = app.sessions.find(sid_num);
             if (live != app.sessions.end()) {
+                if (live->second.pending_delete) {
+                    res.status = 404;
+                    res.set_content(error_body("unknown session", 404).dump(), "application/json");
+                    return;
+                }
                 if (live->second.busy || live->second.readers > 0) {
-                    res.status = 409;
-                    res.set_content(error_body("session already has an active operation", 409).dump(),
+                    live->second.pending_delete = true;
+                    res.set_content(json{{"session_id", sid}, {"deleted", true}, {"deferred", true}}.dump(),
                                     "application/json");
                     return;
                 }
@@ -2495,7 +2541,8 @@ int main(int argc, char ** argv) {
             }
         }
         if (sequence) app.scheduler->release_sequence(*sequence);
-        res.set_content(json{{"session_id", sid}, {"deleted", true}}.dump(), "application/json");
+        res.set_content(json{{"session_id", sid}, {"deleted", true}, {"deferred", false}}.dump(),
+                        "application/json");
     });
 
     std::cerr << "multimodal-server listening on 0.0.0.0:" << cfg.port << "\n";
