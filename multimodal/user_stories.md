@@ -371,11 +371,13 @@ Latency / performance budget:
 - **GPU (GO-B, measured 2026-10-19, RTX 5060 Ti, pool 4):** engine
   `readout_ms` p95 <= 1 ms over >= 600 warm Gate-shape calls (measured p95
   0.43 ms, median 0.30 ms); the critical-path priority inject-with-readout
-  on a pre-forked standby session p95 <= 100 ms warm at <= 128 suffix tokens
-  (measured 63.5 ms at 127 tokens; 75.7-88.1 ms idle at the 148-token Gate
-  suffix; 123 ms alongside eager generation; 129 ms with TTS synthesising on
-  the same GPU, 81 ms with TTS on the other GPU; see ADR 0010 "GO-B results").
-  Fork and delete are off the critical path (reported, not gated).
+  on a pre-forked standby session p95 <= 150 ms warm at <= 128 suffix tokens
+  (gate raised from 100 ms by the owner 2026-10-19: still fast enough to seem
+  real time to the user; ADR 0010 "Gate amendments"). Measured 63.5 ms at
+  127 tokens; 75.7-88.1 ms idle at the 148-token Gate suffix; 123 ms
+  alongside eager generation; 129 ms with TTS synthesising on the same GPU,
+  81 ms with TTS on the other GPU; see ADR 0010 "GO-B results". Fork and
+  delete are off the critical path (reported, not gated).
 - **CPU (GO-A, recorded):** `readout_ms` <= 5 ms per inject (64 candidates,
   top_k 16, 262144-token vocab). The pure compute is also gated in the util
   tests (Gate shape <= 0.5 ms; measured ~0.28 ms after the vectorizable
